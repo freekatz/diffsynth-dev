@@ -1,6 +1,5 @@
 import torch, os, argparse, accelerate, warnings
 from diffsynth.core import UnifiedDataset
-from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -10,7 +9,7 @@ class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
         model_paths=None, model_id_with_origin_paths=None,
-        tokenizer_path=None, audio_processor_path=None,
+        tokenizer_path=None,
         trainable_models=None,
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
         preset_lora_path=None, preset_lora_model=None,
@@ -35,14 +34,12 @@ class WanTrainingModule(DiffusionTrainingModule):
         for config in model_configs:
             config.skip_download = True
         tokenizer_config = ModelConfig(skip_download=True, model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
-        audio_processor_config = self.parse_path_or_model_id(audio_processor_path)
         self.pipe = WanVideoPipeline.from_pretrained(
             redirect_common_files=False,
             torch_dtype=torch.bfloat16,
             device=device,
             model_configs=model_configs,
             tokenizer_config=tokenizer_config,
-            audio_processor_config=audio_processor_config,
         )
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
@@ -72,15 +69,14 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.min_timestep_boundary = min_timestep_boundary
         
     def parse_extra_inputs(self, data, extra_inputs, inputs_shared):
+        supported_extra_inputs = {"input_image", "end_image"}
         for extra_input in extra_inputs:
+            if extra_input not in supported_extra_inputs:
+                raise ValueError(f"Unsupported extra input for Wan2.1-T2V-1.3B: {extra_input}. Supported values: {', '.join(sorted(supported_extra_inputs))}.")
             if extra_input == "input_image":
                 inputs_shared["input_image"] = data["video"][0]
             elif extra_input == "end_image":
                 inputs_shared["end_image"] = data["video"][-1]
-            elif extra_input == "reference_image" or extra_input == "vace_reference_image":
-                inputs_shared[extra_input] = data[extra_input][0]
-            else:
-                inputs_shared[extra_input] = data[extra_input]
         if inputs_shared.get("framewise_decoding", False):
             # Keep compatibility with framewise-decoding datasets.
             inputs_shared["num_frames"] = 4 * (len(data["video"]) - 1) + 1
@@ -103,8 +99,6 @@ class WanTrainingModule(DiffusionTrainingModule):
             "rand_device": self.pipe.device,
             "use_gradient_checkpointing": self.use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
-            "cfg_merge": False,
-            "vace_scale": 1,
             "max_timestep_boundary": self.max_timestep_boundary,
             "min_timestep_boundary": self.min_timestep_boundary,
         }
@@ -125,7 +119,6 @@ def wan_parser():
     parser = add_general_config(parser)
     parser = add_video_size_config(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
-    parser.add_argument("--audio_processor_path", type=str, default=None, help="Path to the audio processor.")
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
@@ -155,18 +148,12 @@ if __name__ == "__main__":
             num_frames=args.num_frames,
             time_division_factor=4 if not args.framewise_decoding else 1,
             time_division_remainder=1 if not args.framewise_decoding else 0,
-        ),
-        special_operator_map={
-            "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16)),
-            "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
-            "wantodance_music_path": ToAbsolutePath(args.dataset_base_path),
-        }
+        )
     )
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
         tokenizer_path=args.tokenizer_path,
-        audio_processor_path=args.audio_processor_path,
         trainable_models=args.trainable_models,
         lora_base_model=args.lora_base_model,
         lora_target_modules=args.lora_target_modules,

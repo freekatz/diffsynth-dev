@@ -1,6 +1,5 @@
 import torch
-from PIL import Image
-from diffsynth.utils.data import save_video, VideoData
+from diffsynth.utils.data import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 
 
