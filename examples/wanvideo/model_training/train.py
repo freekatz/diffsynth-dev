@@ -32,9 +32,18 @@ class WanTrainingModule(DiffusionTrainingModule):
         
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
-        tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
+        for config in model_configs:
+            config.skip_download = True
+        tokenizer_config = ModelConfig(skip_download=True, model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         audio_processor_config = self.parse_path_or_model_id(audio_processor_path)
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+        self.pipe = WanVideoPipeline.from_pretrained(
+            redirect_common_files=False,
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            audio_processor_config=audio_processor_config,
+        )
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
         # Training mode
@@ -73,7 +82,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             else:
                 inputs_shared[extra_input] = data[extra_input]
         if inputs_shared.get("framewise_decoding", False):
-            # WanToDance global model
+            # Keep compatibility with framewise-decoding datasets.
             inputs_shared["num_frames"] = 4 * (len(data["video"]) - 1) + 1
         return inputs_shared
     
@@ -116,11 +125,11 @@ def wan_parser():
     parser = add_general_config(parser)
     parser = add_video_size_config(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
-    parser.add_argument("--audio_processor_path", type=str, default=None, help="Path to the audio processor. If provided, the processor will be used for Wan2.2-S2V model.")
-    parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
-    parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
+    parser.add_argument("--audio_processor_path", type=str, default=None, help="Path to the audio processor.")
+    parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary.")
+    parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
-    parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable it if this model is a WanToDance global model.")
+    parser.add_argument("--framewise_decoding", default=False, action="store_true", help="Enable framewise decoding.")
     return parser
 
 

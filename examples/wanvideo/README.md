@@ -1,3 +1,10 @@
-English Document: https://diffsynth-studio-doc.readthedocs.io/en/latest/Model_Details/Wan.html
+# Wan Examples (Local Models Only)
 
-中文文档：https://diffsynth-studio-doc.readthedocs.io/zh-cn/latest/Model_Details/Wan.html
+These examples are configured for local checkpoint usage.
+
+- Python scripts use `ModelConfig(skip_download=True, ...)`.
+- Training shell scripts export:
+  - `DIFFSYNTH_SKIP_DOWNLOAD=true`
+  - `DIFFSYNTH_MODEL_BASE_PATH=./models`
+
+Prepare your checkpoints under `./models` (or your custom `DIFFSYNTH_MODEL_BASE_PATH`).

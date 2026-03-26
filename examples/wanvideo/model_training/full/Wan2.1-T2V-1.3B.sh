@@ -1,4 +1,7 @@
-modelscope download --dataset DiffSynth-Studio/diffsynth_example_dataset --include "wanvideo/Wan2.1-T2V-1.3B/*" --local_dir ./data/diffsynth_example_dataset
+export DIFFSYNTH_SKIP_DOWNLOAD=true
+export DIFFSYNTH_MODEL_BASE_PATH=./models
+
+# Prepare dataset locally before running this script.
 
 accelerate launch examples/wanvideo/model_training/train.py \
   --dataset_base_path data/diffsynth_example_dataset/wanvideo/Wan2.1-T2V-1.3B \
