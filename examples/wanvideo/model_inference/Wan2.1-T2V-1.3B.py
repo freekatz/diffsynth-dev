@@ -1,19 +1,38 @@
+import argparse
+import glob
 import torch
 from diffsynth.utils.data import save_video, VideoData
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-m", "--model_path", type=str, required=True, help="Path to the local Wan2.1-T2V-1.3B model directory.")
+    return parser.parse_args()
+
+
+args = parse_args()
+
+
+def resolve_single_path(model_path, pattern):
+    matched_paths = glob.glob(f"{model_path}/{pattern}")
+    if len(matched_paths) == 0:
+        raise FileNotFoundError(f"Cannot find file matching {pattern} under {model_path}.")
+    if len(matched_paths) > 1:
+        raise ValueError(f"Found multiple files matching {pattern} under {model_path}: {matched_paths}")
+    return matched_paths[0]
+
+
 pipe = WanVideoPipeline.from_pretrained(
-    redirect_common_files=True,
+    redirect_common_files=False,
     torch_dtype=torch.bfloat16,
     device="cuda",
     model_configs=[
-        ModelConfig(skip_download=True, model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="diffusion_pytorch_model*.safetensors"),
-        ModelConfig(skip_download=True, model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth"),
-        ModelConfig(skip_download=True, model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="Wan2.1_VAE.pth"),
-        ModelConfig(skip_download=True, model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"),
+        ModelConfig(path=resolve_single_path(args.model_path, "diffusion_pytorch_model*.safetensors")),
+        ModelConfig(path=resolve_single_path(args.model_path, "models_t5_umt5-xxl-enc-bf16.pth")),
+        ModelConfig(path=resolve_single_path(args.model_path, "Wan2.1_VAE.pth")),
     ],
-    tokenizer_config=ModelConfig(skip_download=True, model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/"),
+    tokenizer_config=ModelConfig(path=f"{args.model_path}/google/umt5-xxl"),
 )
 
 # Text-to-video
@@ -24,23 +43,12 @@ video = pipe(
 )
 save_video(video, "video_1_Wan2.1-T2V-1.3B_t2v.mp4", fps=15, quality=5)
 
-# Image-to-video
-input_image = video[0]
-video = pipe(
-    prompt="纪实摄影风格画面，一只活泼的小狗继续沿着草地向前奔跑，镜头保持中景侧面移动，动作连贯自然，光照稳定，背景草地与天空细节清晰。",
-    negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-    input_image=input_image,
-    seed=1,
-    tiled=True,
-)
-save_video(video, "video_2_Wan2.1-T2V-1.3B_i2v.mp4", fps=15, quality=5)
-
 # Video-to-video
-video = VideoData("video_1_Wan2.1-T2V-1.3B_t2v.mp4", height=480, width=832)
+video = VideoData("video_1_Wan2.1-T2V-1.3B_t2v.mp4", height=480, width=832).raw_data()
 video = pipe(
     prompt="纪实摄影风格画面，一只活泼的小狗戴着黑色墨镜在绿茵茵的草地上迅速奔跑。小狗毛色棕黄，戴着黑色墨镜，两只耳朵立起，神情专注而欢快。阳光洒在它身上，使得毛发看上去格外柔软而闪亮。背景是一片开阔的草地，偶尔点缀着几朵野花，远处隐约可见蓝天和几片白云。透视感鲜明，捕捉小狗奔跑时的动感和四周草地的生机。中景侧面移动视角。",
     negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
     input_video=video, denoising_strength=0.7,
     seed=2, tiled=True
 )
-save_video(video, "video_3_Wan2.1-T2V-1.3B_v2v.mp4", fps=15, quality=5)
+save_video(video, "video_2_Wan2.1-T2V-1.3B_v2v.mp4", fps=15, quality=5)
