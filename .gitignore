@@ -4,6 +4,7 @@ data/
 bak/
 results/
 training/
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

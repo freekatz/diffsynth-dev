@@ -32,6 +32,15 @@ VRAM_MANAGEMENT_MODULE_MAPS = {
         'torch.nn.SiLU': 'diffsynth.core.vram.layers.AutoWrappedModule',
         'torch.nn.Dropout': 'diffsynth.core.vram.layers.AutoWrappedModule',
     },
+    'diffsynth.models.wan_video_4d_dit.WanModel4D': {
+        'diffsynth.models.wan_video_4d_dit.DiTBlock4D': 'diffsynth.core.vram.layers.AutoWrappedNonRecurseModule',
+        'diffsynth.models.wan_video_dit.MLP': 'diffsynth.core.vram.layers.AutoWrappedModule',
+        'diffsynth.models.wan_video_dit.Head': 'diffsynth.core.vram.layers.AutoWrappedModule',
+        'torch.nn.Linear': 'diffsynth.core.vram.layers.AutoWrappedLinear',
+        'torch.nn.Conv3d': 'diffsynth.core.vram.layers.AutoWrappedModule',
+        'torch.nn.LayerNorm': 'diffsynth.core.vram.layers.AutoWrappedModule',
+        'diffsynth.models.wan_video_dit.RMSNorm': 'diffsynth.core.vram.layers.AutoWrappedModule',
+    },
 }
 
 VERSION_CHECKER_MAPS = {}
