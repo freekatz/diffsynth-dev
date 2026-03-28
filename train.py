@@ -305,7 +305,6 @@ class Wan4DTrainModule(pl.LightningModule):
 def parse_args():
     p = argparse.ArgumentParser(
         description="Wan4D train (index.json format + Lightning). Defaults match Wan2.1-T2V-1.3B full dit recipe.",
-        epilog="Ref: examples/wanvideo/model_training/full/Wan2.1-T2V-1.3B.sh; LoRA uses 1e-4 — pass --learning_rate 1e-4 if needed.",
     )
     p.add_argument(
         "--dataset_root",
