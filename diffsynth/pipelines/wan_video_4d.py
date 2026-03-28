@@ -1,6 +1,8 @@
 import glob
-import math
+import json
 import os
+
+import math
 import torch
 from typing import Optional, Union
 from einops import rearrange
@@ -18,7 +20,7 @@ from ..models.wan_video_vae import WanVideoVAE
 from ..models.wan_video_image_encoder import WanImageEncoder
 
 
-def _resolve_single_path(model_path: str, patterns: list[str]) -> str:
+def resolve_single_path(model_path: str, patterns: list[str]) -> str:
     for pattern in patterns:
         matched_paths = sorted(glob.glob(os.path.join(model_path, pattern)))
         if len(matched_paths) == 1:
@@ -28,7 +30,7 @@ def _resolve_single_path(model_path: str, patterns: list[str]) -> str:
     raise FileNotFoundError(f"Cannot resolve any of {patterns} under {model_path}.")
 
 
-def _resolve_single_dir(model_path: str, patterns: list[str]) -> str:
+def resolve_single_dir(model_path: str, patterns: list[str]) -> str:
     for pattern in patterns:
         matched_paths = [path for path in sorted(glob.glob(os.path.join(model_path, pattern))) if os.path.isdir(path)]
         if len(matched_paths) == 1:
@@ -38,20 +40,21 @@ def _resolve_single_dir(model_path: str, patterns: list[str]) -> str:
     raise FileNotFoundError(f"Cannot resolve any directory in {patterns} under {model_path}.")
 
 
-def _build_wan_t2v_model_configs(model_path: str) -> list[ModelConfig]:
+
+def build_wan_t2v_model_configs(model_path: str) -> list[ModelConfig]:
     return [
-        ModelConfig(path=_resolve_single_path(model_path, [
+        ModelConfig(path=resolve_single_path(model_path, [
             "diffusion_pytorch_model*.safetensors",
             "wan_video_dit*.safetensors",
             "model*.safetensors",
             "dit*.safetensors",
         ])),
-        ModelConfig(path=_resolve_single_path(model_path, [
+        ModelConfig(path=resolve_single_path(model_path, [
             "models_t5_umt5-xxl-enc-bf16.pth",
             "wan_video_text_encoder*.pth",
             "text_encoder*.pth",
         ])),
-        ModelConfig(path=_resolve_single_path(model_path, [
+        ModelConfig(path=resolve_single_path(model_path, [
             "Wan2.1_VAE.pth",
             "wan_video_vae*.pth",
             "vae*.pth",
@@ -59,8 +62,8 @@ def _build_wan_t2v_model_configs(model_path: str) -> list[ModelConfig]:
     ]
 
 
-def _build_wan_tokenizer_config(model_path: str) -> ModelConfig:
-    tokenizer_dir = _resolve_single_dir(model_path, [
+def build_wan_tokenizer_config(model_path: str) -> ModelConfig:
+    tokenizer_dir = resolve_single_dir(model_path, [
         "google/umt5-xxl",
         "umt5-xxl",
         "tokenizer",
@@ -111,7 +114,7 @@ class Wan4DPipeline(BasePipeline):
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Union[str, torch.device] = get_device_type(),
         model_configs: list[ModelConfig] = [],
-        tokenizer_config: Optional[ModelConfig] = ModelConfig(
+        tokenizer_config: ModelConfig = ModelConfig(
             model_id="Wan-AI/Wan2.1-T2V-1.3B",
             origin_file_pattern="google/umt5-xxl/",
         ),
@@ -171,11 +174,6 @@ class Wan4DPipeline(BasePipeline):
             pipe.dit.load_state_dict(ckpt, strict=True)
             print(f"Loaded Wan4D checkpoint from {wan4d_ckpt_path}")
 
-        # WanModel4D is constructed in Python (not from model_pool); weights are CPU tensors until moved.
-        if pipe.dit is not None:
-            pipe.dit = pipe.dit.to(device=pipe.device, dtype=pipe.torch_dtype)
-            pipe.dit.eval()
-
         pipe.vae = model_pool.fetch_model("wan_video_vae")
         pipe.image_encoder = model_pool.fetch_model("wan_video_image_encoder")
 
@@ -203,8 +201,8 @@ class Wan4DPipeline(BasePipeline):
         return Wan4DPipeline.from_pretrained(
             torch_dtype=torch_dtype,
             device=device,
-            model_configs=_build_wan_t2v_model_configs(pretrained_model_dir),
-            tokenizer_config=_build_wan_tokenizer_config(pretrained_model_dir),
+            model_configs=build_wan_t2v_model_configs(pretrained_model_dir),
+            tokenizer_config=build_wan_tokenizer_config(pretrained_model_dir),
             wan4d_ckpt_path=wan4d_ckpt_path,
             vram_limit=vram_limit,
         )
@@ -248,10 +246,12 @@ class Wan4DPipeline(BasePipeline):
         negative_prompt: str = "",
         # Camera-control inputs
         source_video: torch.Tensor = None,          # [B, C, T, H, W] float32, range [-1, 1]
+        source_latents: Optional[torch.Tensor] = None,  # [B, 16, T_latent, h, w]; skips VAE encode if set
         target_camera: torch.Tensor = None,          # [B, T', 12] camera extrinsics, T'=21
         source_camera: torch.Tensor = None,          # [B, T', 12]
         src_time_embedding: torch.Tensor = None,     # [T] or [B, T] frame indices (T=81)
         tgt_time_embedding: torch.Tensor = None,     # [T] or [B, T]
+        prompt_context: Optional[torch.Tensor] = None,  # [B, L, D] positive UMT5 embeds; skips text encode if set
         # Randomness
         seed: Optional[int] = None,
         rand_device: str = "cpu",
@@ -272,8 +272,8 @@ class Wan4DPipeline(BasePipeline):
         # Progress bar
         progress_bar_cmd=tqdm,
     ):
-        if source_video is None:
-            raise ValueError("`source_video` is required for Wan4DPipeline inference.")
+        if source_latents is None and source_video is None:
+            raise ValueError("Provide `source_video` or precomputed `source_latents` for Wan4DPipeline inference.")
         if target_camera is None or source_camera is None:
             raise ValueError("Both `target_camera` and `source_camera` are required.")
         if src_time_embedding is None or tgt_time_embedding is None:
@@ -294,10 +294,13 @@ class Wan4DPipeline(BasePipeline):
         )
         latents = noise
 
-        # --- encode source video ---
-        self.load_models_to_device(["vae"])
-        source_video = source_video.to(dtype=self.torch_dtype, device=self.device)
-        source_latents = self._encode_source_video(source_video, **tiler_kwargs)
+        # --- encode source video (or use precomputed latents) ---
+        if source_latents is None:
+            self.load_models_to_device(["vae"])
+            source_video = source_video.to(dtype=self.torch_dtype, device=self.device)
+            source_latents = self._encode_source_video(source_video, **tiler_kwargs)
+        else:
+            source_latents = source_latents.to(dtype=self.torch_dtype, device=self.device)
 
         # --- prepare camera embeddings ---
         cam_emb = {
@@ -308,9 +311,15 @@ class Wan4DPipeline(BasePipeline):
         tgt_time_emb = tgt_time_embedding.to(dtype=self.torch_dtype, device=self.device)
         frame_time_emb = {"time_embedding_src": src_time_emb, "time_embedding_tgt": tgt_time_emb}
 
-        # --- encode prompts ---
-        self.load_models_to_device(["text_encoder"])
-        context_posi = self._encode_prompt(prompt)
+        # --- encode prompts (optional precomputed positive context) ---
+        if prompt_context is not None:
+            context_posi = prompt_context.to(dtype=self.torch_dtype, device=self.device)
+            if context_posi.dim() == 2:
+                context_posi = context_posi.unsqueeze(0)
+            self.load_models_to_device(["text_encoder"] if cfg_scale != 1.0 else [])
+        else:
+            self.load_models_to_device(["text_encoder"])
+            context_posi = self._encode_prompt(prompt)
         context_nega = self._encode_prompt(negative_prompt) if cfg_scale != 1.0 else None
 
         # --- denoising loop ---
@@ -319,12 +328,12 @@ class Wan4DPipeline(BasePipeline):
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
             latents_input = torch.cat([latents, source_latents], dim=2)
 
-            noise_pred_posi = model_fn_wan4d(
+            noise_pred_posi = model_fn_wan4d_video(
                 self.dit, latents_input, timestep=timestep,
                 cam_emb=cam_emb, context=context_posi, frame_time_embedding=frame_time_emb,
             )
             if cfg_scale != 1.0:
-                noise_pred_nega = model_fn_wan4d(
+                noise_pred_nega = model_fn_wan4d_video(
                     self.dit, latents_input, timestep=timestep,
                     cam_emb=cam_emb, context=context_nega, frame_time_embedding=frame_time_emb,
                 )
@@ -346,7 +355,7 @@ class Wan4DPipeline(BasePipeline):
         return frames
 
 
-def model_fn_wan4d(
+def model_fn_wan4d_video(
     dit: WanModel4D,
     x: torch.Tensor,
     timestep: torch.Tensor,

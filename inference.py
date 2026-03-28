@@ -1,365 +1,319 @@
+#!/usr/bin/env python3
+"""Wan4D inference using trained model weights.
+
+Examples::
+
+    python inference.py --clip_dir ./data/videos/.../clip_0 --wan_model_dir ./models \\
+        --ckpt ./training/proj/exp/checkpoints/step500_model.ckpt
+
+Use the pure model weight file (*_model.ckpt) saved by training for inference.
+"""
+
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import os
-from typing import Any
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
 import imageio
 import numpy as np
 import torch
-from einops import rearrange
-from PIL import Image
 from torchvision.transforms import v2
 
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
-
-
-VALID_TIME_MODES = {
-    "forward",
-    "reverse",
-    "pingpong",
-    "bounce_late",
-    "bounce_early",
-    "slowmo_first_half",
-    "slowmo_second_half",
-    "ramp_then_freeze",
-    "freeze_start",
-    "freeze_early",
-    "freeze_mid",
-    "freeze_late",
-    "freeze_end",
-}
+from utils.camera import get_target_camera_from_source, load_camera_from_meta, load_camera_from_json
+from utils.image import load_frames_using_imageio
+from utils.time_pattern import VALID_TIME_PATTERNS, get_time_pattern
 
 DEFAULT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，"
-    "JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，"
+    "JPEG 压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，"
     "手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
+RESULTS_DIR = "results"
 
 
-def load_frames_using_imageio(file_path, num_frames, frame_process):
-    reader = imageio.get_reader(file_path)
-    reader_any: Any = reader
-    if reader_any.count_frames() < num_frames:
-        reader.close()
-        return None
-    frames = []
-    for frame_id in range(num_frames):
-        frame = reader.get_data(frame_id)
-        frame = Image.fromarray(frame)
-        frame = frame_process(frame)
-        frames.append(frame)
-    reader.close()
-    return torch.stack(frames, dim=0).permute(1, 0, 2, 3)
+def video_path_hash(video_rel_path: str) -> str:
+    """Generate 16-char hash for video path (for latent cache lookup)."""
+    return hashlib.sha256(video_rel_path.encode()).hexdigest()[:16]
 
 
-class Camera:
-    def __init__(self, c2w):
-        c2w_mat = np.array(c2w).reshape(4, 4)
-        self.c2w_mat = c2w_mat
-        self.w2c_mat = np.linalg.inv(c2w_mat)
+def caption_content_hash(caption: str) -> str:
+    """Generate 16-char hash for caption text (for latent cache lookup)."""
+    return hashlib.sha256(caption.encode()).hexdigest()[:16]
 
 
-def parse_matrix(matrix_str):
-    rows = matrix_str.strip().split("] [")
-    matrix = []
-    for row in rows:
-        row = row.replace("[", "").replace("]", "")
-        matrix.append(list(map(float, row.split())))
-    return np.array(matrix)
+def load_checkpoint(ckpt_path: str, device: str = "cpu") -> dict:
+    """Load pure model weights from training checkpoint.
 
+    Use the *_model.ckpt file saved by training.
+    Also supports Lightning format (auto-extracts state_dict).
 
-def parse_cam_type(cam_type):
-    if isinstance(cam_type, int):
-        return cam_type
-    text = str(cam_type).lower().strip()
-    if text.startswith("cam"):
-        text = text[3:]
-    text = text.lstrip("0") or "0"
-    return int(text)
+    Args:
+        ckpt_path: Path to checkpoint file (*_model.ckpt or .ckpt)
+        device: Device to load weights to
 
+    Returns:
+        dict: Model state_dict with 'pipe.dit.' or 'dit.' prefix stripped
+    """
+    obj = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-def get_relative_pose(cam_params):
-    abs_w2cs = [cam_param.w2c_mat for cam_param in cam_params]
-    abs_c2ws = [cam_param.c2w_mat for cam_param in cam_params]
-    target_cam_c2w = np.eye(4)
-    abs2rel = target_cam_c2w @ abs_w2cs[0]
-    ret_poses = [target_cam_c2w] + [abs2rel @ abs_c2w for abs_c2w in abs_c2ws[1:]]
-    return np.array(ret_poses, dtype=np.float32)
-
-
-def load_src_camera(src_cam_path):
-    raw_w2c = np.load(src_cam_path)
-    src_c2w = np.linalg.inv(raw_w2c)
-    ref_inv = np.linalg.inv(src_c2w[0])
-    src_c2w_norm = src_c2w @ ref_inv
-    translations = src_c2w_norm[:, :3, 3]
-    scene_scale = np.max(np.abs(translations))
-    if scene_scale < 1e-2:
-        scene_scale = 1.0
-    src_c2w_norm[:, :3, 3] /= scene_scale
-    src_c2w_norm = src_c2w_norm[::4]
-    poses = [torch.as_tensor(src_c2w_norm[i], dtype=torch.float32)[:3, :] for i in range(len(src_c2w_norm))]
-    src_cam = torch.stack(poses, dim=0)
-    src_cam = rearrange(src_cam, "b c d -> b (c d)")
-    return src_cam.to(torch.bfloat16)
-
-
-def make_identity_src_camera(num_frames=81):
-    identity_w2c = np.eye(4)[np.newaxis].repeat(num_frames, axis=0)
-    src_c2w = np.linalg.inv(identity_w2c)
-    ref_inv = np.linalg.inv(src_c2w[0])
-    src_c2w_norm = src_c2w @ ref_inv
-    src_c2w_norm = src_c2w_norm[::4]
-    poses = [torch.as_tensor(src_c2w_norm[i], dtype=torch.float32)[:3, :] for i in range(len(src_c2w_norm))]
-    src_cam = torch.stack(poses, dim=0)
-    src_cam = rearrange(src_cam, "b c d -> b (c d)")
-    return src_cam.to(torch.bfloat16)
-
-
-def load_target_camera(camera_json_path, cam_idx, num_frames=81):
-    with open(camera_json_path, "r") as file:
-        cam_data = json.load(file)
-    frame_indices = list(range(num_frames))[::4]
-    traj = [parse_matrix(cam_data[f"frame{idx}"][f"cam{cam_idx:02d}"]) for idx in frame_indices]
-    traj = np.stack(traj).transpose(0, 2, 1)
-    cam_params = []
-    for c2w in traj:
-        c2w = c2w[:, [1, 2, 0, 3]]
-        c2w[:3, 1] *= -1.0
-        c2w[:3, 3] /= 100.0
-        cam_params.append(Camera(c2w))
-    relative_poses = []
-    for index in range(len(cam_params)):
-        relative_pose = get_relative_pose([cam_params[0], cam_params[index]])
-        relative_poses.append(torch.as_tensor(relative_pose)[:, :3, :][1])
-    pose_embedding = torch.stack(relative_poses, dim=0)
-    pose_embedding = rearrange(pose_embedding, "b c d -> b (c d)")
-    return pose_embedding.to(torch.bfloat16)
-
-
-def get_time_pattern(pattern: str, num_frames: int = 81):
-    if pattern == "reverse":
-        base = list(range(num_frames - 1, -1, -1))
-    elif pattern == "pingpong":
-        start = 40
-        base = list(range(start, num_frames)) + list(range(num_frames - 1, start - 1, -1))
-    elif pattern == "bounce_late":
-        frame_a, frame_b, frame_c = 4 * 15, 4 * 21, 4 * 5
-        base = list(range(frame_a, frame_b + 1)) + list(range(frame_b, frame_c - 1, -1))
-    elif pattern == "bounce_early":
-        frame_a, frame_b, frame_c = 4 * 5, 4 * 21, 4 * 15
-        base = list(range(frame_a, frame_b + 1)) + list(range(frame_b, frame_c - 1, -1))
-    elif pattern == "slowmo_first_half":
-        base = [0] + [index for index in range(1, 41) for _ in (0, 1)]
-    elif pattern == "slowmo_second_half":
-        base = [40] + [index for index in range(41, num_frames) for _ in (0, 1)]
-    elif pattern == "ramp_then_freeze":
-        freeze_point = 40
-        base = list(range(freeze_point + 1)) + [freeze_point] * (num_frames - freeze_point - 1)
-    elif pattern == "freeze_start":
-        base = [0.0] * num_frames
-    elif pattern == "freeze_early":
-        base = [20.0] * num_frames
-    elif pattern == "freeze_mid":
-        base = [40.0] * num_frames
-    elif pattern == "freeze_late":
-        base = [60.0] * num_frames
-    elif pattern == "freeze_end":
-        base = [80.0] * num_frames
-    elif pattern == "forward":
-        base = list(range(num_frames))
+    if isinstance(obj, dict) and 'state_dict' in obj:
+        sd = obj['state_dict']
     else:
-        raise ValueError(f"Unknown time pattern: {pattern}")
+        sd = obj
 
-    if len(base) >= num_frames:
-        return base[:num_frames]
+    # Strip 'pipe.dit.' or 'dit.' prefix
+    def strip_prefix(k):
+        if k.startswith('pipe.dit.'):
+            return k[len('pipe.dit.'):]
+        if k.startswith('dit.'):
+            return k[len('dit.'):]
+        return k
 
-    output = []
-    index = 0
-    while len(output) < num_frames:
-        output.append(base[index % len(base)])
-        index += 1
-    return output
-
-
-def resolve_caption(video_path, caption_arg, caption_file):
-    if caption_arg is not None and str(caption_arg).strip():
-        return str(caption_arg).strip()
-    if caption_file is not None:
-        if not os.path.isfile(caption_file):
-            raise FileNotFoundError(f"--caption_file not found: {caption_file}")
-        with open(caption_file, "r", encoding="utf-8") as file:
-            text = file.read().strip()
-        if text:
-            return text
-    video_dir = os.path.dirname(os.path.abspath(video_path))
-    stem = os.path.splitext(os.path.basename(video_path))[0]
-    for name in (f"{stem}.txt", "caption.txt", "prompt.txt"):
-        path = os.path.join(video_dir, name)
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as file:
-                text = file.read().strip()
-            if text:
-                return text
-    raise ValueError(
-        "No caption: pass --caption, or --caption_file, or place a .txt next to the video "
-        f"(e.g. `{stem}.txt`, `caption.txt`, `prompt.txt`)."
-    )
+    return {strip_prefix(k): v for k, v in sd.items()}
 
 
-def resolve_src_cam(video_path, data_dir, src_vid_cam, auto_src_cam):
-    if src_vid_cam is not None:
-        return src_vid_cam
-    if not auto_src_cam or data_dir is None:
-        return None
-    stem = os.path.splitext(os.path.basename(video_path))[0]
-    candidate = os.path.join(data_dir, "src_cam", f"{stem}_extrinsics.npy")
-    return candidate if os.path.isfile(candidate) else None
+def resolve_inference_device(device: str, gpu_id: Optional[int]) -> str:
+    """Resolve target device with optional GPU index.
+
+    Args:
+        device: Base device string (cuda, cpu, mps)
+        gpu_id: Optional CUDA device index
+
+    Returns:
+        Full device string (e.g., cuda:0, cpu, mps)
+    """
+    if gpu_id is None:
+        return device
+    d = device.strip().lower()
+    if d == "cpu" or d.startswith("mps"):
+        raise SystemExit("--gpu_id only applies with CUDA; do not use --device cpu/mps with --gpu_id")
+    if d == "cuda" or d.startswith("cuda:"):
+        return f"cuda:{gpu_id}"
+    raise SystemExit(f"--gpu_id requires --device cuda or cuda:* (got --device {device!r})")
+
+
+def resolve_clip_path(
+    clip_dir: Optional[str],
+    dataset_root: Optional[str],
+    clip_relpath: Optional[str]
+) -> tuple[Path, Path]:
+    """Resolve clip directory and dataset root.
+
+    Args:
+        clip_dir: Direct clip directory path, or None
+        dataset_root: Dataset root directory, or None
+        clip_relpath: Relative path under videos/, or None
+
+    Returns:
+        (clip_path, dataset_root) tuple
+
+    Raises:
+        ValueError: If arguments are invalid or incomplete
+    """
+    if clip_dir:
+        if dataset_root or clip_relpath:
+            raise ValueError("Use either --clip_dir or (--dataset_root + --clip_relpath), not both.")
+        clip_path = Path(clip_dir).resolve()
+        # Infer dataset_root from clip_path (find 'videos' segment)
+        parts = clip_path.parts
+        if 'videos' in parts:
+            idx = parts.index('videos')
+            inferred_root = Path(*parts[:idx]) if idx > 0 else Path('.')
+        else:
+            inferred_root = clip_path.parent
+        return clip_path, inferred_root
+
+    if dataset_root and clip_relpath:
+        clip_path = Path(dataset_root) / 'videos' / clip_relpath
+        return clip_path.resolve(), Path(dataset_root).resolve()
+
+    raise ValueError("Provide --clip_dir or both --dataset_root and --clip_relpath")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Wan4D single-video inference. Use --data_dir + --wan_model_dir for minimal args.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Demo layout: cameras under data_dir, optional src_cam from data_dir/src_cam/<video_stem>_extrinsics.npy
-  python inference.py --wan_model_dir /path/to/Wan2.1-T2V-1.3B --video_path data/demo_videos/videos/a.mp4 \\
-    --data_dir data/demo_videos --ckpt outputs/run/checkpoints/step1000.ckpt
+    p = argparse.ArgumentParser(description="Wan4D inference")
 
-  # Base model only (no --ckpt)
-  python inference.py --wan_model_dir /path/to/Wan2.1-T2V-1.3B --video_path data/demo_videos/videos/a.mp4 \\
-    --data_dir data/demo_videos --caption "a cinematic shot"
-""",
-    )
-    parser.add_argument("--video_path", type=str, required=True, help="Input source video path.")
-    parser.add_argument(
-        "--caption",
-        type=str,
-        default=None,
-        help="Prompt text. If omitted, reads from --caption_file or <video_stem>.txt / caption.txt / prompt.txt next to the video.",
-    )
-    parser.add_argument(
-        "--caption_file",
-        type=str,
-        default=None,
-        help="Optional path to a text file with the prompt (overrides sidecar .txt when --caption is not set).",
-    )
-    parser.add_argument(
-        "--ckpt",
-        type=str,
-        default=None,
-        help="Fine-tuned DiT checkpoint (e.g. step*.ckpt). Omit to run with base Wan weights only.",
-    )
-    parser.add_argument("--output_dir", type=str, default="./outputs/wan4d_infer", help="Output directory for mp4.")
-    parser.add_argument("--output_name", type=str, default=None, help="Output filename stem (default: video stem + _wan4d).")
+    # Clip selection (mutually exclusive)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--clip_dir", type=str, default=None,
+                   help="Path to clip directory (e.g., .../videos/source/vid/clip_0)")
+    g.add_argument("--dataset_root", type=str, default=None,
+                   help="Dataset root directory (requires --clip_relpath)")
+    p.add_argument("--clip_relpath", type=str, default=None,
+                   help="Relative path under videos/, e.g., source/vid/clip_0")
 
-    parser.add_argument(
-        "--wan_model_dir",
-        type=str,
-        required=True,
-        help="Local Wan pretrained directory (DiT + VAE + text encoder + tokenizer).",
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="data/demo_videos",
-        help="Dataset root: uses {data_dir}/cameras/camera_extrinsics.json unless --camera_file is set.",
-    )
-    parser.add_argument(
-        "--camera_file",
-        type=str,
-        default=None,
-        help="Override path to camera_extrinsics.json (default: {data_dir}/cameras/camera_extrinsics.json).",
-    )
-    parser.add_argument("--cam_type", type=str, default="cam01", help="Target camera key, e.g. cam01 or 1.")
-    parser.add_argument(
-        "--src_vid_cam",
-        type=str,
-        default=None,
-        help="Explicit path to source camera extrinsics .npy. Overrides --auto_src_cam.",
-    )
-    parser.add_argument(
-        "--auto_src_cam",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="If true and --src_vid_cam is not set, try {data_dir}/src_cam/<video_stem>_extrinsics.npy (default: true).",
-    )
-    parser.add_argument(
-        "--negative_prompt",
-        type=str,
-        default=DEFAULT_NEGATIVE_PROMPT,
-        help="Negative prompt for CFG (default: long Chinese safety list). Use empty string to disable negative branch.",
-    )
-    parser.add_argument("--temporal_control", type=str, default="forward", choices=sorted(VALID_TIME_MODES))
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--cfg_scale", type=float, default=5.0)
-    parser.add_argument("--num_inference_steps", type=int, default=20)
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--width", type=int, default=832)
-    parser.add_argument("--num_frames", type=int, default=81)
-    parser.add_argument("--tiled", default=True, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--device", type=str, default="cuda", help="Device for pipeline (e.g. cuda or cuda:0).")
-    return parser.parse_args()
+    # Model
+    p.add_argument("--wan_model_dir", type=str, required=True,
+                   help="Path to Wan model directory")
+    p.add_argument("--ckpt", type=str, default=None,
+                   help="Pure model weight file from training (step{N}_model.ckpt)")
+
+    # Target camera
+    p.add_argument("--pattern", type=str, default="forward", choices=sorted(VALID_TIME_PATTERNS),
+                   help="Time pattern for target camera motion")
+    p.add_argument("--preset_cam", type=int, choices=range(1, 11), default=None,
+                   help="Preset camera index (1-10) from camera_extrinsics.json")
+    p.add_argument("--camera_json", type=str, default=None,
+                   help="Camera JSON file (default: {dataset_root}/cameras/camera_extrinsics.json)")
+
+    # Inference settings
+    p.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--cfg_scale", type=float, default=5.0)
+    p.add_argument("--num_inference_steps", type=int, default=20)
+    p.add_argument("--height", type=int, default=480)
+    p.add_argument("--width", type=int, default=832)
+    p.add_argument("--num_frames", type=int, default=81)
+    p.add_argument("--tiled", default=True, action=argparse.BooleanOptionalAction)
+
+    # Latent cache
+    p.add_argument("--no_latent_cache", action="store_true",
+                   help="Ignore caption_latents/ and latents/ caches")
+
+    # Device
+    p.add_argument("--device", type=str, default="cuda",
+                   help="Device to use (cuda, cpu, mps)")
+    p.add_argument("--gpu_id", type=int, default=None, metavar="N",
+                   help="CUDA device index (e.g., 0, 1, 2). Uses cuda:N. Ignored for cpu/mps.")
+
+    # Output
+    p.add_argument("--output", type=str, default=None,
+                   help="Output mp4 path (default: results/{clip}_{pattern}_{timestamp}.mp4)")
+
+    return p.parse_args()
 
 
 def main():
     args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    camera_file = args.camera_file or os.path.join(args.data_dir, "cameras", "camera_extrinsics.json")
-    if not os.path.isfile(camera_file):
-        raise FileNotFoundError(
-            f"Camera file not found: {camera_file}. Set --camera_file or a valid --data_dir."
-        )
+    # Resolve device
+    device = resolve_inference_device(args.device, args.gpu_id)
 
-    caption = resolve_caption(args.video_path, args.caption, args.caption_file)
-    src_cam_path = resolve_src_cam(args.video_path, args.data_dir, args.src_vid_cam, args.auto_src_cam)
-    if src_cam_path:
-        print(f"Using source camera: {src_cam_path}")
+    # 1. Resolve paths
+    clip_path, dataset_root = resolve_clip_path(args.clip_dir, args.dataset_root, args.clip_relpath)
+
+    # 2. Validate required files
+    for path, label in (
+        (clip_path / "video.mp4", "video.mp4"),
+        (clip_path / "meta.json", "meta.json"),
+        (clip_path / "caption.txt", "caption.txt"),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing {label}: {path}")
+
+    # 3. Load caption and metadata
+    caption_text = (clip_path / "caption.txt").read_text(encoding="utf-8").strip()
+    if not caption_text:
+        raise ValueError(f"Empty caption: {clip_path / 'caption.txt'}")
+
+    meta = json.loads((clip_path / "meta.json").read_text(encoding="utf-8"))
+    src_c2w = np.array(meta["camera"]["extrinsics_c2w"], dtype=np.float32)
+
+    # 4. Load cameras
+    src_camera = load_camera_from_meta(str(clip_path / "meta.json"), dtype=torch.bfloat16).unsqueeze(0)
+
+    if args.preset_cam:
+        camera_json = Path(args.camera_json) if args.camera_json else dataset_root / "cameras" / "camera_extrinsics.json"
+        if not camera_json.is_file():
+            raise FileNotFoundError(f"Camera JSON not found: {camera_json}")
+        tgt_camera = load_camera_from_json(
+            str(camera_json), cam_idx=args.preset_cam, num_frames=args.num_frames, dtype=torch.bfloat16
+        ).unsqueeze(0)
     else:
-        print("Using identity source camera (no src_cam .npy or --auto_src_cam disabled).")
+        tgt_camera = get_target_camera_from_source(
+            src_c2w, args.pattern, num_frames=args.num_frames, dtype=torch.bfloat16
+        ).unsqueeze(0)
 
-    frame_process = v2.Compose([
-        v2.CenterCrop(size=(args.height, args.width)),
-        v2.Resize(size=(args.height, args.width), antialias=True),
-        v2.ToTensor(),
-        v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-    ])
-    video = load_frames_using_imageio(args.video_path, num_frames=args.num_frames, frame_process=frame_process)
-    if video is None:
-        raise ValueError(f"Cannot load enough frames from video: {args.video_path}")
-    source_video = video.unsqueeze(0).to(torch.bfloat16)
-
-    video_stem = os.path.splitext(os.path.basename(args.video_path))[0]
-    if src_cam_path is not None:
-        src_camera = load_src_camera(src_cam_path).unsqueeze(0)
-    else:
-        src_camera = make_identity_src_camera(num_frames=args.num_frames).unsqueeze(0)
-    tgt_camera = load_target_camera(camera_file, parse_cam_type(args.cam_type), num_frames=args.num_frames).unsqueeze(0)
-
+    # 5. Load time embeddings
     src_time = torch.tensor(get_time_pattern("forward", args.num_frames), dtype=torch.float32).unsqueeze(0)
-    tgt_time = torch.tensor(get_time_pattern(args.temporal_control, args.num_frames), dtype=torch.float32).unsqueeze(0)
+    tgt_time = torch.tensor(get_time_pattern(args.pattern, args.num_frames), dtype=torch.float32).unsqueeze(0)
 
+    # 6. Load latent cache (optional)
+    prompt_context: Optional[torch.Tensor] = None
+    source_latents: Optional[torch.Tensor] = None
+    source_video: Optional[torch.Tensor] = None
+
+    if not args.no_latent_cache:
+        # Try caption latent
+        rel_video = f"videos/{clip_path.relative_to(dataset_root)}/video.mp4" if clip_path.is_relative_to(dataset_root) else str(clip_path / "video.mp4")
+        cap_latent_file = dataset_root / "caption_latents" / f"{caption_content_hash(caption_text)}.pt"
+        if cap_latent_file.is_file():
+            td = torch.load(cap_latent_file, weights_only=True, map_location="cpu")
+            prompt_context = td["text_embeds"].detach()
+            print(f"Using caption latent: {cap_latent_file}")
+        else:
+            print(f"No caption latent at {cap_latent_file}")
+
+        # Try source video latent
+        src_latent_file = dataset_root / "latents" / f"{video_path_hash(rel_video)}.pt"
+        if src_latent_file.is_file():
+            pack = torch.load(src_latent_file, weights_only=True, map_location="cpu")
+            source_latents = pack["latents"].detach().unsqueeze(0).to(torch.bfloat16)
+            print(f"Using source VAE latent: {src_latent_file}")
+        else:
+            print(f"No source latent at {src_latent_file}")
+    else:
+        print("--no_latent_cache: ignoring latent caches")
+
+    # 7. Load source video if no latent
+    latent_t = (args.num_frames - 1) // 4 + 1
+    if source_latents is not None:
+        _, t, _, _ = source_latents.shape[1:]
+        if t != latent_t:
+            raise ValueError(f"Source latent T={t}, expected {latent_t} for num_frames={args.num_frames}")
+
+    if source_latents is None:
+        frame_process = v2.Compose([
+            v2.CenterCrop(size=(args.height, args.width)),
+            v2.ToTensor(),
+            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+        video = load_frames_using_imageio(
+            str(clip_path / "video.mp4"),
+            num_frames=args.num_frames,
+            frame_process=frame_process,
+            target_h=args.height,
+            target_w=args.width,
+            permute_to_cthw=True,
+        )
+        if video is None:
+            raise ValueError(f"Cannot load {args.num_frames} frames from {clip_path / 'video.mp4'}")
+        source_video = video.unsqueeze(0).to(torch.bfloat16)
+
+    # 8. Load pipeline and checkpoint
     pipe = Wan4DPipeline.from_wan_model_dir(
         pretrained_model_dir=args.wan_model_dir,
-        wan4d_ckpt_path=args.ckpt,
+        wan4d_ckpt_path=None,
         torch_dtype=torch.bfloat16,
-        device=args.device,
+        device=device,
     )
-    if args.ckpt:
-        print(f"Loaded Wan4D checkpoint: {args.ckpt}")
-    else:
-        print("No --ckpt: using base Wan DiT weights only.")
 
+    if args.ckpt:
+        sd = load_checkpoint(args.ckpt, device=device)
+        pipe.dit.load_state_dict(sd, strict=False)
+        pipe.dit.to(device=device, dtype=torch.bfloat16)
+        print(f"Loaded DiT from {args.ckpt}")
+    else:
+        print("No --ckpt: using base Wan2.1 model only")
+
+    # 9. Run inference
+    prompt_str = caption_text if prompt_context is None else ""
     frames = pipe(
-        prompt=caption,
+        prompt=prompt_str,
         negative_prompt=args.negative_prompt,
         source_video=source_video,
+        source_latents=source_latents,
         target_camera=tgt_camera,
         source_camera=src_camera,
         src_time_embedding=src_time,
         tgt_time_embedding=tgt_time,
+        prompt_context=prompt_context,
         cfg_scale=args.cfg_scale,
         seed=args.seed,
         num_inference_steps=args.num_inference_steps,
@@ -369,13 +323,19 @@ def main():
         tiled=args.tiled,
     )
 
-    out_stem = args.output_name or f"{video_stem}_wan4d"
-    output_path = os.path.join(args.output_dir, f"{out_stem}.mp4")
-    with imageio.get_writer(output_path, fps=30, codec="libx264") as writer:
-        writer_any: Any = writer
+    # 10. Save output
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    stem = clip_path.name
+    suffix = f"{args.pattern}" if not args.preset_cam else f"preset{args.preset_cam}_{args.pattern}"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = args.output or os.path.join(RESULTS_DIR, f"{stem}_{suffix}_{ts}.mp4")
+
+    print(f"Writing {out_path}")
+    with imageio.get_writer(out_path, fps=30, codec="libx264") as writer:
         for frame in frames:
-            writer_any.append_data(frame.cpu().numpy() if isinstance(frame, torch.Tensor) else np.array(frame))
-    print(f"Saved: {output_path}")
+            arr = frame.cpu().numpy() if isinstance(frame, torch.Tensor) else np.array(frame)
+            writer.append_data(arr)
+    print("Done.")
 
 
 if __name__ == "__main__":

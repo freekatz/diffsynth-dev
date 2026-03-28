@@ -1,6 +1,7 @@
 tmp/
 refer/
 data/
+raw_data/
 bak/
 results/
 training/

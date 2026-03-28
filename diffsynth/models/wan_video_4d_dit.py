@@ -135,7 +135,6 @@ class DiTBlock4D(nn.Module):
         # broadcast to all spatial patches: [B, 2*T', h, w, dim] -> [B, 2*T'*h*w, dim]
         t_cond = t_cond.unsqueeze(2).unsqueeze(3).expand(-1, -1, h, w, -1)
         t_cond = rearrange(t_cond, "b f h w d -> b (f h w) d")
-        input_x = input_x + t_cond
 
         # --- camera embedding ---
         cam_tgt = self.cam_encoder(cam_emb["tgt"])  # [B, T', dim]
@@ -143,6 +142,12 @@ class DiTBlock4D(nn.Module):
         cam = torch.cat([cam_tgt, cam_src], dim=1)  # [B, 2*T', dim]
         cam = cam.unsqueeze(2).unsqueeze(3).expand(-1, -1, h, w, -1)
         cam = rearrange(cam, "b f h w d -> b (f h w) d")
+        seq = input_x.shape[1]
+        if t_cond.shape[1] != seq or cam.shape[1] != seq:
+            raise ValueError(
+                f"DiTBlock4D token mismatch: patches={seq}, time_cond={t_cond.shape[1]}, cam={cam.shape[1]}."
+            )
+        input_x = input_x + t_cond
         input_x = input_x + cam
 
         # --- self-attention with projector gate ---
@@ -198,6 +203,73 @@ class WanModel4D(torch.nn.Module):
         if has_image_input:
             self.img_emb = MLP(1280, dim)
 
+    def _validate_forward_inputs(self, cam_emb: dict, frame_time_embedding: dict) -> None:
+        required_cam_keys = {"src", "tgt"}
+        required_time_keys = {"time_embedding_src", "time_embedding_tgt"}
+        missing_cam_keys = sorted(required_cam_keys - set(cam_emb.keys()))
+        missing_time_keys = sorted(required_time_keys - set(frame_time_embedding.keys()))
+        if missing_cam_keys:
+            raise KeyError(f"`cam_emb` is missing required keys: {missing_cam_keys}. Required keys: ['src', 'tgt'].")
+        if missing_time_keys:
+            raise KeyError(
+                f"`frame_time_embedding` is missing required keys: {missing_time_keys}. "
+                "Required keys: ['time_embedding_src', 'time_embedding_tgt']."
+            )
+
+    def _forward_prepare(
+        self,
+        x: torch.Tensor,
+        timestep: torch.Tensor,
+        cam_emb: dict,
+        context: torch.Tensor,
+        frame_time_embedding: dict,
+        clip_feature: Optional[torch.Tensor] = None,
+        y: Optional[torch.Tensor] = None,
+    ):
+        self._validate_forward_inputs(cam_emb, frame_time_embedding)
+        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
+        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+        context = self.text_embedding(context)
+
+        if self.has_image_input:
+            if y is None or clip_feature is None:
+                raise ValueError("WanModel4D expects both `y` and `clip_feature` when `has_image_input=True`.")
+            x = torch.cat([x, y], dim=1)
+            clip_embedding = self.img_emb(clip_feature)
+            context = torch.cat([clip_embedding, context], dim=1)
+
+        x, (f, h, w) = self.patchify(x)
+
+        freqs = torch.cat([
+            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        return t, t_mod, context, x, (f, h, w), freqs
+
+    def _forward_blocks(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        cam_emb: dict,
+        frame_time_embedding: dict,
+        t_mod: torch.Tensor,
+        freqs: torch.Tensor,
+        h: int,
+        w: int,
+        *,
+        use_gradient_checkpointing: bool,
+        use_gradient_checkpointing_offload: bool,
+    ) -> torch.Tensor:
+        for block in self.blocks:
+            x = gradient_checkpoint_forward(
+                block,
+                use_gradient_checkpointing,
+                use_gradient_checkpointing_offload,
+                x, context, cam_emb, frame_time_embedding, t_mod, freqs, h, w,
+            )
+        return x
+
     def patchify(self, x: torch.Tensor):
         x = self.patch_embedding(x)
         grid_size = x.shape[2:]
@@ -225,45 +297,20 @@ class WanModel4D(torch.nn.Module):
         use_gradient_checkpointing_offload: bool = False,
         **kwargs,
     ):
-        required_cam_keys = {"src", "tgt"}
-        required_time_keys = {"time_embedding_src", "time_embedding_tgt"}
-        missing_cam_keys = sorted(required_cam_keys - set(cam_emb.keys()))
-        missing_time_keys = sorted(required_time_keys - set(frame_time_embedding.keys()))
-        if missing_cam_keys:
-            raise KeyError(f"`cam_emb` is missing required keys: {missing_cam_keys}. Required keys: ['src', 'tgt'].")
-        if missing_time_keys:
-            raise KeyError(
-                f"`frame_time_embedding` is missing required keys: {missing_time_keys}. "
-                "Required keys: ['time_embedding_src', 'time_embedding_tgt']."
-            )
-
-        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
-        t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
-        context = self.text_embedding(context)
-
-        if self.has_image_input:
-            if y is None or clip_feature is None:
-                raise ValueError("WanModel4D expects both `y` and `clip_feature` when `has_image_input=True`.")
-            x = torch.cat([x, y], dim=1)
-            clip_embedding = self.img_emb(clip_feature)
-            context = torch.cat([clip_embedding, context], dim=1)
-
-        x, (f, h, w) = self.patchify(x)
-
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
-
-        for block in self.blocks:
-            x = gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing,
-                use_gradient_checkpointing_offload,
-                x, context, cam_emb, frame_time_embedding, t_mod, freqs, h, w,
-            )
-
+        t, t_mod, context, x, (f, h, w), freqs = self._forward_prepare(
+            x, timestep, cam_emb, context, frame_time_embedding, clip_feature, y
+        )
+        x = self._forward_blocks(
+            x,
+            context,
+            cam_emb,
+            frame_time_embedding,
+            t_mod,
+            freqs,
+            h,
+            w,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
         x = self.head(x, t)
-        x = self.unpatchify(x, (f, h, w))
-        return x
+        return self.unpatchify(x, (f, h, w))
