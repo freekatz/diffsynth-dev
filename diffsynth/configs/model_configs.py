@@ -18,6 +18,13 @@ wan_series = [{'model_hash': '9269f8db9040a9d860eaca435be61814',
  {'model_hash': 'ccc42284ea13e1ad04693284c7a09be6',
   'model_name': 'wan_video_vae',
   'model_class': 'diffsynth.models.wan_video_vae.WanVideoVAE',
-  'state_dict_converter': 'diffsynth.utils.state_dict_converters.wan_video_vae.WanVideoVAEStateDictConverter'}]
+  'state_dict_converter': 'diffsynth.utils.state_dict_converters.wan_video_vae.WanVideoVAEStateDictConverter'},
+  {
+
+        "model_hash": "5941c53e207d62f20f9025686193c40b",
+        "model_name": "wan_video_image_encoder",
+        "model_class": "diffsynth.models.wan_video_image_encoder.WanImageEncoder",
+        "state_dict_converter": "diffsynth.utils.state_dict_converters.wan_video_image_encoder.WanImageEncoderStateDictConverter"
+    },]
 
 MODEL_CONFIGS = wan_series

@@ -12,7 +12,8 @@ requires-python = ">=3.10.1"
 dependencies = [
     "torch>=2.0.0",
     "torchvision",
-    "transformers",
+    "torchaudio",
+    "transformers==5.4.0",
     "imageio",
     "imageio[ffmpeg]",
     "safetensors",
@@ -22,9 +23,16 @@ dependencies = [
     "modelscope",
     "ftfy",
     "pandas",
+    "pillow",
+    "decord",
     "accelerate",
     "peft",
     "datasets",
+    "opencv-python",
+    "pytorch_lightning",
+    "rerun_sdk",
+    "tyro",
+    "tqdm",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
