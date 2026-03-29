@@ -82,8 +82,8 @@ def copy_input_video_to_output_dir(clip_path: Path, output_subdir: str) -> Optio
     return target_path
 
 
-def build_output_subdir(dataset_root: Path, clip_path: Path) -> str:
-    """results/{source}-{video}-{clip} from clip path under dataset_root/videos."""
+def build_output_subdir(dataset_root: Path, clip_path: Path, output_name: str) -> str:
+    """results/{output_name}/{source}-{video}-{clip} from clip path under dataset_root/videos."""
     videos_dir = dataset_root / "videos"
     rel_path = clip_path.relative_to(videos_dir)
     parts = list(rel_path.parts)
@@ -96,7 +96,8 @@ def build_output_subdir(dataset_root: Path, clip_path: Path) -> str:
         source, video_id, clip_id = "unknown", "unknown", "clip"
 
     subdir_name = f"{source}-{video_id}-{clip_id}"
-    return os.path.join(RESULTS_DIR, subdir_name)
+    on = (output_name or "").strip() or "default"
+    return os.path.join(RESULTS_DIR, on, subdir_name)
 
 
 def draw_pattern_label(frame: np.ndarray, pattern: str, is_target: bool) -> np.ndarray:
@@ -241,37 +242,10 @@ def parse_preset_cam_indices(arg: Optional[str]) -> list[int]:
     return out
 
 
-def resolve_run_output_path(
-    output_opt: Optional[str],
-    default_subdir: str,
-    run_tag: str,
-    ts: str,
-    multiple_runs: bool,
-) -> str:
-    """Output path: run_tag e.g. ``reverse`` or ``reverse_preset_03``. Multiple runs -> --output must be a directory if set."""
+def resolve_run_output_path(default_subdir: str, run_tag: str, ts: str) -> str:
+    """MP4 path under the clip output directory; run_tag e.g. ``reverse`` or ``reverse_preset_03``."""
     name = f"{run_tag}_{ts}.mp4"
-    if not output_opt:
-        return os.path.join(default_subdir, name)
-
-    p = Path(output_opt).expanduser()
-    if not p.is_absolute():
-        p = Path.cwd() / p
-    p = p.resolve()
-
-    if multiple_runs:
-        if p.is_file() or p.suffix.lower() == ".mp4":
-            raise SystemExit(
-                "With multiple --pattern or --preset_cam values, --output must be a directory, not an .mp4 file."
-            )
-        p.mkdir(parents=True, exist_ok=True)
-        return str(p / name)
-
-    if p.suffix.lower() == ".mp4":
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return str(p)
-
-    p.mkdir(parents=True, exist_ok=True)
-    return str(p / name)
+    return os.path.join(default_subdir, name)
 
 
 def parse_args():
@@ -343,8 +317,8 @@ def parse_args():
     p.add_argument(
         "--output",
         type=str,
-        default=None,
-        help="Override output: single run -> .mp4 path or directory; multiple --pattern or --preset_cam -> directory only.",
+        default="default",
+        help="Name of subdirectory under results/ (default: default -> results/default/<clip>/).",
     )
 
     return p.parse_args()
@@ -372,8 +346,6 @@ def main():
         runs = [("preset", idx) for idx in preset_indices]
     else:
         runs = [("pattern", p) for p in parse_time_patterns(args.pattern)]
-
-    multiple_runs = len(runs) > 1
 
     clip_path, dataset_root = resolve_clip_path(args.clip_dir, args.dataset_root, args.clip_relpath)
 
@@ -470,7 +442,7 @@ def main():
     else:
         print("No --ckpt: using base Wan2.1 model only")
 
-    output_subdir = build_output_subdir(dataset_root, clip_path)
+    output_subdir = build_output_subdir(dataset_root, clip_path, args.output)
     os.makedirs(output_subdir, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -553,7 +525,7 @@ def main():
         except Exception as e:
             print(f"Could not load target video: {e}")
 
-        out_path = resolve_run_output_path(args.output, output_subdir, run_tag, ts, multiple_runs)
+        out_path = resolve_run_output_path(output_subdir, run_tag, ts)
 
         if run_kind == "pattern" and str(value) == "forward":
             copy_input_video_to_output_dir(clip_path, output_subdir)
