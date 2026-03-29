@@ -19,7 +19,7 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 import imageio
 import numpy as np
@@ -30,7 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
 from utils.camera import get_target_camera_from_source, load_camera_from_meta, load_camera_from_json
 from utils.image import load_frames_using_imageio
-from utils.time_pattern import VALID_TIME_PATTERNS, get_time_pattern
+from utils.time_pattern import VALID_TIME_PATTERNS, TimePatternType, get_time_pattern
 
 
 def to_hwc_numpy(frame: torch.Tensor | Image.Image | np.ndarray) -> np.ndarray:
@@ -57,12 +57,14 @@ def read_video_fps(video_path: Path, default: float = 30.0) -> float:
         return default
 
 
-def parse_time_patterns(pattern_arg: str) -> list[str]:
+def parse_time_patterns(pattern_arg: str) -> list[TimePatternType]:
     """Validate and split comma-separated time patterns."""
-    patterns = [p.strip() for p in pattern_arg.split(",")]
-    for p in patterns:
+    patterns: list[TimePatternType] = []
+    for p in pattern_arg.split(","):
+        p = p.strip()
         if p not in VALID_TIME_PATTERNS:
             raise ValueError(f"Invalid pattern '{p}'. Valid: {sorted(VALID_TIME_PATTERNS)}")
+        patterns.append(cast(TimePatternType, p))
     return patterns
 
 
@@ -246,7 +248,7 @@ def resolve_run_output_path(
     ts: str,
     multiple_runs: bool,
 ) -> str:
-    """Output path: run_tag is e.g. ``reverse`` or ``preset_03``. Multiple runs -> --output must be a dir if set."""
+    """Output path: run_tag e.g. ``reverse`` or ``reverse_preset_03``. Multiple runs -> --output must be a directory if set."""
     name = f"{run_tag}_{ts}.mp4"
     if not output_opt:
         return os.path.join(default_subdir, name)
@@ -308,8 +310,8 @@ def parse_args():
         "--preset_cam",
         type=str,
         default=None,
-        help="Preset camera from camera_extrinsics.json: one index (e.g. 3) or comma-separated batch (e.g. 1,2,3). "
-        "Incompatible with time-remap --pattern: forces target time embedding to forward. Omit when using --pattern alone.",
+        help="JSON preset cameras: one index or comma-separated batch (e.g. 1,2,3). "
+        "Requires a single --pattern (no commas) for target time embedding; output names include both.",
     )
     p.add_argument(
         "--camera_json",
@@ -358,15 +360,16 @@ def main():
     except ValueError as e:
         raise SystemExit(str(e)) from e
 
+    preset_tgt_pattern: Optional[TimePatternType] = None
     if preset_indices:
         pnorm = args.pattern.replace(" ", "")
-        if "," in pnorm or pnorm != "forward":
-            print(
-                "Note: --preset_cam uses JSON camera trajectories in natural frame order; "
-                "target time embedding is always forward (training pairs time-remap only with "
-                "source-reindexed cameras). Ignoring --pattern for this run."
+        if "," in pnorm:
+            raise SystemExit(
+                "With --preset_cam, use a single --pattern (no commas). "
+                "Batch multiple cameras via --preset_cam 1,2,3 — not multiple patterns."
             )
-        runs: list[tuple[str, str | int]] = [("preset", idx) for idx in preset_indices]
+        preset_tgt_pattern = parse_time_patterns(pnorm)[0]
+        runs = [("preset", idx) for idx in preset_indices]
     else:
         runs = [("pattern", p) for p in parse_time_patterns(args.pattern)]
 
@@ -483,11 +486,14 @@ def main():
 
     for run_idx, (run_kind, value) in enumerate(runs):
         if run_kind == "preset":
-            run_tag = f"preset_{int(value):02d}"
-            label = f"preset cam {value}"
+            pt = preset_tgt_pattern
+            assert pt is not None
+            run_tag = f"{pt}_preset_{int(value):02d}"
+            label = f"{pt} @ preset cam {value}"
         else:
-            run_tag = str(value)
-            label = str(value)
+            pattern = cast(TimePatternType, value)
+            run_tag = pattern
+            label = pattern
 
         print(f"\n{'='*50}")
         print(f"Processing run {run_idx + 1}/{len(runs)}: {label}")
@@ -501,9 +507,8 @@ def main():
             tgt_camera = load_camera_from_json(
                 str(camera_json), cam_idx=int(value), num_frames=args.num_frames, dtype=torch.bfloat16
             ).unsqueeze(0)
-            tgt_time = torch.tensor(get_time_pattern("forward", args.num_frames), dtype=torch.float32).unsqueeze(0)
+            tgt_time = torch.tensor(get_time_pattern(pt, args.num_frames), dtype=torch.float32).unsqueeze(0)
         else:
-            pattern = str(value)
             tgt_camera = get_target_camera_from_source(
                 src_c2w, pattern, num_frames=args.num_frames, dtype=torch.bfloat16
             ).unsqueeze(0)
@@ -529,29 +534,30 @@ def main():
         )
 
         target_frames: Optional[torch.Tensor] = None
-        if run_kind == "pattern":
-            try:
-                target_video_path = derive_target_video_path(clip_path, dataset_root, str(value))
-                if target_video_path.is_file():
-                    target_frame_process = v2.Compose(
-                        [
-                            v2.CenterCrop(size=(args.height, args.width)),
-                            v2.ToTensor(),
-                        ]
-                    )
-                    target_frames = load_frames_using_imageio(
-                        str(target_video_path),
-                        num_frames=args.num_frames,
-                        frame_process=target_frame_process,
-                        target_h=args.height,
-                        target_w=args.width,
-                        permute_to_cthw=False,
-                    )
-                    print(f"Loaded target video: {target_video_path}")
-                else:
-                    print(f"Target video not found: {target_video_path}")
-            except Exception as e:
-                print(f"Could not load target video: {e}")
+        tgt_pattern_for_video = str(value) if run_kind == "pattern" else preset_tgt_pattern
+        assert tgt_pattern_for_video is not None
+        try:
+            target_video_path = derive_target_video_path(clip_path, dataset_root, tgt_pattern_for_video)
+            if target_video_path.is_file():
+                target_frame_process = v2.Compose(
+                    [
+                        v2.CenterCrop(size=(args.height, args.width)),
+                        v2.ToTensor(),
+                    ]
+                )
+                target_frames = load_frames_using_imageio(
+                    str(target_video_path),
+                    num_frames=args.num_frames,
+                    frame_process=target_frame_process,
+                    target_h=args.height,
+                    target_w=args.width,
+                    permute_to_cthw=False,
+                )
+                print(f"Loaded target video: {target_video_path}")
+            else:
+                print(f"Target video not found: {target_video_path}")
+        except Exception as e:
+            print(f"Could not load target video: {e}")
 
         out_path = resolve_run_output_path(args.output, output_subdir, run_tag, ts, multiple_runs)
 
