@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -220,15 +221,33 @@ def derive_target_video_path(clip_path: Path, dataset_root: Path, pattern: str) 
     return dataset_root / "target_videos" / rel_path / f"{pattern}_video.mp4"
 
 
-def resolve_pattern_output_path(
+def parse_preset_cam_indices(arg: Optional[str]) -> list[int]:
+    """Parse --preset_cam as '3' or '1,2,3' (1-10). Empty / None -> []."""
+    if arg is None or not str(arg).strip():
+        return []
+    out: list[int] = []
+    for part in re.split(r"[\s,]+", str(arg).strip()):
+        if not part:
+            continue
+        try:
+            v = int(part, 10)
+        except ValueError as e:
+            raise ValueError(f"Invalid --preset_cam token {part!r} (expected integers 1-10)") from e
+        if not (1 <= v <= 10):
+            raise ValueError(f"--preset_cam indices must be 1-10, got {v}")
+        out.append(v)
+    return out
+
+
+def resolve_run_output_path(
     output_opt: Optional[str],
     default_subdir: str,
-    pattern: str,
+    run_tag: str,
     ts: str,
-    multiple_patterns: bool,
+    multiple_runs: bool,
 ) -> str:
-    """Single pattern: --output file.mp4 or directory. Multiple: --output must be a directory."""
-    name = f"{pattern}_{ts}.mp4"
+    """Output path: run_tag is e.g. ``reverse`` or ``preset_03``. Multiple runs -> --output must be a dir if set."""
+    name = f"{run_tag}_{ts}.mp4"
     if not output_opt:
         return os.path.join(default_subdir, name)
 
@@ -237,10 +256,10 @@ def resolve_pattern_output_path(
         p = Path.cwd() / p
     p = p.resolve()
 
-    if multiple_patterns:
+    if multiple_runs:
         if p.is_file() or p.suffix.lower() == ".mp4":
             raise SystemExit(
-                "With multiple comma-separated --pattern values, --output must be an existing or new directory, not an .mp4 file."
+                "With multiple --pattern or --preset_cam values, --output must be a directory, not an .mp4 file."
             )
         p.mkdir(parents=True, exist_ok=True)
         return str(p / name)
@@ -287,10 +306,10 @@ def parse_args():
     )
     p.add_argument(
         "--preset_cam",
-        type=int,
-        choices=range(1, 11),
+        type=str,
         default=None,
-        help="Preset camera index (1-10) from camera_extrinsics.json",
+        help="Preset camera from camera_extrinsics.json: one index (e.g. 3) or comma-separated batch (e.g. 1,2,3). "
+        "Incompatible with time-remap --pattern: forces target time embedding to forward. Omit when using --pattern alone.",
     )
     p.add_argument(
         "--camera_json",
@@ -323,7 +342,7 @@ def parse_args():
         "--output",
         type=str,
         default=None,
-        help="Override output: single pattern -> path ending in .mp4 or a directory; multiple patterns -> directory only.",
+        help="Override output: single run -> .mp4 path or directory; multiple --pattern or --preset_cam -> directory only.",
     )
 
     return p.parse_args()
@@ -332,9 +351,26 @@ def parse_args():
 def main():
     args = parse_args()
 
-    patterns = parse_time_patterns(args.pattern)
-    multiple_patterns = len(patterns) > 1
     device = resolve_inference_device(args.device, args.gpu_id)
+
+    try:
+        preset_indices = parse_preset_cam_indices(args.preset_cam)
+    except ValueError as e:
+        raise SystemExit(str(e)) from e
+
+    if preset_indices:
+        pnorm = args.pattern.replace(" ", "")
+        if "," in pnorm or pnorm != "forward":
+            print(
+                "Note: --preset_cam uses JSON camera trajectories in natural frame order; "
+                "target time embedding is always forward (training pairs time-remap only with "
+                "source-reindexed cameras). Ignoring --pattern for this run."
+            )
+        runs: list[tuple[str, str | int]] = [("preset", idx) for idx in preset_indices]
+    else:
+        runs = [("pattern", p) for p in parse_time_patterns(args.pattern)]
+
+    multiple_runs = len(runs) > 1
 
     clip_path, dataset_root = resolve_clip_path(args.clip_dir, args.dataset_root, args.clip_relpath)
 
@@ -443,24 +479,35 @@ def main():
 
     prompt_str = caption_text if prompt_context is None else ""
 
-    for pattern_idx, pattern in enumerate(patterns):
+    camera_json: Optional[Path] = None
+
+    for run_idx, (run_kind, value) in enumerate(runs):
+        if run_kind == "preset":
+            run_tag = f"preset_{int(value):02d}"
+            label = f"preset cam {value}"
+        else:
+            run_tag = str(value)
+            label = str(value)
+
         print(f"\n{'='*50}")
-        print(f"Processing pattern {pattern_idx + 1}/{len(patterns)}: {pattern}")
+        print(f"Processing run {run_idx + 1}/{len(runs)}: {label}")
         print(f"{'='*50}")
 
-        if args.preset_cam:
-            camera_json = Path(args.camera_json) if args.camera_json else dataset_root / "cameras" / "camera_extrinsics.json"
-            if not camera_json.is_file():
-                raise FileNotFoundError(f"Camera JSON not found: {camera_json}")
+        if run_kind == "preset":
+            if camera_json is None:
+                camera_json = Path(args.camera_json) if args.camera_json else dataset_root / "cameras" / "camera_extrinsics.json"
+                if not camera_json.is_file():
+                    raise FileNotFoundError(f"Camera JSON not found: {camera_json}")
             tgt_camera = load_camera_from_json(
-                str(camera_json), cam_idx=args.preset_cam, num_frames=args.num_frames, dtype=torch.bfloat16
+                str(camera_json), cam_idx=int(value), num_frames=args.num_frames, dtype=torch.bfloat16
             ).unsqueeze(0)
+            tgt_time = torch.tensor(get_time_pattern("forward", args.num_frames), dtype=torch.float32).unsqueeze(0)
         else:
+            pattern = str(value)
             tgt_camera = get_target_camera_from_source(
                 src_c2w, pattern, num_frames=args.num_frames, dtype=torch.bfloat16
             ).unsqueeze(0)
-
-        tgt_time = torch.tensor(get_time_pattern(pattern, args.num_frames), dtype=torch.float32).unsqueeze(0)
+            tgt_time = torch.tensor(get_time_pattern(pattern, args.num_frames), dtype=torch.float32).unsqueeze(0)
 
         frames = pipe(
             prompt=prompt_str,
@@ -482,32 +529,35 @@ def main():
         )
 
         target_frames: Optional[torch.Tensor] = None
-        try:
-            target_video_path = derive_target_video_path(clip_path, dataset_root, pattern)
-            if target_video_path.is_file():
-                target_frame_process = v2.Compose(
-                    [
-                        v2.CenterCrop(size=(args.height, args.width)),
-                        v2.ToTensor(),
-                    ]
-                )
-                target_frames = load_frames_using_imageio(
-                    str(target_video_path),
-                    num_frames=args.num_frames,
-                    frame_process=target_frame_process,
-                    target_h=args.height,
-                    target_w=args.width,
-                    permute_to_cthw=False,
-                )
-                print(f"Loaded target video: {target_video_path}")
-            else:
-                print(f"Target video not found: {target_video_path}")
-        except Exception as e:
-            print(f"Could not load target video: {e}")
+        if run_kind == "pattern":
+            try:
+                target_video_path = derive_target_video_path(clip_path, dataset_root, str(value))
+                if target_video_path.is_file():
+                    target_frame_process = v2.Compose(
+                        [
+                            v2.CenterCrop(size=(args.height, args.width)),
+                            v2.ToTensor(),
+                        ]
+                    )
+                    target_frames = load_frames_using_imageio(
+                        str(target_video_path),
+                        num_frames=args.num_frames,
+                        frame_process=target_frame_process,
+                        target_h=args.height,
+                        target_w=args.width,
+                        permute_to_cthw=False,
+                    )
+                    print(f"Loaded target video: {target_video_path}")
+                else:
+                    print(f"Target video not found: {target_video_path}")
+            except Exception as e:
+                print(f"Could not load target video: {e}")
 
-        out_path = resolve_pattern_output_path(args.output, output_subdir, pattern, ts, multiple_patterns)
+        out_path = resolve_run_output_path(args.output, output_subdir, run_tag, ts, multiple_runs)
 
-        if pattern == "forward":
+        if run_kind == "pattern" and str(value) == "forward":
+            copy_input_video_to_output_dir(clip_path, output_subdir)
+        elif run_kind == "preset" and run_idx == 0:
             copy_input_video_to_output_dir(clip_path, output_subdir)
 
         print(f"Writing {out_path}")
@@ -522,8 +572,8 @@ def main():
                 for target_frame, pred_frame in zip(target_frames[:n_pair], frames[:n_pair]):
                     target_arr = to_hwc_numpy(target_frame)
                     pred_arr = to_hwc_numpy(pred_frame)
-                    target_labeled = draw_pattern_label(target_arr, pattern, is_target=True)
-                    pred_labeled = draw_pattern_label(pred_arr, pattern, is_target=False)
+                    target_labeled = draw_pattern_label(target_arr, run_tag, is_target=True)
+                    pred_labeled = draw_pattern_label(pred_arr, run_tag, is_target=False)
                     combined = np.concatenate([target_labeled, pred_labeled], axis=1)
                     writer.append_data(combined)
         else:
