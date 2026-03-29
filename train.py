@@ -253,16 +253,15 @@ class Wan4DTrainModule(pl.LightningModule):
         checkpoint_dir = self.trainer.checkpoint_callback.dirpath
         current_step = self.global_step
 
-        # Save pure state_dict file for inference
-        state_dict = checkpoint['state_dict']
-        model_ckpt_path = os.path.join(checkpoint_dir, f"step{current_step}_model.ckpt")
-        torch.save(state_dict, model_ckpt_path)
+        # 只在 rank 0 保存，避免多卡重复写入
+        if self.global_rank == 0:
+            state_dict = checkpoint['state_dict']
+            model_ckpt_path = os.path.join(checkpoint_dir, f"step{current_step}_model.ckpt")
+            torch.save(state_dict, model_ckpt_path)
 
-        # Keep checkpoint default content for resuming training
-        # Do NOT call checkpoint.clear() - we need optimizer states
-        log = logging.getLogger("wan4d_train")
-        log.info(f"Checkpoint saved: step={current_step}, dir={checkpoint_dir}")
-        log.info(f"Model weights saved: {model_ckpt_path}")
+            log = logging.getLogger("wan4d_train")
+            log.info(f"Checkpoint saved: step={current_step}, dir={checkpoint_dir}")
+            log.info(f"Model weights saved: {model_ckpt_path}")
 
     def configure_optimizers(self):
         params = [p for p in self.dit.parameters() if p.requires_grad]
