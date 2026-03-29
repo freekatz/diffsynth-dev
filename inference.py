@@ -529,14 +529,19 @@ def main():
                     target_labeled = draw_pattern_label(target_arr, pattern, is_target=True)
                     pred_labeled = draw_pattern_label(pred_arr, pattern, is_target=False)
 
-                    # Concatenate horizontally
-                    combined = np.concatenate([target_labeled, pred_labeled], axis=2)
+                    # Concatenate horizontally (axis=1 is width in HWC; axis=2 would stack RGB -> invalid channel count)
+                    combined = np.concatenate([target_labeled, pred_labeled], axis=1)
                     writer.append_data(combined)
         else:
-            # Predicted video only
+            # Predicted video only (pipeline returns list of PIL.Image; ensure HWC uint8 for imageio)
             with imageio.get_writer(out_path, fps=30, codec="libx264") as writer:
                 for frame in frames:
-                    arr = frame.cpu().numpy() if isinstance(frame, torch.Tensor) else np.array(frame)
+                    if isinstance(frame, torch.Tensor):
+                        arr = frame.detach().cpu().numpy()
+                        if arr.ndim == 3 and arr.shape[0] == 3:
+                            arr = np.transpose(arr, (1, 2, 0))
+                    else:
+                        arr = np.array(frame)
                     writer.append_data(arr)
 
     print("\nDone.")
