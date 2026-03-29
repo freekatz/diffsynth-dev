@@ -13,6 +13,30 @@ import torch.nn.functional as F
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
+
+class Wan4DModelCheckpoint(ModelCheckpoint):
+    """ModelCheckpoint that also cleans up standalone dit model weights."""
+
+    def _remove_checkpoint(self, trainer, filepath):
+        """Remove checkpoint and corresponding _model.ckpt file."""
+        # Call parent to remove the main checkpoint file
+        super()._remove_checkpoint(trainer, filepath)
+
+        # Also remove the corresponding _model.ckpt file
+        # Extract step number from filepath (e.g., "epoch=0-step=500.ckpt" -> 500)
+        import re
+        match = re.search(r"step=(\d+)", filepath)
+        if match:
+            step = match.group(1)
+            model_ckpt_path = os.path.join(
+                os.path.dirname(filepath),
+                f"step{step}_model.ckpt"
+            )
+            if os.path.exists(model_ckpt_path):
+                os.remove(model_ckpt_path)
+                log = logging.getLogger("wan4d_train")
+                log.info(f"Model weights removed: {model_ckpt_path}")
+
 from diffsynth.core import ModelConfig
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
 from utils.dataset import Wan4DDataset
@@ -505,7 +529,7 @@ def main():
             )
         except ImportError:
             log.warning("swanlab not installed, skip")
-    ckpt = ModelCheckpoint(
+    ckpt = Wan4DModelCheckpoint(
         dirpath=ckpt_dir,
         save_top_k=args.save_top_k,
         monitor="checkpoint_step" if args.save_top_k > 0 else None,

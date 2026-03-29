@@ -51,16 +51,31 @@ def draw_pattern_label(frame: np.ndarray, pattern: str, is_target: bool) -> np.n
     """Draw pattern label on frame.
 
     Args:
-        frame: Frame array [H, W, C] in range [0, 255] or [0, 1]
+        frame: Frame array [H, W, C] or [H, W] in range [0, 255] or [0, 1]
         pattern: Pattern name to display
         is_target: If True, label is "Target", else "Predicted"
 
     Returns:
         Frame with label drawn
     """
-    # Convert to PIL Image
+    # Normalize shape to [H, W, C]
+    if frame.ndim == 2:
+        # Grayscale: [H, W] -> [H, W, 3]
+        frame = np.stack([frame, frame, frame], axis=-1)
+    elif frame.ndim == 3 and frame.shape[2] == 1:
+        # Grayscale: [H, W, 1] -> [H, W, 3]
+        frame = np.concatenate([frame, frame, frame], axis=2)
+    elif frame.ndim == 3 and frame.shape[2] == 4:
+        # RGBA -> RGB
+        frame = frame[:, :, :3]
+
+    # Normalize value range to [0, 255]
     if frame.max() <= 1.0:
         frame = (frame * 255).astype(np.uint8)
+    elif frame.dtype != np.uint8:
+        frame = frame.astype(np.uint8)
+
+    # Convert to PIL Image
     img = Image.fromarray(frame)
     draw = ImageDraw.Draw(img)
 
@@ -462,7 +477,12 @@ def main():
             # Side-by-side: target (left) | predicted (right)
             with imageio.get_writer(out_path, fps=30, codec="libx264") as writer:
                 for i, (target_frame, pred_frame) in enumerate(zip(target_frames, frames)):
+                    # target_frame: [C, H, W] tensor -> numpy -> [H, W, C]
                     target_arr = target_frame.cpu().numpy() if isinstance(target_frame, torch.Tensor) else np.array(target_frame)
+                    if target_arr.ndim == 3 and target_arr.shape[0] == 3:
+                        # Convert [C, H, W] to [H, W, C]
+                        target_arr = np.transpose(target_arr, (1, 2, 0))
+
                     pred_arr = pred_frame.cpu().numpy() if isinstance(pred_frame, torch.Tensor) else np.array(pred_frame)
 
                     # Draw labels
