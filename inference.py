@@ -32,15 +32,32 @@ from utils.image import load_frames_using_imageio
 from utils.time_pattern import VALID_TIME_PATTERNS, get_time_pattern
 
 
+def to_hwc_numpy(frame: torch.Tensor | Image.Image | np.ndarray) -> np.ndarray:
+    """Tensor (CHW), PIL, or array -> HWC numpy for imageio."""
+    if isinstance(frame, torch.Tensor):
+        arr = frame.detach().cpu().numpy()
+    elif isinstance(frame, Image.Image):
+        arr = np.array(frame)
+    else:
+        arr = np.asarray(frame)
+    if arr.ndim == 3 and arr.shape[0] == 3:
+        arr = np.transpose(arr, (1, 2, 0))
+    return arr
+
+
+def read_video_fps(video_path: Path, default: float = 30.0) -> float:
+    try:
+        r = imageio.get_reader(str(video_path))
+        meta = r.get_meta_data()
+        r.close()
+        fps = meta.get("fps", default)
+        return float(fps) if fps else default
+    except Exception:
+        return default
+
+
 def parse_time_patterns(pattern_arg: str) -> list[str]:
-    """Parse comma-separated time patterns.
-
-    Args:
-        pattern_arg: Single pattern or comma-separated list (e.g., "forward,reverse,pingpong")
-
-    Returns:
-        List of validated pattern strings
-    """
+    """Validate and split comma-separated time patterns."""
     patterns = [p.strip() for p in pattern_arg.split(",")]
     for p in patterns:
         if p not in VALID_TIME_PATTERNS:
@@ -49,14 +66,12 @@ def parse_time_patterns(pattern_arg: str) -> list[str]:
 
 
 def copy_input_video_to_output_dir(clip_path: Path, output_subdir: str) -> Optional[str]:
-    """Copy input video to output directory as forward_gt."""
+    """Copy clip video.mp4 to output_subdir as forward_gt.mp4 if missing."""
     src_video = clip_path / "video.mp4"
     if not src_video.is_file():
         return None
 
-    target_filename = "forward_gt.mp4"
-    target_path = os.path.join(output_subdir, target_filename)
-
+    target_path = os.path.join(output_subdir, "forward_gt.mp4")
     if os.path.exists(target_path):
         return target_path
 
@@ -65,8 +80,8 @@ def copy_input_video_to_output_dir(clip_path: Path, output_subdir: str) -> Optio
 
 
 def build_output_subdir(dataset_root: Path, clip_path: Path) -> str:
-    """Build output subdirectory from clip path."""
-    videos_dir = dataset_root / 'videos'
+    """results/{source}-{video}-{clip} from clip path under dataset_root/videos."""
+    videos_dir = dataset_root / "videos"
     rel_path = clip_path.relative_to(videos_dir)
     parts = list(rel_path.parts)
 
@@ -82,38 +97,22 @@ def build_output_subdir(dataset_root: Path, clip_path: Path) -> str:
 
 
 def draw_pattern_label(frame: np.ndarray, pattern: str, is_target: bool) -> np.ndarray:
-    """Draw pattern label on frame.
-
-    Args:
-        frame: Frame array [H, W, C] or [H, W] in range [0, 255] or [0, 1]
-        pattern: Pattern name to display
-        is_target: If True, label is "Target", else "Predicted"
-
-    Returns:
-        Frame with label drawn
-    """
-    # Normalize shape to [H, W, C]
+    """Overlay pattern name and TARGET/PREDICTED on frame (HWC or CHW after caller prep)."""
     if frame.ndim == 2:
-        # Grayscale: [H, W] -> [H, W, 3]
         frame = np.stack([frame, frame, frame], axis=-1)
     elif frame.ndim == 3 and frame.shape[2] == 1:
-        # Grayscale: [H, W, 1] -> [H, W, 3]
         frame = np.concatenate([frame, frame, frame], axis=2)
     elif frame.ndim == 3 and frame.shape[2] == 4:
-        # RGBA -> RGB
         frame = frame[:, :, :3]
 
-    # Normalize value range to [0, 255]
-    if frame.max() <= 1.0:
-        frame = (frame * 255).astype(np.uint8)
+    if frame.max() <= 1.0 + 1e-6:
+        frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
     elif frame.dtype != np.uint8:
         frame = frame.astype(np.uint8)
 
-    # Convert to PIL Image
     img = Image.fromarray(frame)
     draw = ImageDraw.Draw(img)
 
-    # Try to use a reasonable font, fall back to default if not available
     font_size = max(20, min(frame.shape[0] // 20, 30))
     try:
         font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
@@ -123,30 +122,25 @@ def draw_pattern_label(frame: np.ndarray, pattern: str, is_target: bool) -> np.n
         except (OSError, IOError):
             font = ImageFont.load_default()
 
-    # Label text
     label = f"[{pattern}] {'TARGET' if is_target else 'PREDICTED'}"
 
-    # Get text bounding box
     bbox = draw.textbbox((0, 0), label, font=font)
     text_width = bbox[2] - bbox[0]
     text_height = bbox[3] - bbox[1]
 
-    # Padding and background
     padding = 8
     bg_x, bg_y = padding, padding
     bg_w, bg_h = text_width + 2 * padding, text_height + 2 * padding
 
-    # Draw semi-transparent background
-    bg = Image.new('RGBA', img.size, (0, 0, 0, 0))
+    bg = Image.new("RGBA", img.size, (0, 0, 0, 0))
     bg_draw = ImageDraw.Draw(bg)
     bg_draw.rectangle([bg_x, bg_y, bg_x + bg_w, bg_y + bg_h], fill=(0, 0, 0, 128))
-    img = Image.alpha_composite(img.convert('RGBA'), bg)
+    img = Image.alpha_composite(img.convert("RGBA"), bg)
     draw = ImageDraw.Draw(img)
 
-    # Draw text
     draw.text((bg_x + padding, bg_y + padding), label, font=font, fill=(255, 255, 255, 255))
 
-    return np.array(img.convert('RGB'))
+    return np.array(img.convert("RGB"))
 
 DEFAULT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，"
@@ -157,56 +151,36 @@ RESULTS_DIR = "results"
 
 
 def video_path_hash(video_rel_path: str) -> str:
-    """Generate 16-char hash for video path (for latent cache lookup)."""
+    """16-char SHA256 prefix for latent cache key."""
     return hashlib.sha256(video_rel_path.encode()).hexdigest()[:16]
 
 
 def caption_content_hash(caption: str) -> str:
-    """Generate 16-char hash for caption text (for latent cache lookup)."""
+    """16-char SHA256 prefix for caption latent cache key."""
     return hashlib.sha256(caption.encode()).hexdigest()[:16]
 
 
 def load_checkpoint(ckpt_path: str, device: str = "cpu") -> dict:
-    """Load pure model weights from training checkpoint.
-
-    Use the *_model.ckpt file saved by training.
-    Also supports Lightning format (auto-extracts state_dict).
-
-    Args:
-        ckpt_path: Path to checkpoint file (*_model.ckpt or .ckpt)
-        device: Device to load weights to
-
-    Returns:
-        dict: Model state_dict with 'pipe.dit.' or 'dit.' prefix stripped
-    """
+    """Load checkpoint dict; supports Lightning state_dict and strips pipe.dit./dit. prefixes."""
     obj = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    if isinstance(obj, dict) and 'state_dict' in obj:
-        sd = obj['state_dict']
+    if isinstance(obj, dict) and "state_dict" in obj:
+        sd = obj["state_dict"]
     else:
         sd = obj
 
-    # Strip 'pipe.dit.' or 'dit.' prefix
     def strip_prefix(k):
-        if k.startswith('pipe.dit.'):
-            return k[len('pipe.dit.'):]
-        if k.startswith('dit.'):
-            return k[len('dit.'):]
+        if k.startswith("pipe.dit."):
+            return k[len("pipe.dit."):]
+        if k.startswith("dit."):
+            return k[len("dit."):]
         return k
 
     return {strip_prefix(k): v for k, v in sd.items()}
 
 
 def resolve_inference_device(device: str, gpu_id: Optional[int]) -> str:
-    """Resolve target device with optional GPU index.
-
-    Args:
-        device: Base device string (cuda, cpu, mps)
-        gpu_id: Optional CUDA device index
-
-    Returns:
-        Full device string (e.g., cuda:0, cpu, mps)
-    """
+    """Return device string; cuda + gpu_id -> cuda:N."""
     if gpu_id is None:
         return device
     d = device.strip().lower()
@@ -220,84 +194,111 @@ def resolve_inference_device(device: str, gpu_id: Optional[int]) -> str:
 def resolve_clip_path(
     clip_dir: Optional[str],
     dataset_root: Optional[str],
-    clip_relpath: Optional[str]
+    clip_relpath: Optional[str],
 ) -> tuple[Path, Path]:
-    """Resolve clip directory and dataset root.
-
-    Args:
-        clip_dir: Direct clip directory path, or None
-        dataset_root: Dataset root directory, or None
-        clip_relpath: Relative path under videos/, or None
-
-    Returns:
-        (clip_path, dataset_root) tuple
-
-    Raises:
-        ValueError: If arguments are invalid or incomplete
-    """
+    """Resolve (clip_path, dataset_root). Use --clip_dir or --dataset_root + --clip_relpath."""
     if clip_dir:
         clip_path = Path(clip_dir).resolve()
-        # Infer dataset_root from clip_path (find 'videos' segment)
         parts = clip_path.parts
-        if 'videos' in parts:
-            idx = parts.index('videos')
-            inferred_root = Path(*parts[:idx]) if idx > 0 else Path('.')
+        if "videos" in parts:
+            idx = parts.index("videos")
+            inferred_root = Path(*parts[:idx]) if idx > 0 else Path(".")
         else:
             inferred_root = clip_path.parent
         return clip_path, inferred_root
 
     if dataset_root and clip_relpath:
-        clip_path = Path(dataset_root) / 'videos' / clip_relpath
+        clip_path = Path(dataset_root) / "videos" / clip_relpath
         return clip_path.resolve(), Path(dataset_root).resolve()
 
     raise ValueError("Provide --clip_dir or both --dataset_root and --clip_relpath")
 
 
 def derive_target_video_path(clip_path: Path, dataset_root: Path, pattern: str) -> Path:
-    """Derive target video path from clip path.
+    """target_videos/<relpath_under_videos>/{pattern}_video.mp4"""
+    rel_path = clip_path.relative_to(dataset_root / "videos")
+    return dataset_root / "target_videos" / rel_path / f"{pattern}_video.mp4"
 
-    Args:
-        clip_path: Source clip directory (e.g., .../videos/source/vid/clip_0)
-        dataset_root: Dataset root directory
-        pattern: Time pattern name
 
-    Returns:
-        Path to target video file (e.g., .../target_videos/source/vid/clip_0/{pattern}_video.mp4)
-    """
-    # Get relative path under videos/
-    rel_path = clip_path.relative_to(dataset_root / 'videos')
-    target_video_dir = dataset_root / 'target_videos' / rel_path
-    target_video_file = target_video_dir / f"{pattern}_video.mp4"
-    return target_video_file
+def resolve_pattern_output_path(
+    output_opt: Optional[str],
+    default_subdir: str,
+    pattern: str,
+    ts: str,
+    multiple_patterns: bool,
+) -> str:
+    """Single pattern: --output file.mp4 or directory. Multiple: --output must be a directory."""
+    name = f"{pattern}_{ts}.mp4"
+    if not output_opt:
+        return os.path.join(default_subdir, name)
+
+    p = Path(output_opt).expanduser()
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    p = p.resolve()
+
+    if multiple_patterns:
+        if p.is_file() or p.suffix.lower() == ".mp4":
+            raise SystemExit(
+                "With multiple comma-separated --pattern values, --output must be an existing or new directory, not an .mp4 file."
+            )
+        p.mkdir(parents=True, exist_ok=True)
+        return str(p / name)
+
+    if p.suffix.lower() == ".mp4":
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return str(p)
+
+    p.mkdir(parents=True, exist_ok=True)
+    return str(p / name)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Wan4D inference")
 
-    # Clip selection (mutually exclusive)
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--clip_dir", type=str, default=None,
-                   help="Path to clip directory (e.g., .../videos/source/vid/clip_0)")
-    g.add_argument("--dataset_root", type=str, default=None,
-                   help="Dataset root directory (requires --clip_relpath)")
-    p.add_argument("--clip_relpath", type=str, default=None,
-                   help="Relative path under videos/, e.g., source/vid/clip_0")
+    g.add_argument(
+        "--clip_dir",
+        type=str,
+        default=None,
+        help="Path to clip directory (e.g., .../videos/source/vid/clip_0)",
+    )
+    g.add_argument(
+        "--dataset_root",
+        type=str,
+        default=None,
+        help="Dataset root directory (requires --clip_relpath)",
+    )
+    p.add_argument(
+        "--clip_relpath",
+        type=str,
+        default=None,
+        help="Relative path under videos/, e.g., source/vid/clip_0",
+    )
 
-    # Model
-    p.add_argument("--wan_model_dir", type=str, required=True,
-                   help="Path to Wan model directory")
-    p.add_argument("--ckpt", type=str, default=None,
-                   help="Pure model weight file from training (step{N}_model.ckpt)")
+    p.add_argument("--wan_model_dir", type=str, required=True, help="Path to Wan model directory")
+    p.add_argument("--ckpt", type=str, default=None, help="Pure model weight file from training (step{N}_model.ckpt)")
 
-    # Target camera
-    p.add_argument("--pattern", type=str, default="forward",
-                   help="Time pattern for target camera motion. Can be a single pattern or comma-separated list (e.g., 'forward,reverse,pingpong')")
-    p.add_argument("--preset_cam", type=int, choices=range(1, 11), default=None,
-                   help="Preset camera index (1-10) from camera_extrinsics.json")
-    p.add_argument("--camera_json", type=str, default=None,
-                   help="Camera JSON file (default: {dataset_root}/cameras/camera_extrinsics.json)")
+    p.add_argument(
+        "--pattern",
+        type=str,
+        default="forward",
+        help="Time pattern(s), comma-separated, e.g. forward,reverse,pingpong",
+    )
+    p.add_argument(
+        "--preset_cam",
+        type=int,
+        choices=range(1, 11),
+        default=None,
+        help="Preset camera index (1-10) from camera_extrinsics.json",
+    )
+    p.add_argument(
+        "--camera_json",
+        type=str,
+        default=None,
+        help="Camera JSON (default: {dataset_root}/cameras/camera_extrinsics.json)",
+    )
 
-    # Inference settings
     p.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cfg_scale", type=float, default=5.0)
@@ -307,19 +308,23 @@ def parse_args():
     p.add_argument("--num_frames", type=int, default=81)
     p.add_argument("--tiled", default=True, action=argparse.BooleanOptionalAction)
 
-    # Latent cache
-    p.add_argument("--no_latent_cache", action="store_true",
-                   help="Ignore caption_latents/ and latents/ caches")
+    p.add_argument("--no_latent_cache", action="store_true", help="Ignore caption_latents/ and latents/ caches")
 
-    # Device
-    p.add_argument("--device", type=str, default="cuda",
-                   help="Device to use (cuda, cpu, mps)")
-    p.add_argument("--gpu_id", type=int, default=None, metavar="N",
-                   help="CUDA device index (e.g., 0, 1, 2). Uses cuda:N. Ignored for cpu/mps.")
+    p.add_argument("--device", type=str, default="cuda", help="Device (cuda, cpu, mps)")
+    p.add_argument(
+        "--gpu_id",
+        type=int,
+        default=None,
+        metavar="N",
+        help="CUDA device index. Ignored for cpu/mps.",
+    )
 
-    # Output
-    p.add_argument("--output", type=str, default=None,
-                   help="Output mp4 path (default: results/{clip}_{pattern}_{timestamp}.mp4). For multiple patterns, use directory path.")
+    p.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Override output: single pattern -> path ending in .mp4 or a directory; multiple patterns -> directory only.",
+    )
 
     return p.parse_args()
 
@@ -327,16 +332,21 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Parse time patterns (support comma-separated list)
     patterns = parse_time_patterns(args.pattern)
-
-    # Resolve device
+    multiple_patterns = len(patterns) > 1
     device = resolve_inference_device(args.device, args.gpu_id)
 
-    # 1. Resolve paths
     clip_path, dataset_root = resolve_clip_path(args.clip_dir, args.dataset_root, args.clip_relpath)
 
-    # 2. Validate required files
+    videos_root = dataset_root / "videos"
+    if not clip_path.is_relative_to(videos_root):
+        raise ValueError(
+            f"Clip directory must lie under the dataset videos folder:\n"
+            f"  clip_path: {clip_path}\n"
+            f"  expected under: {videos_root.resolve()}\n"
+            f"(Fix --clip_dir / --dataset_root so the clip lives under .../videos/...)"
+        )
+
     for path, label in (
         (clip_path / "video.mp4", "video.mp4"),
         (clip_path / "meta.json", "meta.json"),
@@ -345,7 +355,6 @@ def main():
         if not path.is_file():
             raise FileNotFoundError(f"Missing {label}: {path}")
 
-    # 3. Load caption and metadata
     caption_text = (clip_path / "caption.txt").read_text(encoding="utf-8").strip()
     if not caption_text:
         raise ValueError(f"Empty caption: {clip_path / 'caption.txt'}")
@@ -353,20 +362,20 @@ def main():
     meta = json.loads((clip_path / "meta.json").read_text(encoding="utf-8"))
     src_c2w = np.array(meta["camera"]["extrinsics_c2w"], dtype=np.float32)
 
-    # 4. Load source camera
     src_camera = load_camera_from_meta(str(clip_path / "meta.json"), dtype=torch.bfloat16).unsqueeze(0)
 
-    # 5. Load source time embeddings (always forward)
     src_time = torch.tensor(get_time_pattern("forward", args.num_frames), dtype=torch.float32).unsqueeze(0)
 
-    # 6. Load latent cache (optional)
     prompt_context: Optional[torch.Tensor] = None
     source_latents: Optional[torch.Tensor] = None
     source_video: Optional[torch.Tensor] = None
 
     if not args.no_latent_cache:
-        # Try caption latent
-        rel_video = f"videos/{clip_path.relative_to(dataset_root)}/video.mp4" if clip_path.is_relative_to(dataset_root) else str(clip_path / "video.mp4")
+        rel_video = (
+            f"videos/{clip_path.relative_to(dataset_root)}/video.mp4"
+            if clip_path.is_relative_to(dataset_root)
+            else str(clip_path / "video.mp4")
+        )
         cap_latent_file = dataset_root / "caption_latents" / f"{caption_content_hash(caption_text)}.pt"
         if cap_latent_file.is_file():
             td = torch.load(cap_latent_file, weights_only=True, map_location="cpu")
@@ -375,7 +384,6 @@ def main():
         else:
             print(f"No caption latent at {cap_latent_file}")
 
-        # Try source video latent
         src_latent_file = dataset_root / "latents" / f"{video_path_hash(rel_video)}.pt"
         if src_latent_file.is_file():
             pack = torch.load(src_latent_file, weights_only=True, map_location="cpu")
@@ -386,7 +394,6 @@ def main():
     else:
         print("--no_latent_cache: ignoring latent caches")
 
-    # 7. Load source video if no latent
     latent_t = (args.num_frames - 1) // 4 + 1
     if source_latents is not None:
         _, t, _, _ = source_latents.shape[1:]
@@ -394,11 +401,13 @@ def main():
             raise ValueError(f"Source latent T={t}, expected {latent_t} for num_frames={args.num_frames}")
 
     if source_latents is None:
-        frame_process = v2.Compose([
-            v2.CenterCrop(size=(args.height, args.width)),
-            v2.ToTensor(),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        frame_process = v2.Compose(
+            [
+                v2.CenterCrop(size=(args.height, args.width)),
+                v2.ToTensor(),
+                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
         video = load_frames_using_imageio(
             str(clip_path / "video.mp4"),
             num_frames=args.num_frames,
@@ -411,7 +420,6 @@ def main():
             raise ValueError(f"Cannot load {args.num_frames} frames from {clip_path / 'video.mp4'}")
         source_video = video.unsqueeze(0).to(torch.bfloat16)
 
-    # 8. Load pipeline and checkpoint
     pipe = Wan4DPipeline.from_wan_model_dir(
         pretrained_model_dir=args.wan_model_dir,
         wan4d_ckpt_path=None,
@@ -427,12 +435,11 @@ def main():
     else:
         print("No --ckpt: using base Wan2.1 model only")
 
-    # 9. Run inference for each pattern
-    # Build output subdirectory from clip path
     output_subdir = build_output_subdir(dataset_root, clip_path)
     os.makedirs(output_subdir, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_fps = read_video_fps(clip_path / "video.mp4")
 
     prompt_str = caption_text if prompt_context is None else ""
 
@@ -441,7 +448,6 @@ def main():
         print(f"Processing pattern {pattern_idx + 1}/{len(patterns)}: {pattern}")
         print(f"{'='*50}")
 
-        # Load target camera
         if args.preset_cam:
             camera_json = Path(args.camera_json) if args.camera_json else dataset_root / "cameras" / "camera_extrinsics.json"
             if not camera_json.is_file():
@@ -454,10 +460,8 @@ def main():
                 src_c2w, pattern, num_frames=args.num_frames, dtype=torch.bfloat16
             ).unsqueeze(0)
 
-        # Load target time embeddings
         tgt_time = torch.tensor(get_time_pattern(pattern, args.num_frames), dtype=torch.float32).unsqueeze(0)
 
-        # Run inference
         frames = pipe(
             prompt=prompt_str,
             negative_prompt=args.negative_prompt,
@@ -477,15 +481,16 @@ def main():
             tiled=args.tiled,
         )
 
-        # Try to load target video for side-by-side output
-        target_frames: Optional[list] = None
+        target_frames: Optional[torch.Tensor] = None
         try:
             target_video_path = derive_target_video_path(clip_path, dataset_root, pattern)
             if target_video_path.is_file():
-                target_frame_process = v2.Compose([
-                    v2.CenterCrop(size=(args.height, args.width)),
-                    v2.ToTensor(),
-                ])
+                target_frame_process = v2.Compose(
+                    [
+                        v2.CenterCrop(size=(args.height, args.width)),
+                        v2.ToTensor(),
+                    ]
+                )
                 target_frames = load_frames_using_imageio(
                     str(target_video_path),
                     num_frames=args.num_frames,
@@ -500,49 +505,31 @@ def main():
         except Exception as e:
             print(f"Could not load target video: {e}")
 
-        # Save output
-        out_path = os.path.join(output_subdir, f"{pattern}_{ts}.mp4")
+        out_path = resolve_pattern_output_path(args.output, output_subdir, pattern, ts, multiple_patterns)
 
-        # Copy input video as GT (only once, for forward pattern)
         if pattern == "forward":
             copy_input_video_to_output_dir(clip_path, output_subdir)
 
         print(f"Writing {out_path}")
 
         if target_frames is not None:
-            # Side-by-side: target (left) | predicted (right)
-            with imageio.get_writer(out_path, fps=30, codec="libx264") as writer:
-                for i, (target_frame, pred_frame) in enumerate(zip(target_frames, frames)):
-                    # target_frame: [C, H, W] tensor -> numpy -> [H, W, C]
-                    target_arr = target_frame.cpu().numpy() if isinstance(target_frame, torch.Tensor) else np.array(target_frame)
-                    if target_arr.ndim == 3 and target_arr.shape[0] == 3:
-                        # Convert [C, H, W] to [H, W, C]
-                        target_arr = np.transpose(target_arr, (1, 2, 0))
+            nt, nf = len(target_frames), len(frames)
+            n_pair = min(nt, nf)
+            if nt != nf:
+                print(f"Warning: target frames ({nt}) != prediction frames ({nf}); writing {n_pair} side-by-side frames.")
 
-                    # pred_frame: [C, H, W] tensor -> numpy -> [H, W, C]
-                    pred_arr = pred_frame.cpu().numpy() if isinstance(pred_frame, torch.Tensor) else np.array(pred_frame)
-                    if pred_arr.ndim == 3 and pred_arr.shape[0] == 3:
-                        # Convert [C, H, W] to [H, W, C]
-                        pred_arr = np.transpose(pred_arr, (1, 2, 0))
-
-                    # Draw labels
+            with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
+                for target_frame, pred_frame in zip(target_frames[:n_pair], frames[:n_pair]):
+                    target_arr = to_hwc_numpy(target_frame)
+                    pred_arr = to_hwc_numpy(pred_frame)
                     target_labeled = draw_pattern_label(target_arr, pattern, is_target=True)
                     pred_labeled = draw_pattern_label(pred_arr, pattern, is_target=False)
-
-                    # Concatenate horizontally (axis=1 is width in HWC; axis=2 would stack RGB -> invalid channel count)
                     combined = np.concatenate([target_labeled, pred_labeled], axis=1)
                     writer.append_data(combined)
         else:
-            # Predicted video only (pipeline returns list of PIL.Image; ensure HWC uint8 for imageio)
-            with imageio.get_writer(out_path, fps=30, codec="libx264") as writer:
+            with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
                 for frame in frames:
-                    if isinstance(frame, torch.Tensor):
-                        arr = frame.detach().cpu().numpy()
-                        if arr.ndim == 3 and arr.shape[0] == 3:
-                            arr = np.transpose(arr, (1, 2, 0))
-                    else:
-                        arr = np.array(frame)
-                    writer.append_data(arr)
+                    writer.append_data(to_hwc_numpy(frame))
 
     print("\nDone.")
 
