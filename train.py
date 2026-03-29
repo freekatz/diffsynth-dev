@@ -176,17 +176,10 @@ class Wan4DTrainModule(pl.LightningModule):
         cam_emb = {
             "tgt": batch["cam_emb"]["tgt"].to(self.device, dtype=dt),
         }
-        fte = {
-            "time_embedding_src": batch["frame_time_embedding"]["time_embedding_src"].to(
-                self.device, dtype=dt
-            ),
-            "time_embedding_tgt": batch["frame_time_embedding"]["time_embedding_tgt"].to(
-                self.device, dtype=dt
-            ),
-        }
-        return latents, context, cam_emb, fte
+        tgt_progress = batch["tgt_progress"].to(self.device, dtype=dt)
+        return latents, context, cam_emb, tgt_progress
 
-    def _diffusion_loss(self, latents, context, cam_emb, fte):
+    def _diffusion_loss(self, latents, context, cam_emb, tgt_progress):
         noise = torch.randn_like(latents)
         timestep_id = torch.randint(
             0, self.pipe.scheduler.num_train_timesteps, (1,), device="cpu"
@@ -205,7 +198,7 @@ class Wan4DTrainModule(pl.LightningModule):
             timestep=timestep,
             cam_emb=cam_emb,
             context=context,
-            frame_time_embedding=fte,
+            tgt_progress=tgt_progress,
             use_gradient_checkpointing=self.hparams.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.hparams.use_gradient_checkpointing_offload,
         )
@@ -223,8 +216,8 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss * w
 
     def training_step(self, batch, batch_idx):
-        latents, context, cam_emb, fte = self._batch_to_model_device(batch)
-        loss = self._diffusion_loss(latents, context, cam_emb, fte)
+        latents, context, cam_emb, tgt_progress = self._batch_to_model_device(batch)
+        loss = self._diffusion_loss(latents, context, cam_emb, tgt_progress)
 
         every = int(self.hparams.log_metrics_every)
         if self.global_step % every == 0:

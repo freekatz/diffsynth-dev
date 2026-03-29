@@ -132,13 +132,16 @@ tgt_cam = process_camera(tgt_c2w)
 
 **核心原理**: target video 的帧是 source video 帧的重排，因此 target camera 也是 source camera 的重排。
 
-### 3.3 Time Embedding
+### 3.3 归一化时间进度 (`tgt_progress`)
 
-Time embedding 表示帧的时间索引，用于模型理解时序关系：
+模型侧不再使用 source/target 两套帧索引；**仅对目标侧**提供一条归一化进度曲线 `tgt_progress`，形状 `[num_frames]`，取值约在 `[0, 1]`。该曲线与 `get_time_pattern` 的帧索引序列一一对应：将每个索引除以 `max(num_frames - 1, 1)` 得到进度。
+
+训练/数据集由 `utils/time_pattern.generate_progress_curve(pattern, num_frames)` 生成，与 `WanModel4D(..., tgt_progress=...)` 接口一致。
 
 ```python
-src_time = torch.tensor(get_time_pattern("forward", 81), dtype=torch.float32)   # [0, 1, ..., 80]
-tgt_time = torch.tensor(get_time_pattern(pattern, 81), dtype=torch.float32)     # 按 pattern 重排
+from utils.time_pattern import generate_progress_curve
+
+tgt_progress = generate_progress_curve(pattern, num_frames=81)  # torch.Tensor [81]
 ```
 
 ---
@@ -336,19 +339,18 @@ class Wan4DDataset(Dataset):
         time_indices = get_time_pattern(pattern, 81)
         tgt_c2w = src_c2w[time_indices]
 
-        # 采样 + 归一化 → [21, 12] embedding
-        src_cam = self._process_camera(src_c2w)
+        # 采样 + 归一化 → [21, 12] embedding（与训练代码一致，仅条件化 target 相机）
         tgt_cam = self._process_camera(tgt_c2w)
 
-        # time embedding
-        src_time = torch.tensor(get_time_pattern("forward", 81), dtype=torch.float32)
-        tgt_time = torch.tensor(get_time_pattern(pattern, 81), dtype=torch.float32)
+        from utils.time_pattern import generate_progress_curve
+
+        tgt_progress = generate_progress_curve(pattern, 81)
 
         return {
             "latents": latents,
             "prompt_context": prompt_context,
-            "cam_emb": {"src": src_cam, "tgt": tgt_cam},
-            "frame_time_embedding": {"time_embedding_src": src_time, "time_embedding_tgt": tgt_time},
+            "cam_emb": {"tgt": tgt_cam},
+            "tgt_progress": tgt_progress,
             "time_pattern": pattern,
         }
 

@@ -13,6 +13,29 @@ from .wan_video_dit import (
 )
 
 
+class Modulation(nn.Module):
+    """AdaLN modulation: cond → (shift, scale, gate)."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.lin = nn.Linear(dim, 3 * dim, bias=True)
+        nn.init.zeros_(self.lin.weight)
+        nn.init.zeros_(self.lin.bias)
+        with torch.no_grad():
+            self.lin.bias[2 * dim :].fill_(1.0)
+
+    def forward(self, cond: torch.Tensor):
+        """
+        Args:
+            cond: [B, N, dim] (per-token) or [B, dim] (global)
+        Returns:
+            shift, scale, gate: same rank as ``cond`` for last dim splits
+        """
+        out = self.lin(F.silu(cond))
+        shift, scale, gate = out.chunk(3, dim=-1)
+        return shift, scale, gate
+
+
 class CausalConv1d(nn.Conv1d):
     """Causal 1D convolution: pads only on the left (past frames)."""
 
@@ -92,6 +115,9 @@ class DiTBlock4D(nn.Module):
         self.cam_encoder.weight.data.zero_()
         self.cam_encoder.bias.data.zero_()
 
+        self.cam_modulation = Modulation(dim)
+        self.time_modulation = Modulation(dim)
+
         # Projector gate on self-attention output (identity-init)
         self.projector = nn.Linear(dim, dim)
         self.projector.weight = nn.Parameter(torch.eye(dim))
@@ -107,54 +133,66 @@ class DiTBlock4D(nn.Module):
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def _encode_time(self, time_indices: torch.Tensor) -> torch.Tensor:
-        """Encode frame-time indices -> [B, T, dim] via sinusoidal + MLP + temporal downsample."""
-        if time_indices.dim() == 1:
-            time_indices = time_indices.unsqueeze(0)  # [1, T]
-        B, T = time_indices.shape
-        flat = time_indices.reshape(B * T)
-        emb = self.frame_time_embedding(
-            sinusoidal_embedding_1d(self.freq_dim, flat).to(time_indices.dtype)
-        )  # [B*T, dim]
-        emb = emb.reshape(B, T, self.dim)  # [B, T, dim]
-        return self.temporal_downsampler(emb)  # [B, T', dim]
+    def _encode_time(self, tgt_progress: torch.Tensor) -> torch.Tensor:
+        """Encode target normalized progress -> [B, T', dim].
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor, cam_emb: dict,
-                frame_time_embedding: dict, t_mod: torch.Tensor, freqs: torch.Tensor,
-                h: int, w: int, layer_idx: int = 0) -> torch.Tensor:
+        Args:
+            tgt_progress: [B, T] values in [0, 1] (typically linspace-style curves).
+        """
+        if tgt_progress.dim() == 1:
+            tgt_progress = tgt_progress.unsqueeze(0)
+        B, T = tgt_progress.shape
+        flat = tgt_progress.reshape(B * T)
+        emb = self.frame_time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, flat).to(tgt_progress.dtype)
+        )
+        emb = emb.reshape(B, T, self.dim)
+        return self.temporal_downsampler(emb)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        cam_emb: dict,
+        tgt_progress: torch.Tensor,
+        t_mod: torch.Tensor,
+        freqs: torch.Tensor,
+        h: int,
+        w: int,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
         ).chunk(6, dim=1)
 
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-
-        # --- frame-time conditioning ---
-        src_t = self._encode_time(frame_time_embedding["time_embedding_src"])  # [B, T', dim]
-        tgt_t = self._encode_time(frame_time_embedding["time_embedding_tgt"])  # [B, T', dim]
-        t_cond = torch.cat([tgt_t, src_t], dim=1)  # [B, 2*T', dim]
-        # broadcast to all spatial patches: [B, 2*T', h, w, dim] -> [B, 2*T'*h*w, dim]
+        tgt_t = self._encode_time(tgt_progress)
+        src_t = torch.zeros_like(tgt_t)
+        t_cond = torch.cat([tgt_t, src_t], dim=1)
         t_cond = t_cond.unsqueeze(2).unsqueeze(3).expand(-1, -1, h, w, -1)
         t_cond = rearrange(t_cond, "b f h w d -> b (f h w) d")
 
-        # --- camera embedding ---
-        cam_tgt = self.cam_encoder(cam_emb["tgt"])  # [B, T', dim]
+        cam_tgt = self.cam_encoder(cam_emb["tgt"])
         cam_zero = torch.zeros_like(cam_tgt)
-        cam = torch.cat([cam_tgt, cam_zero], dim=1)  # [B, 2*T', dim]; source half: no cam inject
+        cam = torch.cat([cam_tgt, cam_zero], dim=1)
         cam = cam.unsqueeze(2).unsqueeze(3).expand(-1, -1, h, w, -1)
         cam = rearrange(cam, "b f h w d -> b (f h w) d")
+
+        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        cam_shift, cam_scale, cam_gate = self.cam_modulation(cam)
+        input_x = (1 + cam_scale) * input_x + cam_shift
         seq = input_x.shape[1]
         if t_cond.shape[1] != seq or cam.shape[1] != seq:
             raise ValueError(
                 f"DiTBlock4D token mismatch: patches={seq}, time_cond={t_cond.shape[1]}, cam={cam.shape[1]}."
             )
-        input_x = input_x + t_cond
-        input_x = input_x + cam
 
-        # --- self-attention with projector gate ---
-        x = x + gate_msa * self.projector(self.self_attn(input_x, freqs))
+        x = x + gate_msa * cam_gate * self.projector(self.self_attn(input_x, freqs))
         x = x + self.cross_attn(self.norm3(x), context)
+
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp * self.ffn(input_x)
+        time_shift, time_scale, time_gate = self.time_modulation(t_cond)
+        input_x = (1 + time_scale) * input_x + time_shift
+        x = x + gate_mlp * time_gate * self.ffn(input_x)
         return x
 
 
@@ -203,18 +241,11 @@ class WanModel4D(torch.nn.Module):
         if has_image_input:
             self.img_emb = MLP(1280, dim)
 
-    def _validate_forward_inputs(self, cam_emb: dict, frame_time_embedding: dict) -> None:
-        required_cam_keys = {"tgt"}
-        required_time_keys = {"time_embedding_src", "time_embedding_tgt"}
-        missing_cam_keys = sorted(required_cam_keys - set(cam_emb.keys()))
-        missing_time_keys = sorted(required_time_keys - set(frame_time_embedding.keys()))
-        if missing_cam_keys:
-            raise KeyError(f"`cam_emb` is missing required keys: {missing_cam_keys}. Required keys: ['tgt'].")
-        if missing_time_keys:
-            raise KeyError(
-                f"`frame_time_embedding` is missing required keys: {missing_time_keys}. "
-                "Required keys: ['time_embedding_src', 'time_embedding_tgt']."
-            )
+    def _validate_forward_inputs(self, cam_emb: dict, tgt_progress: Optional[torch.Tensor]) -> None:
+        if "tgt" not in cam_emb:
+            raise KeyError("`cam_emb` missing key 'tgt'.")
+        if tgt_progress is None:
+            raise ValueError("`tgt_progress` is required.")
 
     def _forward_prepare(
         self,
@@ -222,11 +253,11 @@ class WanModel4D(torch.nn.Module):
         timestep: torch.Tensor,
         cam_emb: dict,
         context: torch.Tensor,
-        frame_time_embedding: dict,
+        tgt_progress: torch.Tensor,
         clip_feature: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
     ):
-        self._validate_forward_inputs(cam_emb, frame_time_embedding)
+        self._validate_forward_inputs(cam_emb, tgt_progress)
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
@@ -252,7 +283,7 @@ class WanModel4D(torch.nn.Module):
         x: torch.Tensor,
         context: torch.Tensor,
         cam_emb: dict,
-        frame_time_embedding: dict,
+        tgt_progress: torch.Tensor,
         t_mod: torch.Tensor,
         freqs: torch.Tensor,
         h: int,
@@ -266,7 +297,7 @@ class WanModel4D(torch.nn.Module):
                 block,
                 use_gradient_checkpointing,
                 use_gradient_checkpointing_offload,
-                x, context, cam_emb, frame_time_embedding, t_mod, freqs, h, w,
+                x, context, cam_emb, tgt_progress, t_mod, freqs, h, w,
             )
         return x
 
@@ -290,7 +321,7 @@ class WanModel4D(torch.nn.Module):
         timestep: torch.Tensor,
         cam_emb: dict,
         context: torch.Tensor,
-        frame_time_embedding: dict,
+        tgt_progress: torch.Tensor,
         clip_feature: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
         use_gradient_checkpointing: bool = False,
@@ -298,13 +329,13 @@ class WanModel4D(torch.nn.Module):
         **kwargs,
     ):
         t, t_mod, context, x, (f, h, w), freqs = self._forward_prepare(
-            x, timestep, cam_emb, context, frame_time_embedding, clip_feature, y
+            x, timestep, cam_emb, context, tgt_progress, clip_feature, y
         )
         x = self._forward_blocks(
             x,
             context,
             cam_emb,
-            frame_time_embedding,
+            tgt_progress,
             t_mod,
             freqs,
             h,

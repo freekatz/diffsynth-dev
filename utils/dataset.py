@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from utils.camera import get_target_camera_from_source
-from utils.time_pattern import get_time_pattern, TimePatternType
+from utils.time_pattern import TimePatternType, generate_progress_curve
 
 # Wan2.1 VAE: pixel / latent spatial ratio (see diffsynth/models/wan_video_vae.py).
 WAN_VAE_SPATIAL_STRIDE = 8
@@ -208,22 +208,15 @@ class Wan4DDataset(torch.utils.data.Dataset):
         src_c2w = np.array(meta["camera"]["extrinsics_c2w"])
         tgt_cam = get_target_camera_from_source(src_c2w, pattern, num_frames=self.num_frames)
 
-        src_time = torch.tensor(
-            get_time_pattern("forward", self.num_frames), dtype=torch.float32
-        )
-        tgt_time = torch.tensor(
-            get_time_pattern(cast(TimePatternType, pattern), self.num_frames),
-            dtype=torch.float32,
+        tgt_progress = generate_progress_curve(
+            cast(TimePatternType, pattern), self.num_frames
         )
 
         return {
             "latents": latents,
             "prompt_context": prompt_context,
             "cam_emb": {"tgt": tgt_cam},
-            "frame_time_embedding": {
-                "time_embedding_src": src_time,
-                "time_embedding_tgt": tgt_time,
-            },
+            "tgt_progress": tgt_progress,
             "time_pattern": pattern,
         }
 

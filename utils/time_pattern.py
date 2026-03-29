@@ -1,5 +1,8 @@
-from typing import List, Literal
+from typing import List, Literal, Union, cast
+
 import random
+
+import torch
 
 TimePatternType = Literal["forward", "reverse", "pingpong", "bounce_late", "bounce_early", "slowmo_first_half", "slowmo_second_half", "ramp_then_freeze", "freeze_start", "freeze_early", "freeze_mid", "freeze_late", "freeze_end"]
 
@@ -67,6 +70,23 @@ def get_random_time_pattern(num_frames: int = 81, exclude_patterns: frozenset = 
     selected_pattern = rng.choice(available_patterns)
     time_indices = get_time_pattern(selected_pattern, num_frames)
     return selected_pattern, time_indices
+
+def generate_progress_curve(
+    pattern: Union[TimePatternType, str], num_frames: int = 81
+) -> torch.Tensor:
+    """Map a time pattern to normalized progress values in ``[0, 1]`` (length ``num_frames``).
+
+    Uses the same frame-index trajectory as :func:`get_time_pattern`, then scales by
+    ``1 / max(num_frames - 1, 1)`` so indices align with normalized timeline.
+    """
+    if pattern not in VALID_TIME_PATTERNS:
+        raise ValueError(
+            f"Unknown time pattern: {pattern}. Valid patterns: {sorted(VALID_TIME_PATTERNS)}"
+        )
+    raw = get_time_pattern(cast(TimePatternType, pattern), num_frames)
+    denom = max(num_frames - 1, 1)
+    return torch.tensor([float(v) / denom for v in raw], dtype=torch.float32)
+
 
 def validate_time_pattern(pattern: str, num_frames: int = 81, min_unique_frames: int = 1) -> bool:
     if pattern not in VALID_TIME_PATTERNS:
