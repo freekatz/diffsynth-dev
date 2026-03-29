@@ -23,11 +23,81 @@ import imageio
 import numpy as np
 import torch
 from torchvision.transforms import v2
+from PIL import Image, ImageDraw, ImageFont
 
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
 from utils.camera import get_target_camera_from_source, load_camera_from_meta, load_camera_from_json
 from utils.image import load_frames_using_imageio
 from utils.time_pattern import VALID_TIME_PATTERNS, get_time_pattern
+
+
+def parse_time_patterns(pattern_arg: str) -> list[str]:
+    """Parse comma-separated time patterns.
+
+    Args:
+        pattern_arg: Single pattern or comma-separated list (e.g., "forward,reverse,pingpong")
+
+    Returns:
+        List of validated pattern strings
+    """
+    patterns = [p.strip() for p in pattern_arg.split(",")]
+    for p in patterns:
+        if p not in VALID_TIME_PATTERNS:
+            raise ValueError(f"Invalid pattern '{p}'. Valid: {sorted(VALID_TIME_PATTERNS)}")
+    return patterns
+
+
+def draw_pattern_label(frame: np.ndarray, pattern: str, is_target: bool) -> np.ndarray:
+    """Draw pattern label on frame.
+
+    Args:
+        frame: Frame array [H, W, C] in range [0, 255] or [0, 1]
+        pattern: Pattern name to display
+        is_target: If True, label is "Target", else "Predicted"
+
+    Returns:
+        Frame with label drawn
+    """
+    # Convert to PIL Image
+    if frame.max() <= 1.0:
+        frame = (frame * 255).astype(np.uint8)
+    img = Image.fromarray(frame)
+    draw = ImageDraw.Draw(img)
+
+    # Try to use a reasonable font, fall back to default if not available
+    font_size = max(20, min(frame.shape[0] // 20, 30))
+    try:
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
+    except (OSError, IOError):
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+
+    # Label text
+    label = f"[{pattern}] {'TARGET' if is_target else 'PREDICTED'}"
+
+    # Get text bounding box
+    bbox = draw.textbbox((0, 0), label, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+
+    # Padding and background
+    padding = 8
+    bg_x, bg_y = padding, padding
+    bg_w, bg_h = text_width + 2 * padding, text_height + 2 * padding
+
+    # Draw semi-transparent background
+    bg = Image.new('RGBA', img.size, (0, 0, 0, 0))
+    bg_draw = ImageDraw.Draw(bg)
+    bg_draw.rectangle([bg_x, bg_y, bg_x + bg_w, bg_y + bg_h], fill=(0, 0, 0, 128))
+    img = Image.alpha_composite(img.convert('RGBA'), bg)
+    draw = ImageDraw.Draw(img)
+
+    # Draw text
+    draw.text((bg_x + padding, bg_y + padding), label, font=font, fill=(255, 255, 255, 255))
+
+    return np.array(img.convert('RGB'))
 
 DEFAULT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，"
@@ -117,8 +187,6 @@ def resolve_clip_path(
         ValueError: If arguments are invalid or incomplete
     """
     if clip_dir:
-        if dataset_root or clip_relpath:
-            raise ValueError("Use either --clip_dir or (--dataset_root + --clip_relpath), not both.")
         clip_path = Path(clip_dir).resolve()
         # Infer dataset_root from clip_path (find 'videos' segment)
         parts = clip_path.parts
@@ -134,6 +202,24 @@ def resolve_clip_path(
         return clip_path.resolve(), Path(dataset_root).resolve()
 
     raise ValueError("Provide --clip_dir or both --dataset_root and --clip_relpath")
+
+
+def derive_target_video_path(clip_path: Path, dataset_root: Path, pattern: str) -> Path:
+    """Derive target video path from clip path.
+
+    Args:
+        clip_path: Source clip directory (e.g., .../videos/source/vid/clip_0)
+        dataset_root: Dataset root directory
+        pattern: Time pattern name
+
+    Returns:
+        Path to target video file (e.g., .../target_videos/source/vid/clip_0/{pattern}_video.mp4)
+    """
+    # Get relative path under videos/
+    rel_path = clip_path.relative_to(dataset_root / 'videos')
+    target_video_dir = dataset_root / 'target_videos' / rel_path
+    target_video_file = target_video_dir / f"{pattern}_video.mp4"
+    return target_video_file
 
 
 def parse_args():
@@ -155,8 +241,8 @@ def parse_args():
                    help="Pure model weight file from training (step{N}_model.ckpt)")
 
     # Target camera
-    p.add_argument("--pattern", type=str, default="forward", choices=sorted(VALID_TIME_PATTERNS),
-                   help="Time pattern for target camera motion")
+    p.add_argument("--pattern", type=str, default="forward",
+                   help="Time pattern for target camera motion. Can be a single pattern or comma-separated list (e.g., 'forward,reverse,pingpong')")
     p.add_argument("--preset_cam", type=int, choices=range(1, 11), default=None,
                    help="Preset camera index (1-10) from camera_extrinsics.json")
     p.add_argument("--camera_json", type=str, default=None,
@@ -184,13 +270,16 @@ def parse_args():
 
     # Output
     p.add_argument("--output", type=str, default=None,
-                   help="Output mp4 path (default: results/{clip}_{pattern}_{timestamp}.mp4)")
+                   help="Output mp4 path (default: results/{clip}_{pattern}_{timestamp}.mp4). For multiple patterns, use directory path.")
 
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Parse time patterns (support comma-separated list)
+    patterns = parse_time_patterns(args.pattern)
 
     # Resolve device
     device = resolve_inference_device(args.device, args.gpu_id)
@@ -215,24 +304,11 @@ def main():
     meta = json.loads((clip_path / "meta.json").read_text(encoding="utf-8"))
     src_c2w = np.array(meta["camera"]["extrinsics_c2w"], dtype=np.float32)
 
-    # 4. Load cameras
+    # 4. Load source camera
     src_camera = load_camera_from_meta(str(clip_path / "meta.json"), dtype=torch.bfloat16).unsqueeze(0)
 
-    if args.preset_cam:
-        camera_json = Path(args.camera_json) if args.camera_json else dataset_root / "cameras" / "camera_extrinsics.json"
-        if not camera_json.is_file():
-            raise FileNotFoundError(f"Camera JSON not found: {camera_json}")
-        tgt_camera = load_camera_from_json(
-            str(camera_json), cam_idx=args.preset_cam, num_frames=args.num_frames, dtype=torch.bfloat16
-        ).unsqueeze(0)
-    else:
-        tgt_camera = get_target_camera_from_source(
-            src_c2w, args.pattern, num_frames=args.num_frames, dtype=torch.bfloat16
-        ).unsqueeze(0)
-
-    # 5. Load time embeddings
+    # 5. Load source time embeddings (always forward)
     src_time = torch.tensor(get_time_pattern("forward", args.num_frames), dtype=torch.float32).unsqueeze(0)
-    tgt_time = torch.tensor(get_time_pattern(args.pattern, args.num_frames), dtype=torch.float32).unsqueeze(0)
 
     # 6. Load latent cache (optional)
     prompt_context: Optional[torch.Tensor] = None
@@ -302,40 +378,108 @@ def main():
     else:
         print("No --ckpt: using base Wan2.1 model only")
 
-    # 9. Run inference
-    prompt_str = caption_text if prompt_context is None else ""
-    frames = pipe(
-        prompt=prompt_str,
-        negative_prompt=args.negative_prompt,
-        source_video=source_video,
-        source_latents=source_latents,
-        target_camera=tgt_camera,
-        source_camera=src_camera,
-        src_time_embedding=src_time,
-        tgt_time_embedding=tgt_time,
-        prompt_context=prompt_context,
-        cfg_scale=args.cfg_scale,
-        seed=args.seed,
-        num_inference_steps=args.num_inference_steps,
-        height=args.height,
-        width=args.width,
-        num_frames=args.num_frames,
-        tiled=args.tiled,
-    )
-
-    # 10. Save output
+    # 9. Run inference for each pattern
     os.makedirs(RESULTS_DIR, exist_ok=True)
     stem = clip_path.name
-    suffix = f"{args.pattern}" if not args.preset_cam else f"preset{args.preset_cam}_{args.pattern}"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = args.output or os.path.join(RESULTS_DIR, f"{stem}_{suffix}_{ts}.mp4")
 
-    print(f"Writing {out_path}")
-    with imageio.get_writer(out_path, fps=30, codec="libx264") as writer:
-        for frame in frames:
-            arr = frame.cpu().numpy() if isinstance(frame, torch.Tensor) else np.array(frame)
-            writer.append_data(arr)
-    print("Done.")
+    prompt_str = caption_text if prompt_context is None else ""
+
+    for pattern_idx, pattern in enumerate(patterns):
+        print(f"\n{'='*50}")
+        print(f"Processing pattern {pattern_idx + 1}/{len(patterns)}: {pattern}")
+        print(f"{'='*50}")
+
+        # Load target camera
+        if args.preset_cam:
+            camera_json = Path(args.camera_json) if args.camera_json else dataset_root / "cameras" / "camera_extrinsics.json"
+            if not camera_json.is_file():
+                raise FileNotFoundError(f"Camera JSON not found: {camera_json}")
+            tgt_camera = load_camera_from_json(
+                str(camera_json), cam_idx=args.preset_cam, num_frames=args.num_frames, dtype=torch.bfloat16
+            ).unsqueeze(0)
+        else:
+            tgt_camera = get_target_camera_from_source(
+                src_c2w, pattern, num_frames=args.num_frames, dtype=torch.bfloat16
+            ).unsqueeze(0)
+
+        # Load target time embeddings
+        tgt_time = torch.tensor(get_time_pattern(pattern, args.num_frames), dtype=torch.float32).unsqueeze(0)
+
+        # Run inference
+        frames = pipe(
+            prompt=prompt_str,
+            negative_prompt=args.negative_prompt,
+            source_video=source_video,
+            source_latents=source_latents,
+            target_camera=tgt_camera,
+            source_camera=src_camera,
+            src_time_embedding=src_time,
+            tgt_time_embedding=tgt_time,
+            prompt_context=prompt_context,
+            cfg_scale=args.cfg_scale,
+            seed=args.seed,
+            num_inference_steps=args.num_inference_steps,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            tiled=args.tiled,
+        )
+
+        # Try to load target video for side-by-side output
+        target_frames: Optional[list] = None
+        try:
+            target_video_path = derive_target_video_path(clip_path, dataset_root, pattern)
+            if target_video_path.is_file():
+                target_frame_process = v2.Compose([
+                    v2.CenterCrop(size=(args.height, args.width)),
+                    v2.ToTensor(),
+                ])
+                target_frames = load_frames_using_imageio(
+                    str(target_video_path),
+                    num_frames=args.num_frames,
+                    frame_process=target_frame_process,
+                    target_h=args.height,
+                    target_w=args.width,
+                    permute_to_cthw=False,
+                )
+                print(f"Loaded target video: {target_video_path}")
+            else:
+                print(f"Target video not found: {target_video_path}")
+        except Exception as e:
+            print(f"Could not load target video: {e}")
+
+        # Save output
+        suffix = f"{pattern}" if not args.preset_cam else f"preset{args.preset_cam}_{pattern}"
+        if len(patterns) > 1:
+            out_path = os.path.join(RESULTS_DIR, f"{stem}_{suffix}_{ts}.mp4")
+        else:
+            out_path = args.output or os.path.join(RESULTS_DIR, f"{stem}_{suffix}_{ts}.mp4")
+
+        print(f"Writing {out_path}")
+
+        if target_frames is not None:
+            # Side-by-side: target (left) | predicted (right)
+            with imageio.get_writer(out_path, fps=30, codec="libx264") as writer:
+                for i, (target_frame, pred_frame) in enumerate(zip(target_frames, frames)):
+                    target_arr = target_frame.cpu().numpy() if isinstance(target_frame, torch.Tensor) else np.array(target_frame)
+                    pred_arr = pred_frame.cpu().numpy() if isinstance(pred_frame, torch.Tensor) else np.array(pred_frame)
+
+                    # Draw labels
+                    target_labeled = draw_pattern_label(target_arr, pattern, is_target=True)
+                    pred_labeled = draw_pattern_label(pred_arr, pattern, is_target=False)
+
+                    # Concatenate horizontally
+                    combined = np.concatenate([target_labeled, pred_labeled], axis=2)
+                    writer.append_data(combined)
+        else:
+            # Predicted video only
+            with imageio.get_writer(out_path, fps=30, codec="libx264") as writer:
+                for frame in frames:
+                    arr = frame.cpu().numpy() if isinstance(frame, torch.Tensor) else np.array(frame)
+                    writer.append_data(arr)
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
