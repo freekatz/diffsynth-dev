@@ -138,8 +138,8 @@ class DiTBlock4D(nn.Module):
 
         # --- camera embedding ---
         cam_tgt = self.cam_encoder(cam_emb["tgt"])  # [B, T', dim]
-        cam_src = self.cam_encoder(cam_emb["src"])  # [B, T', dim]
-        cam = torch.cat([cam_tgt, cam_src], dim=1)  # [B, 2*T', dim]
+        cam_zero = torch.zeros_like(cam_tgt)
+        cam = torch.cat([cam_tgt, cam_zero], dim=1)  # [B, 2*T', dim]; source half: no cam inject
         cam = cam.unsqueeze(2).unsqueeze(3).expand(-1, -1, h, w, -1)
         cam = rearrange(cam, "b f h w d -> b (f h w) d")
         seq = input_x.shape[1]
@@ -204,12 +204,12 @@ class WanModel4D(torch.nn.Module):
             self.img_emb = MLP(1280, dim)
 
     def _validate_forward_inputs(self, cam_emb: dict, frame_time_embedding: dict) -> None:
-        required_cam_keys = {"src", "tgt"}
+        required_cam_keys = {"tgt"}
         required_time_keys = {"time_embedding_src", "time_embedding_tgt"}
         missing_cam_keys = sorted(required_cam_keys - set(cam_emb.keys()))
         missing_time_keys = sorted(required_time_keys - set(frame_time_embedding.keys()))
         if missing_cam_keys:
-            raise KeyError(f"`cam_emb` is missing required keys: {missing_cam_keys}. Required keys: ['src', 'tgt'].")
+            raise KeyError(f"`cam_emb` is missing required keys: {missing_cam_keys}. Required keys: ['tgt'].")
         if missing_time_keys:
             raise KeyError(
                 f"`frame_time_embedding` is missing required keys: {missing_time_keys}. "

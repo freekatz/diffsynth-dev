@@ -174,7 +174,6 @@ class Wan4DTrainModule(pl.LightningModule):
         if context.ndim == 4 and context.shape[1] == 1:
             context = context.squeeze(1)
         cam_emb = {
-            "src": batch["cam_emb"]["src"].to(self.device, dtype=dt),
             "tgt": batch["cam_emb"]["tgt"].to(self.device, dtype=dt),
         }
         fte = {

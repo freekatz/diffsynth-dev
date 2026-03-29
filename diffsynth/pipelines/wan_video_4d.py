@@ -75,7 +75,8 @@ class Wan4DPipeline(BasePipeline):
     """Inference pipeline for Wan4D camera-controlled video re-rendering.
 
     Extends Wan2.1-T2V-1.3B with camera pose and temporal pattern conditioning to
-    re-render a source video from a new camera trajectory.
+    re-render a source video from a new camera trajectory. Only the target camera
+    trajectory is conditioned; the source-latent half of tokens gets no camera bias.
 
     Usage::
         pipe = Wan4DPipeline.from_pretrained(
@@ -90,7 +91,6 @@ class Wan4DPipeline(BasePipeline):
             prompt="...",
             source_video=source_video_tensor,
             target_camera=tgt_cam_tensor,
-            source_camera=src_cam_tensor,
             src_time_embedding=src_time_idx,
             tgt_time_embedding=tgt_time_idx,
         )
@@ -248,7 +248,6 @@ class Wan4DPipeline(BasePipeline):
         source_video: torch.Tensor = None,          # [B, C, T, H, W] float32, range [-1, 1]
         source_latents: Optional[torch.Tensor] = None,  # [B, 16, T_latent, h, w]; skips VAE encode if set
         target_camera: torch.Tensor = None,          # [B, T', 12] camera extrinsics, T'=21
-        source_camera: torch.Tensor = None,          # [B, T', 12]
         src_time_embedding: torch.Tensor = None,     # [T] or [B, T] frame indices (T=81)
         tgt_time_embedding: torch.Tensor = None,     # [T] or [B, T]
         prompt_context: Optional[torch.Tensor] = None,  # [B, L, D] positive UMT5 embeds; skips text encode if set
@@ -274,8 +273,8 @@ class Wan4DPipeline(BasePipeline):
     ):
         if source_latents is None and source_video is None:
             raise ValueError("Provide `source_video` or precomputed `source_latents` for Wan4DPipeline inference.")
-        if target_camera is None or source_camera is None:
-            raise ValueError("Both `target_camera` and `source_camera` are required.")
+        if target_camera is None:
+            raise ValueError("`target_camera` is required.")
         if src_time_embedding is None or tgt_time_embedding is None:
             raise ValueError("Both `src_time_embedding` and `tgt_time_embedding` are required.")
 
@@ -305,7 +304,6 @@ class Wan4DPipeline(BasePipeline):
         # --- prepare camera embeddings ---
         cam_emb = {
             "tgt": target_camera.to(dtype=self.torch_dtype, device=self.device),
-            "src": source_camera.to(dtype=self.torch_dtype, device=self.device),
         }
         src_time_emb = src_time_embedding.to(dtype=self.torch_dtype, device=self.device)
         tgt_time_emb = tgt_time_embedding.to(dtype=self.torch_dtype, device=self.device)
@@ -373,19 +371,19 @@ def model_fn_wan4d_video(
         x: Noisy latents [B, C, F, H, W]. For Wan4D, F = 2 * latent_length
             (target + source latents concatenated along the temporal dimension).
         timestep: Current denoising timestep [B].
-        cam_emb: Dict with keys ``"src"`` and ``"tgt"``, each [B, T', 12].
+        cam_emb: Dict with key ``"tgt"`` only, [B, T', 12] (source latent half gets zero cam bias).
         context: Text embeddings [B, seq_len, text_dim].
         frame_time_embedding: Dict with keys ``"time_embedding_src"`` and
             ``"time_embedding_tgt"``, each [T] or [B, T] frame-index tensors.
         clip_feature: Optional CLIP image features for I2V [B, 257, 1280].
         y: Optional VAE-encoded source image for I2V [B, C, F, H, W].
     """
-    required_cam_keys = {"src", "tgt"}
+    required_cam_keys = {"tgt"}
     required_time_keys = {"time_embedding_src", "time_embedding_tgt"}
     missing_cam_keys = sorted(required_cam_keys - set(cam_emb.keys()))
     missing_time_keys = sorted(required_time_keys - set(frame_time_embedding.keys()))
     if missing_cam_keys:
-        raise KeyError(f"`cam_emb` is missing required keys: {missing_cam_keys}. Required keys: ['src', 'tgt'].")
+        raise KeyError(f"`cam_emb` is missing required keys: {missing_cam_keys}. Required keys: ['tgt'].")
     if missing_time_keys:
         raise KeyError(
             f"`frame_time_embedding` is missing required keys: {missing_time_keys}. "

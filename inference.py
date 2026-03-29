@@ -28,7 +28,7 @@ from torchvision.transforms import v2
 from PIL import Image, ImageDraw, ImageFont
 
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
-from utils.camera import get_target_camera_from_source, load_camera_from_meta, load_camera_from_json
+from utils.camera import get_target_camera_from_source, load_camera_from_json
 from utils.image import load_frames_using_imageio
 from utils.time_pattern import VALID_TIME_PATTERNS, TimePatternType, get_time_pattern
 
@@ -401,8 +401,6 @@ def main():
     meta = json.loads((clip_path / "meta.json").read_text(encoding="utf-8"))
     src_c2w = np.array(meta["camera"]["extrinsics_c2w"], dtype=np.float32)
 
-    src_camera = load_camera_from_meta(str(clip_path / "meta.json"), dtype=torch.bfloat16).unsqueeze(0)
-
     src_time = torch.tensor(get_time_pattern("forward", args.num_frames), dtype=torch.float32).unsqueeze(0)
 
     prompt_context: Optional[torch.Tensor] = None
@@ -520,7 +518,6 @@ def main():
             source_video=source_video,
             source_latents=source_latents,
             target_camera=tgt_camera,
-            source_camera=src_camera,
             src_time_embedding=src_time,
             tgt_time_embedding=tgt_time,
             prompt_context=prompt_context,

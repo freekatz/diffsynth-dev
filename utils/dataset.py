@@ -21,7 +21,7 @@ from typing import List, Optional, cast
 import numpy as np
 import torch
 
-from utils.camera import load_camera_from_meta, get_target_camera_from_source
+from utils.camera import get_target_camera_from_source
 from utils.time_pattern import get_time_pattern, TimePatternType
 
 # Wan2.1 VAE: pixel / latent spatial ratio (see diffsynth/models/wan_video_vae.py).
@@ -203,7 +203,6 @@ class Wan4DDataset(torch.utils.data.Dataset):
             self._validate_sample_tensors(latents, prompt_context, clip["path"])
 
         meta_path = self.root / "videos" / clip["path"] / "meta.json"
-        src_cam = load_camera_from_meta(str(meta_path))
         with open(meta_path, "r") as f:
             meta = json.load(f)
         src_c2w = np.array(meta["camera"]["extrinsics_c2w"])
@@ -220,7 +219,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
         return {
             "latents": latents,
             "prompt_context": prompt_context,
-            "cam_emb": {"src": src_cam, "tgt": tgt_cam},
+            "cam_emb": {"tgt": tgt_cam},
             "frame_time_embedding": {
                 "time_embedding_src": src_time,
                 "time_embedding_tgt": tgt_time,
