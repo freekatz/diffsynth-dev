@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -45,6 +46,39 @@ def parse_time_patterns(pattern_arg: str) -> list[str]:
         if p not in VALID_TIME_PATTERNS:
             raise ValueError(f"Invalid pattern '{p}'. Valid: {sorted(VALID_TIME_PATTERNS)}")
     return patterns
+
+
+def copy_input_video_to_output_dir(clip_path: Path, output_subdir: str) -> Optional[str]:
+    """Copy input video to output directory as forward_gt."""
+    src_video = clip_path / "video.mp4"
+    if not src_video.is_file():
+        return None
+
+    target_filename = "forward_gt.mp4"
+    target_path = os.path.join(output_subdir, target_filename)
+
+    if os.path.exists(target_path):
+        return target_path
+
+    shutil.copy2(str(src_video), target_path)
+    return target_path
+
+
+def build_output_subdir(dataset_root: Path, clip_path: Path) -> str:
+    """Build output subdirectory from clip path."""
+    videos_dir = dataset_root / 'videos'
+    rel_path = clip_path.relative_to(videos_dir)
+    parts = list(rel_path.parts)
+
+    if len(parts) >= 3:
+        source, video_id, clip_id = parts[0], parts[1], parts[2]
+    elif len(parts) == 2:
+        source, video_id, clip_id = parts[0], parts[1], "clip"
+    else:
+        source, video_id, clip_id = "unknown", "unknown", "clip"
+
+    subdir_name = f"{source}-{video_id}-{clip_id}"
+    return os.path.join(RESULTS_DIR, subdir_name)
 
 
 def draw_pattern_label(frame: np.ndarray, pattern: str, is_target: bool) -> np.ndarray:
@@ -394,8 +428,10 @@ def main():
         print("No --ckpt: using base Wan2.1 model only")
 
     # 9. Run inference for each pattern
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    stem = clip_path.name
+    # Build output subdirectory from clip path
+    output_subdir = build_output_subdir(dataset_root, clip_path)
+    os.makedirs(output_subdir, exist_ok=True)
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     prompt_str = caption_text if prompt_context is None else ""
@@ -465,11 +501,11 @@ def main():
             print(f"Could not load target video: {e}")
 
         # Save output
-        suffix = f"{pattern}" if not args.preset_cam else f"preset{args.preset_cam}_{pattern}"
-        if len(patterns) > 1:
-            out_path = os.path.join(RESULTS_DIR, f"{stem}_{suffix}_{ts}.mp4")
-        else:
-            out_path = args.output or os.path.join(RESULTS_DIR, f"{stem}_{suffix}_{ts}.mp4")
+        out_path = os.path.join(output_subdir, f"{pattern}_{ts}.mp4")
+
+        # Copy input video as GT (only once, for forward pattern)
+        if pattern == "forward":
+            copy_input_video_to_output_dir(clip_path, output_subdir)
 
         print(f"Writing {out_path}")
 
@@ -483,7 +519,11 @@ def main():
                         # Convert [C, H, W] to [H, W, C]
                         target_arr = np.transpose(target_arr, (1, 2, 0))
 
+                    # pred_frame: [C, H, W] tensor -> numpy -> [H, W, C]
                     pred_arr = pred_frame.cpu().numpy() if isinstance(pred_frame, torch.Tensor) else np.array(pred_frame)
+                    if pred_arr.ndim == 3 and pred_arr.shape[0] == 3:
+                        # Convert [C, H, W] to [H, W, C]
+                        pred_arr = np.transpose(pred_arr, (1, 2, 0))
 
                     # Draw labels
                     target_labeled = draw_pattern_label(target_arr, pattern, is_target=True)
