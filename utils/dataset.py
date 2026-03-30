@@ -200,13 +200,15 @@ class Wan4DDataset(torch.utils.data.Dataset):
         meta_path = self.root / "videos" / clip["path"] / "meta.json"
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        
-        # We don't need camera extraction based on the latest plan, simplifying to empty or ignored
-        tgt_cam = torch.zeros((self.num_frames, 0)) # Mock if needed
-        
-        # Accurate Float Temporal Coords (t / 4.0)
+
+        # Temporal coords at latent-space resolution (one per latent frame, not per pixel frame)
+        F_latent = (self.num_frames - 1) // 4 + 1  # e.g. 21 for num_frames=81
         raw_indices = get_time_pattern(cast(TimePatternType, pattern), self.num_frames)
-        tgt_temporal_coords = torch.tensor([float(v) / 4.0 for v in raw_indices], dtype=torch.float32)
+        # Each latent frame i corresponds to pixel frame i*4; clamp to avoid out-of-bounds
+        latent_pixel_indices = [raw_indices[min(i * 4, len(raw_indices) - 1)] for i in range(F_latent)]
+        tgt_temporal_coords = torch.tensor(
+            [float(v) / 4.0 for v in latent_pixel_indices], dtype=torch.float32
+        )
 
         # Runtime Reference Pick (0 to 3 frames)
         reference_frames = []

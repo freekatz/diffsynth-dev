@@ -1,7 +1,8 @@
 import torch
-from typing import Optional, List
+from typing import Optional, List, Union
 from PIL import Image
 from diffsynth.pipelines.wan_video import WanVideoPipeline, PipelineUnit
+from diffsynth.models.wan_video_4d_dit import Wan4DModel
 
 class WanVideoUnit_4DConditionPreparation(PipelineUnit):
     def __init__(self):
@@ -28,7 +29,7 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
             H_l = height // 8
             W_l = width // 8
             
-            # The all-zero canvas for condition features and mask
+            # All-zero canvas for condition features and mask (batch_size=1; expanded in model_fn)
             condition_latents = torch.zeros((1, 16, F_latent, H_l, W_l), dtype=pipe.torch_dtype, device=pipe.device)
             condition_mask = torch.zeros((1, 1, F_latent, H_l, W_l), dtype=pipe.torch_dtype, device=pipe.device)
             
@@ -61,7 +62,21 @@ def model_fn_wan4d_video(
     # map `y` back for the `Wan4DModel` fallback to process.
     if condition_latents is None and y is not None:
         condition_latents = y
-        
+
+    # Expand condition tensors to match the actual batch size (e.g. CFG doubles the batch)
+    B = latents.shape[0]
+    if condition_latents is not None and condition_latents.shape[0] != B:
+        condition_latents = condition_latents.expand(B, -1, -1, -1, -1)
+    if condition_mask is not None and condition_mask.shape[0] != B:
+        condition_mask = condition_mask.expand(B, -1, -1, -1, -1)
+
+    # Normalize temporal_coords to (B, F_latent) tensor
+    if temporal_coords is not None:
+        if not isinstance(temporal_coords, torch.Tensor):
+            temporal_coords = torch.tensor(temporal_coords, dtype=latents.dtype, device=latents.device)
+        if temporal_coords.ndim == 1:
+            temporal_coords = temporal_coords.unsqueeze(0).expand(B, -1)
+
     x = dit(
         x=latents,
         timestep=timestep,
@@ -73,11 +88,8 @@ def model_fn_wan4d_video(
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
     )
-    
-    if x.shape[0] != latents.shape[0]:
-        x = x.chunk(2, dim=0)[0] - x.chunk(2, dim=0)[1]
-    
-    return dict(noise_pred=x)
+
+    return x
 
 class Wan4DPipeline(WanVideoPipeline):
     def __init__(self, device="cuda", torch_dtype=torch.bfloat16):
@@ -86,7 +98,40 @@ class Wan4DPipeline(WanVideoPipeline):
         self.units.insert(1, WanVideoUnit_4DConditionPreparation())
         # Hook the new model execution function
         self.model_fn = model_fn_wan4d_video
-        
+
+    @staticmethod
+    def from_pretrained(
+        model_configs=None,
+        tokenizer_config=None,
+        device="cuda",
+        torch_dtype=torch.bfloat16,
+        **kwargs,
+    ):
+        """Load a pretrained Wan2.1 base model and wrap it as Wan4DPipeline with Wan4DModel dit."""
+        if model_configs is None:
+            model_configs = []
+        # Load base WanVideoPipeline with pretrained weights
+        base_pipe = WanVideoPipeline.from_pretrained(
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            device=device,
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
+        # Create a properly configured Wan4DPipeline (units + model_fn)
+        pipe = Wan4DPipeline(device=device, torch_dtype=torch_dtype)
+        # Transfer model components from the base pipeline
+        pipe.text_encoder = base_pipe.text_encoder
+        pipe.tokenizer = base_pipe.tokenizer
+        pipe.image_encoder = base_pipe.image_encoder
+        pipe.vae = base_pipe.vae
+        pipe.scheduler = base_pipe.scheduler
+        pipe.vram_management_enabled = base_pipe.vram_management_enabled
+        # Upgrade WanModel dit to Wan4DModel (adds mask_embedding, keeps all pretrained weights)
+        if base_pipe.dit is not None:
+            pipe.dit = Wan4DModel.from_wan_model(base_pipe.dit)
+        return pipe
+
     def __call__(
         self,
         *args,
