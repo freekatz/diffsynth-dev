@@ -27,6 +27,7 @@ import torch
 from torchvision.transforms import v2
 from PIL import Image, ImageDraw, ImageFont
 
+from diffsynth.core import ModelConfig
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
 from utils.image import load_frames_using_imageio
 from utils.time_pattern import VALID_TIME_PATTERNS, TimePatternType, generate_progress_curve, get_time_pattern
@@ -151,6 +152,24 @@ DEFAULT_NEGATIVE_PROMPT = (
     "手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
 RESULTS_DIR = "results"
+
+
+def resolve_dit_path(wan_model_dir: str) -> str:
+    """Find the single DiT safetensors file under wan_model_dir."""
+    import glob as _glob
+    patterns = [
+        "diffusion_pytorch_model*.safetensors",
+        "wan_video_dit*.safetensors",
+        "model*.safetensors",
+        "dit*.safetensors",
+    ]
+    for pattern in patterns:
+        matched = sorted(_glob.glob(os.path.join(wan_model_dir, pattern)))
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            raise ValueError(f"Multiple DiT files found for `{pattern}`: {matched}")
+    raise FileNotFoundError(f"No DiT safetensors found under `{wan_model_dir}`")
 
 
 def video_path_hash(video_rel_path: str) -> str:
@@ -304,23 +323,7 @@ def main():
 
     device = resolve_inference_device(args.device, args.gpu_id)
 
-    try:
-        preset_indices = parse_preset_cam_indices(args.preset_cam)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
-
-    preset_tgt_pattern: Optional[TimePatternType] = None
-    if preset_indices:
-        pnorm = args.pattern.replace(" ", "")
-        if "," in pnorm:
-            raise SystemExit(
-                "With --preset_cam, use a single --pattern (no commas). "
-                "Batch multiple cameras via --preset_cam 1,2,3 — not multiple patterns."
-            )
-        preset_tgt_pattern = parse_time_patterns(pnorm)[0]
-        runs = [("preset", idx) for idx in preset_indices]
-    else:
-        runs = [("pattern", p) for p in parse_time_patterns(args.pattern)]
+    runs = [("pattern", p) for p in parse_time_patterns(args.pattern)]
 
     clip_path, dataset_root = resolve_clip_path(args.clip_dir, args.dataset_root, args.clip_relpath)
 
@@ -365,9 +368,10 @@ def main():
             frame_arr = vframes[idx].permute(1, 2, 0).numpy()
             reference_frames.append(Image.fromarray(frame_arr))
 
-    pipe = Wan4DPipeline.from_wan_model_dir(
-        pretrained_model_dir=args.wan_model_dir,
-        wan4d_ckpt_path=None,
+    dit_path = resolve_dit_path(args.wan_model_dir)
+    pipe = Wan4DPipeline.from_pretrained(
+        model_configs=[ModelConfig(path=dit_path)],
+        tokenizer_config=None,
         torch_dtype=torch.bfloat16,
         device=device,
     )
@@ -397,9 +401,12 @@ def main():
         print(f"Processing run {run_idx + 1}/{len(runs)}: {label}")
         print(f"{'='*50}")
 
-        # Decode specific coords matching our `/4.0` strategy
+        # Temporal coords at latent-space resolution (F_latent values, one per latent frame)
+        F_latent = (args.num_frames - 1) // 4 + 1
         raw_indices = get_time_pattern(pattern, args.num_frames)
-        temporal_coords = [float(v) / 4.0 for v in raw_indices]
+        # Each latent frame i corresponds to pixel frame i*4; clamp to avoid out-of-bounds
+        latent_pixel_indices = [raw_indices[min(i * 4, len(raw_indices) - 1)] for i in range(F_latent)]
+        temporal_coords = [float(v) / 4.0 for v in latent_pixel_indices]
 
         frames = pipe(
             prompt=prompt_str,

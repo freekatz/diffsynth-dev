@@ -54,7 +54,7 @@ WAN21_T2V_13B_LR_SCHEDULER = "constant"
 WAN21_T2V_13B_MAX_EPOCHS = 2
 WAN21_T2V_13B_GRAD_ACCUM = 1
 
-_TRAINABLE_SUBSTR = ("cam_encoder", "projector", "self_attn")
+_TRAINABLE_SUBSTR = ("mask_embedding", "self_attn")
 
 
 def _safe_run_segment(name):
@@ -179,15 +179,13 @@ class Wan4DTrainModule(pl.LightningModule):
         context = batch["prompt_context"].to(self.device, dtype=dt)
         if context.ndim == 4 and context.shape[1] == 1:
             context = context.squeeze(1)
-            
+
         temporal_coords = batch.get("temporal_coords")
         if temporal_coords is not None:
-            temporal_coords = temporal_coords.to(self.device, dtype=dt).squeeze(0) # [F_latent]
-            # Since DiT expects identical shapes or batches
-            if temporal_coords.ndim == 1:
-                temporal_coords = temporal_coords.unsqueeze(0).expand(target_latents.shape[0], -1)
+            # After DataLoader collation, temporal_coords is already (B, F_latent)
+            temporal_coords = temporal_coords.to(self.device, dtype=dt)
 
-        # Assemble 33-channel Latents
+        # Build condition latents and mask from reference frames
         B, _, F_latent, H_l, W_l = target_latents.shape
         condition_latents = torch.zeros((B, 16, F_latent, H_l, W_l), dtype=dt, device=self.device)
         condition_mask = torch.zeros((B, 1, F_latent, H_l, W_l), dtype=dt, device=self.device)
@@ -201,48 +199,44 @@ class Wan4DTrainModule(pl.LightningModule):
             for b_idx in range(B):
                 r_frames = ref_frames_batch[b_idx] if b_idx < len(ref_frames_batch) else []
                 r_indices = ref_indices_batch[b_idx] if b_idx < len(ref_indices_batch) else []
-                
+
                 for ref_img, idx in zip(r_frames, r_indices):
                     # Runtime single image extraction trick (copy 4x)
-                    img_tensor = self.pipe.preprocess_video([ref_img] * 4) 
+                    img_tensor = self.pipe.preprocess_video([ref_img] * 4)
                     z_i = self.pipe.vae.encode(img_tensor, device=self.device)
                     z_i = z_i.to(dtype=dt, device=self.device)
-                    
+
                     target_latent_idx = idx // 4
                     if target_latent_idx < F_latent:
                         condition_latents[b_idx, :, target_latent_idx:target_latent_idx+1, :, :] = z_i
                         condition_mask[b_idx, :, target_latent_idx:target_latent_idx+1, :, :] = 1.0
 
-        latents_33 = torch.cat([target_latents, condition_latents, condition_mask], dim=1)
-        
-        return latents_33, context, temporal_coords
+        return target_latents, condition_latents, condition_mask, context, temporal_coords
 
-    def _diffusion_loss(self, latents, context, temporal_coords):
-        noise = torch.randn_like(latents)
+    def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords):
+        # Only add noise to the target latents; condition tensors remain clean
+        noise = torch.randn_like(target_latents)
         timestep_id = torch.randint(
             0, self.pipe.scheduler.num_train_timesteps, (1,), device="cpu"
         )
         t_scalar = self.pipe.scheduler.timesteps[timestep_id].squeeze()
-        clean = latents
+        clean = target_latents
         noisy = self.pipe.scheduler.add_noise(clean, noise, t_scalar)
-        time_half = noisy.shape[2] // 2
-        noisy[:, :, time_half:, ...] = clean[:, :, time_half:, ...]
         target = self.pipe.scheduler.training_target(clean, noise, t_scalar)
         timestep = t_scalar.to(dtype=self.pipe.torch_dtype, device=self.device).expand(
-            latents.shape[0]
+            target_latents.shape[0]
         )
         pred = self.dit(
             noisy,
             timestep=timestep,
             context=context,
             temporal_coords=temporal_coords,
+            condition_latents=condition_latents,
+            condition_mask=condition_mask,
             use_gradient_checkpointing=self.hparams.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.hparams.use_gradient_checkpointing_offload,
         )
-        loss = F.mse_loss(
-            pred[:, :, :time_half, ...].float(),
-            target[:, :, :time_half, ...].float(),
-        )
+        loss = F.mse_loss(pred.float(), target.float())
         w = self.pipe.scheduler.training_weight(
             t_scalar.to(self.pipe.scheduler.timesteps.device)
         )
@@ -253,8 +247,8 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss * w
 
     def training_step(self, batch, batch_idx):
-        latents, context, temporal_coords = self._batch_to_model_device(batch)
-        loss = self._diffusion_loss(latents, context, temporal_coords)
+        target_latents, condition_latents, condition_mask, context, temporal_coords = self._batch_to_model_device(batch)
+        loss = self._diffusion_loss(target_latents, condition_latents, condition_mask, context, temporal_coords)
 
         every = int(self.hparams.log_metrics_every)
         if self.global_step % every == 0:

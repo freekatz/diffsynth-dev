@@ -1,4 +1,6 @@
+import math
 import torch
+import torch.nn as nn
 from typing import Optional, Tuple
 from einops import rearrange
 from diffsynth.models.wan_video_dit import WanModel, precompute_freqs_cis, precompute_freqs_cis_3d
@@ -15,10 +17,53 @@ def precompute_freqs_cis_fractional(dim: int, coords: torch.Tensor, theta: float
 
 class Wan4DModel(WanModel):
     def __init__(self, *args, **kwargs):
-        # By default for inpainting, we need 33 channels (16 noise + 16 cond + 1 mask)
-        # Assuming the caller instantiates Wan4DModel(..., in_dim=33, ...)
-        # The underlying WanModel will initialize the patch_embedding with `in_dim`.
+        # Keep in_dim=16 to remain compatible with pretrained Wan2.1 weights.
+        # condition_latents reuse patch_embedding; condition_mask uses a separate mask_embedding.
+        kwargs["in_dim"] = 16
         super().__init__(*args, **kwargs)
+        # Small 1-channel mask embedding, zero-initialized so it doesn't disrupt pretrained features.
+        self.mask_embedding = nn.Conv3d(1, self.dim, kernel_size=self.patch_size, stride=self.patch_size)
+        nn.init.zeros_(self.mask_embedding.weight)
+        nn.init.zeros_(self.mask_embedding.bias)
+
+    @classmethod
+    def from_wan_model(cls, wan_model: WanModel) -> "Wan4DModel":
+        """Upgrade a pretrained WanModel to Wan4DModel, copying all weights."""
+        config = dict(
+            dim=wan_model.dim,
+            in_dim=wan_model.in_dim,
+            ffn_dim=wan_model.blocks[0].ffn[0].out_features,
+            out_dim=wan_model.head.head.out_features // math.prod(wan_model.patch_size),
+            text_dim=wan_model.text_embedding[0].in_features,
+            freq_dim=wan_model.time_embedding[0].in_features,
+            eps=1e-6,
+            patch_size=tuple(wan_model.patch_size),
+            num_heads=wan_model.blocks[0].self_attn.num_heads,
+            num_layers=len(wan_model.blocks),
+            has_image_input=wan_model.has_image_input,
+            has_image_pos_emb=getattr(wan_model, "has_image_pos_emb", False),
+            has_ref_conv=getattr(wan_model, "has_ref_conv", False),
+            add_control_adapter=getattr(wan_model, "control_adapter", None) is not None,
+        )
+        instance = cls(**config)
+        # strict=False: mask_embedding keys are new and stay zero-initialized
+        instance.load_state_dict(wan_model.state_dict(), strict=False)
+        return instance
+
+    def patchify(self, x: torch.Tensor):
+        """Apply patch embedding, record grid size, and rearrange to sequence."""
+        x = self.patch_embedding(x)
+        grid_size = x.shape[2:]  # (f, h, w)
+        x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
+        return x, grid_size
+
+    def unpatchify(self, x: torch.Tensor, grid_size):
+        f, h, w = grid_size
+        return rearrange(
+            x, "b (f h w) (x y z c) -> b c (f x) (h y) (w z)",
+            f=f, h=h, w=w,
+            x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2],
+        )
 
     def forward(
         self,
@@ -34,11 +79,12 @@ class Wan4DModel(WanModel):
         **kwargs,
     ):
         """
-        Extended forward pass for 4D VideoCanvas style spatiotemporal completion.
-        
-        y (condition_latents): Conditional latent of shape (B, 16, F_latent, H_latent, W_latent)
-        condition_mask: Mask of shape (B, 1, F_latent, H_latent, W_latent)
-        temporal_coords: Fractional temporal coordinates of shape (B, F_latent)
+        Extended forward pass for 4D inpainting spatiotemporal completion.
+
+        x: Noisy target latent (B, 16, F_latent, H_l, W_l)
+        condition_latents: Clean reference latent (B, 16, F_latent, H_l, W_l), or None
+        condition_mask: Binary mask (B, 1, F_latent, H_l, W_l), or None
+        temporal_coords: Fractional temporal coordinates (B, F_latent), or None
         """
         from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
         from diffsynth.core.gradient import gradient_checkpoint_forward
@@ -47,63 +93,53 @@ class Wan4DModel(WanModel):
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
-        
-        # 1. Handle Channel Concatenation (Wan2.1 native style)
-        if condition_latents is not None and condition_mask is not None:
-            # For inpainting, x (16) + condition (16) + mask (1) = 33 channels
-            x = torch.cat([x, condition_latents, condition_mask], dim=1)
-        elif self.has_image_input and condition_latents is not None:
-            # Fallback for standard 32-channel I2V if needed
-            x = torch.cat([x, condition_latents], dim=1)
-            
+
         if self.has_image_input and clip_feature is not None:
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
-            
-        # 2. Patchify the sequence
-        x, (f, h, w) = self.patchify(x)
+
+        # 1. Patchify the noisy target latents -> (B, seq, dim)
+        x, grid_size = self.patchify(x)
+        f, h, w = grid_size
         b = x.shape[0]
-        
-        # 3. Handle Temporal RoPE Interpolation
+
+        # 2. Additive injection of condition latents and mask (after patchify)
+        if condition_latents is not None:
+            cond = self.patch_embedding(condition_latents)
+            cond = rearrange(cond, "b c f h w -> b (f h w) c").contiguous()
+            x = x + cond
+        if condition_mask is not None:
+            mask = self.mask_embedding(condition_mask)
+            mask = rearrange(mask, "b c f h w -> b (f h w) c").contiguous()
+            x = x + mask
+
+        # 3. Temporal RoPE: fractional coords if provided, integer fallback otherwise
         head_dim = self.dim // self.blocks[0].self_attn.num_heads
         f_dim = head_dim - 2 * (head_dim // 3)
-        h_dim = head_dim // 3
-        w_dim = head_dim // 3
 
-        # For spatial dimensions (H, W), we can use the precomputed native integer ones
         h_freqs_cis = self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
         w_freqs_cis = self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
 
         if temporal_coords is not None:
-            # We compute fractional temporal freqs dynamically for the batch
             f_freqs_cis_list = []
             for i in range(b):
-                coords = temporal_coords[i] # (F,)
-                # Compute fractional rope cis for this specific sequence of times
+                coords = temporal_coords[i]  # (F_latent,)
                 f_freq = precompute_freqs_cis_fractional(f_dim, coords).to(x.device)
                 f_freqs_cis_list.append(f_freq.view(1, f, 1, 1, -1).expand(1, f, h, w, -1))
-                
-            f_freqs_cis_tensor = torch.cat(f_freqs_cis_list, dim=0) # (B, f, h, w, -1)
-            
-            # Expand spatial frequencies to match the batch dimension
+            f_freqs_cis_tensor = torch.cat(f_freqs_cis_list, dim=0)  # (B, f, h, w, head_dim/2)
             h_freqs_cis_b = h_freqs_cis.unsqueeze(0).expand(b, f, h, w, -1).to(x.device)
             w_freqs_cis_b = w_freqs_cis.unsqueeze(0).expand(b, f, h, w, -1).to(x.device)
-            
-            # Combine F, H, W freqs
             freqs = torch.cat([f_freqs_cis_tensor, h_freqs_cis_b, w_freqs_cis_b], dim=-1)
-            # Shape for self_attn is typically (Batch, Seq_len, 1, HeadDim/2)
             freqs = freqs.reshape(b, f * h * w, 1, -1)
-            
         else:
-            # Fallback to standard integer RoPE if temporal_coords are not specified
             f_freqs_cis_tensor = self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1)
             freqs = torch.cat([
                 f_freqs_cis_tensor,
                 h_freqs_cis,
-                w_freqs_cis
+                w_freqs_cis,
             ], dim=-1).reshape(1, f * h * w, 1, -1).to(x.device)
 
-        # 4. Neural Network Blocks
+        # 4. Transformer blocks
         for block in self.blocks:
             if self.training:
                 x = gradient_checkpoint_forward(
@@ -115,7 +151,7 @@ class Wan4DModel(WanModel):
             else:
                 x = block(x, context, t_mod, freqs)
 
-        # 5. Output
+        # 5. Output head + unpatchify
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
         return x
