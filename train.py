@@ -63,7 +63,13 @@ def _safe_run_segment(name):
 
 
 def _is_rank_zero() -> bool:
-    """Global rank 0 only (DDP / multi-GPU). SwanLab DDP expects a single tracker process; see integration docs."""
+    """Return True only on global rank 0 (main process) in DDP / DeepSpeed runs.
+
+    SwanLab must be initialized on a single process only.  If every rank creates
+    a SwanLabLogger the tracker receives duplicate metric reports, and some SwanLab
+    backends reject concurrent init from the same run.  All metric reporting to
+    SwanLab is therefore guarded by this helper so that only rank 0 writes logs.
+    """
     return int(getattr(rank_zero_only, "rank", 0)) == 0
 
 
@@ -116,6 +122,27 @@ def resolve_dit_path(wan_model_dir):
     raise FileNotFoundError(f"no DiT under `{wan_model_dir}`")
 
 
+def resolve_vae_path(wan_model_dir):
+    """Find the Wan VAE weights file in wan_model_dir.
+
+    The VAE is needed at runtime to encode reference frames to latents during training.
+    Returns the path if found, or None if no VAE weights exist (encode will be skipped).
+    """
+    patterns = [
+        "Wan2.1_VAE.pth",
+        "Wan2.1_VAE.safetensors",
+        "Wan2.2_VAE.pth",
+        "Wan2.2_VAE.safetensors",
+        "wan_video_vae*.pth",
+        "wan_video_vae*.safetensors",
+    ]
+    for pattern in patterns:
+        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
+        if matched:
+            return matched[0]
+    return None
+
+
 class Wan4DTrainModule(pl.LightningModule):
     """Fine-tunes selected DiT blocks for Wan4D (noise prediction on first half of latent time)."""
 
@@ -143,8 +170,16 @@ class Wan4DTrainModule(pl.LightningModule):
                 torch.cuda.manual_seed_all(seed)
 
         dit_path = resolve_dit_path(wan_model_dir)
+        # Also load the VAE so that runtime reference-frame encoding is available on
+        # every DDP rank.  In multi-GPU training each rank processes its own batch shard
+        # independently; any rank may receive samples that contain reference frames and
+        # must be able to call pipe.vae.encode() without relying on rank-0 state.
+        vae_path = resolve_vae_path(wan_model_dir)
+        model_configs = [ModelConfig(path=dit_path)]
+        if vae_path is not None:
+            model_configs.append(ModelConfig(path=vae_path))
         self.pipe = Wan4DPipeline.from_pretrained(
-            model_configs=[ModelConfig(path=dit_path)],
+            model_configs=model_configs,
             tokenizer_config=None,
             device="cuda",
             torch_dtype=torch.bfloat16,
@@ -195,6 +230,18 @@ class Wan4DTrainModule(pl.LightningModule):
 
         has_refs = any(len(r) > 0 for r in ref_frames_batch)
         if has_refs:
+            # Runtime VAE encode: reference frames are stored as raw PIL Images in the
+            # dataset and must be encoded to latents at training time.  This must happen
+            # on every DDP rank because each rank independently receives batch shards that
+            # may contain reference frames — skipping encode on non-rank-0 ranks would
+            # leave condition_latents as all-zeros on those ranks, producing wrong
+            # gradients and diverging training.
+            if self.pipe.vae is None:
+                raise RuntimeError(
+                    "Runtime VAE encode is required for reference-frame conditioning but "
+                    "self.pipe.vae is None.  Ensure wan_model_dir contains a VAE weights "
+                    "file (e.g. Wan2.1_VAE.pth) so it is loaded during initialisation."
+                )
             self.pipe.load_models_to_device(["vae"])
             for b_idx in range(B):
                 r_frames = ref_frames_batch[b_idx] if b_idx < len(ref_frames_batch) else []
@@ -555,6 +602,10 @@ def main():
             TensorBoardLogger(save_dir=tb_dir, name="tb", version=args.experiment_name)
         )
     if args.use_swanlab and _is_rank_zero():
+        # SwanLab is initialized only on rank 0 (main process).  In DDP/DeepSpeed
+        # every rank runs this code path, so the _is_rank_zero() guard ensures the
+        # logger is created exactly once — preventing duplicate uploads and avoiding
+        # init errors on worker ranks that have no SwanLab credentials/token.
         try:
             from swanlab.integration.pytorch_lightning import SwanLabLogger  # type: ignore[import-untyped]
 
