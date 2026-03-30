@@ -1,7 +1,7 @@
 import torch
 from typing import Optional, List, Union
 from PIL import Image
-from diffsynth.pipelines.wan_video import WanVideoPipeline, PipelineUnit
+from diffsynth.pipelines.wan_video import WanVideoPipeline, PipelineUnit, WanVideoUnit_PromptEmbedder
 from diffsynth.models.wan_video_4d_dit import Wan4DModel
 
 class WanVideoUnit_4DConditionPreparation(PipelineUnit):
@@ -51,6 +51,18 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
             
         return output
 
+class WanVideoUnit_4DPromptContextOverride(PipelineUnit):
+    """Replace positive text-encoder context with pre-computed prompt embeddings when available."""
+    def __init__(self):
+        super().__init__(take_over=True)
+
+    def process(self, pipe, inputs_shared, inputs_posi, inputs_nega):
+        prompt_context = getattr(pipe, "_temp_prompt_context", None)
+        if prompt_context is not None:
+            inputs_posi["context"] = prompt_context.to(device=pipe.device, dtype=pipe.torch_dtype)
+        return inputs_shared, inputs_posi, inputs_nega
+
+
 def model_fn_wan4d_video(
     dit, latents, timestep, context, y=None, clip_feature=None,
     condition_latents=None, condition_mask=None, temporal_coords=None,
@@ -96,6 +108,14 @@ class Wan4DPipeline(WanVideoPipeline):
         super().__init__(device=device, torch_dtype=torch_dtype)
         # Add the 4D Preprocessing Unit
         self.units.insert(1, WanVideoUnit_4DConditionPreparation())
+        # Insert prompt-context override right after the PromptEmbedder so that
+        # pre-computed text embeddings (when available) replace the encoded prompt.
+        prompt_idx = next(
+            (i for i, unit in enumerate(self.units) if isinstance(unit, WanVideoUnit_PromptEmbedder)),
+            None,
+        )
+        if prompt_idx is not None:
+            self.units.insert(prompt_idx + 1, WanVideoUnit_4DPromptContextOverride())
         # Hook the new model execution function
         self.model_fn = model_fn_wan4d_video
 
@@ -138,10 +158,12 @@ class Wan4DPipeline(WanVideoPipeline):
         reference_frames: Optional[List[Image.Image]] = None,
         reference_indices: Optional[List[int]] = None,      # Corresponding frame indices
         temporal_coords: Optional[List[float]] = None,
+        prompt_context: Optional[torch.Tensor] = None,
         **kwargs
     ):
         # We store arguments for our custom PipelineUnit to grab
         self._temp_reference_frames = reference_frames
         self._temp_reference_indices = reference_indices
         self._temp_temporal_coords = temporal_coords
+        self._temp_prompt_context = prompt_context
         return super().__call__(*args, **kwargs)
