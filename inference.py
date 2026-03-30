@@ -12,6 +12,7 @@ Use the pure model weight file (*_model.ckpt) saved by training for inference.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -154,24 +155,6 @@ DEFAULT_NEGATIVE_PROMPT = (
 RESULTS_DIR = "results"
 
 
-def resolve_dit_path(wan_model_dir: str) -> str:
-    """Find the single DiT safetensors file under wan_model_dir."""
-    import glob as _glob
-    patterns = [
-        "diffusion_pytorch_model*.safetensors",
-        "wan_video_dit*.safetensors",
-        "model*.safetensors",
-        "dit*.safetensors",
-    ]
-    for pattern in patterns:
-        matched = sorted(_glob.glob(os.path.join(wan_model_dir, pattern)))
-        if len(matched) == 1:
-            return matched[0]
-        if len(matched) > 1:
-            raise ValueError(f"Multiple DiT files found for `{pattern}`: {matched}")
-    raise FileNotFoundError(f"No DiT safetensors found under `{wan_model_dir}`")
-
-
 def video_path_hash(video_rel_path: str) -> str:
     """16-char SHA256 prefix for latent cache key."""
     return hashlib.sha256(video_rel_path.encode()).hexdigest()[:16]
@@ -182,7 +165,69 @@ def caption_content_hash(caption: str) -> str:
     return hashlib.sha256(caption.encode()).hexdigest()[:16]
 
 
-def load_checkpoint(ckpt_path: str, device: str = "cpu") -> dict:
+def resolve_dit_path(wan_model_dir: str) -> str:
+    """Resolve DiT weights under a Wan2.1-style folder (same layout as ReCamMaster / train)."""
+    wan_model_dir = os.path.expanduser(wan_model_dir)
+    patterns = [
+        "diffusion_pytorch_model.safetensors",
+        "diffusion_pytorch_model*.safetensors",
+        "wan_video_dit*.safetensors",
+        "model*.safetensors",
+        "dit*.safetensors",
+    ]
+    for pattern in patterns:
+        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            raise ValueError(f"multiple DiT files for `{pattern}` under `{wan_model_dir}`: {matched}")
+    raise FileNotFoundError(f"no DiT checkpoint under `{wan_model_dir}`")
+
+
+def resolve_vae_path(wan_model_dir: str) -> Optional[str]:
+    wan_model_dir = os.path.expanduser(wan_model_dir)
+    patterns = [
+        "Wan2.1_VAE.pth",
+        "Wan2.1_VAE.safetensors",
+        "Wan2.2_VAE.pth",
+        "Wan2.2_VAE.safetensors",
+        "wan_video_vae*.pth",
+        "wan_video_vae*.safetensors",
+    ]
+    for pattern in patterns:
+        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
+        if matched:
+            return matched[0]
+    return None
+
+
+def resolve_text_encoder_path(wan_model_dir: str) -> Optional[str]:
+    """T5/UMT5 encoder weights (e.g. models_t5_umt5-xxl-enc-bf16.pth)."""
+    wan_model_dir = os.path.expanduser(wan_model_dir)
+    patterns = [
+        "models_t5_umt5-xxl-enc-bf16.pth",
+        "models_t5_umt5-xxl-enc-bf16.safetensors",
+        "models_t5*.pth",
+        "models_t5*.safetensors",
+    ]
+    for pattern in patterns:
+        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
+        if len(matched) >= 1:
+            return matched[0]
+    return None
+
+
+def resolve_tokenizer_path(wan_model_dir: str) -> Optional[str]:
+    """HuggingFace tokenizer folder shipped with Wan2.1 (google/umt5-xxl)."""
+    wan_model_dir = os.path.expanduser(wan_model_dir)
+    for rel in ("google/umt5-xxl", "google\\umt5-xxl", "umt5-xxl"):
+        p = os.path.join(wan_model_dir, *rel.replace("\\", "/").split("/"))
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+def load_checkpoint(ckpt_path: str, device: str = "cuda") -> dict:
     """Load checkpoint dict; supports Lightning state_dict and strips pipe.dit./dit. prefixes."""
     obj = torch.load(ckpt_path, map_location=device, weights_only=False)
 
@@ -240,6 +285,21 @@ def derive_target_video_path(clip_path: Path, dataset_root: Path, pattern: str) 
     """target_videos/<relpath_under_videos>/{pattern}_video.mp4"""
     rel_path = clip_path.relative_to(dataset_root / "videos")
     return dataset_root / "target_videos" / rel_path / f"{pattern}_video.mp4"
+
+
+def resolve_gt_video_for_comparison(clip_path: Path, dataset_root: Path, pattern: str) -> tuple[Optional[Path], str]:
+    """Ground-truth video for the left panel of side-by-side output.
+
+    Prefer ``target_videos/.../{pattern}_video.mp4`` when present; otherwise use the
+    clip input ``video.mp4`` (e.g. forward GT lives in the same folder as the source).
+    """
+    target_p = derive_target_video_path(clip_path, dataset_root, pattern)
+    if target_p.is_file():
+        return target_p, "target_videos"
+    input_p = clip_path / "video.mp4"
+    if input_p.is_file():
+        return input_p, "clip_input"
+    return None, ""
 
 
 
@@ -351,8 +411,8 @@ def main():
 
     cap_latent_file = dataset_root / "caption_latents" / f"{caption_content_hash(caption_text)}.pt"
     if cap_latent_file.is_file():
-        td = torch.load(cap_latent_file, weights_only=True, map_location="cpu")
-        prompt_context = td["text_embeds"].detach()
+        td = torch.load(cap_latent_file, weights_only=True, map_location=device)
+        prompt_context = td["text_embeds"].detach().unsqueeze(0)
         print(f"Using caption latent: {cap_latent_file}")
     else:
         print(f"No caption latent at {cap_latent_file}")
@@ -368,10 +428,35 @@ def main():
             frame_arr = vframes[idx].permute(1, 2, 0).numpy()
             reference_frames.append(Image.fromarray(frame_arr))
 
+
     dit_path = resolve_dit_path(args.wan_model_dir)
+    vae_path = resolve_vae_path(args.wan_model_dir)
+    if vae_path is None:
+        raise FileNotFoundError(
+            f"No Wan VAE weights under `{args.wan_model_dir}`. "
+            "Place Wan2.1_VAE.pth, Wan2.1_VAE.safetensors, Wan2.2_VAE.*, or wan_video_vae*.{pth,safetensors} next to the DiT checkpoint."
+        )
+    model_configs = [ModelConfig(path=dit_path), ModelConfig(path=vae_path), ]
+    t5_path = resolve_text_encoder_path(args.wan_model_dir)
+    if t5_path is None:
+        raise FileNotFoundError(
+            f"No T5/UMT5 text encoder under `{args.wan_model_dir}`. "
+            "Expected e.g. `models_t5_umt5-xxl-enc-bf16.pth` (Wan2.1-T2V-1.3B layout)."
+        )
+    model_configs.append(ModelConfig(path=t5_path))
+
+    tok_path = resolve_tokenizer_path(args.wan_model_dir)
+    if tok_path is not None:
+        tokenizer_config = ModelConfig(path=tok_path)
+    else:
+        tokenizer_config = ModelConfig(
+            model_id="Wan-AI/Wan2.1-T2V-1.3B",
+            origin_file_pattern="google/umt5-xxl/",
+        )
+
     pipe = Wan4DPipeline.from_pretrained(
-        model_configs=[ModelConfig(path=dit_path)],
-        tokenizer_config=None,
+        model_configs=model_configs,
+        tokenizer_config=tokenizer_config,
         torch_dtype=torch.bfloat16,
         device=device,
     )
@@ -427,8 +512,10 @@ def main():
         target_frames: Optional[torch.Tensor] = None
         tgt_pattern_for_video = str(value)
         try:
-            target_video_path = derive_target_video_path(clip_path, dataset_root, tgt_pattern_for_video)
-            if target_video_path.is_file():
+            gt_path, gt_source = resolve_gt_video_for_comparison(
+                clip_path, dataset_root, tgt_pattern_for_video
+            )
+            if gt_path is not None:
                 target_frame_process = v2.Compose(
                     [
                         v2.CenterCrop(size=(args.height, args.width)),
@@ -436,18 +523,24 @@ def main():
                     ]
                 )
                 target_frames = load_frames_using_imageio(
-                    str(target_video_path),
+                    str(gt_path),
                     num_frames=args.num_frames,
                     frame_process=target_frame_process,
                     target_h=args.height,
                     target_w=args.width,
                     permute_to_cthw=False,
                 )
-                print(f"Loaded target video: {target_video_path}")
+                print(f"Loaded GT video ({gt_source}): {gt_path}")
             else:
-                print(f"Target video not found: {target_video_path}")
+                tried_target = derive_target_video_path(
+                    clip_path, dataset_root, tgt_pattern_for_video
+                )
+                print(
+                    f"No GT video for side-by-side: missing {tried_target} "
+                    f"and {clip_path / 'video.mp4'}"
+                )
         except Exception as e:
-            print(f"Could not load target video: {e}")
+            print(f"Could not load GT video: {e}")
 
         out_path = resolve_run_output_path(output_subdir, run_tag, ts)
 
