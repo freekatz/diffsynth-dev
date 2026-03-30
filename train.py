@@ -10,6 +10,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from lightning_fabric.utilities.rank_zero import rank_zero_only, rank_zero_warn
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
@@ -59,6 +60,11 @@ _TRAINABLE_SUBSTR = ("cam_encoder", "projector", "self_attn")
 def _safe_run_segment(name):
     s = (name or "run").strip().replace(os.sep, "_").replace("/", "_")
     return s if s else "run"
+
+
+def _is_rank_zero() -> bool:
+    """Global rank 0 only (DDP / multi-GPU). SwanLab DDP expects a single tracker process; see integration docs."""
+    return int(getattr(rank_zero_only, "rank", 0)) == 0
 
 
 def run_root_from_names(output_base, project_name, experiment_name):
@@ -485,11 +491,15 @@ def main():
     out, ckpt_dir, tb_dir, sw_dir = prepare_output_dirs(out)
     log = logging.getLogger("wan4d_train")
     log.setLevel(logging.INFO)
-    fh = logging.FileHandler(os.path.join(out, "finetune.log"), encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    log.addHandler(fh)
-    log.info("start run output=%s", out)
-    save_run_meta(out, vars(args).copy())
+    if _is_rank_zero():
+        fh = logging.FileHandler(os.path.join(out, "finetune.log"), encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(fh)
+        log.info("start run output=%s", out)
+        save_run_meta(out, vars(args).copy())
+    else:
+        log.addHandler(logging.NullHandler())
+        log.propagate = False
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -506,14 +516,15 @@ def main():
         split=args.split,
         validate_tensors=not args.no_dataset_validate,
     )
-    log.info(
-        "dataset_root=%s index=%s clips=%d steps_per_epoch=%d split=%s",
-        dataset_root,
-        index_path,
-        len(ds.clips),
-        ds.steps_per_epoch,
-        args.split,
-    )
+    if _is_rank_zero():
+        log.info(
+            "dataset_root=%s index=%s clips=%d steps_per_epoch=%d split=%s",
+            dataset_root,
+            index_path,
+            len(ds.clips),
+            ds.steps_per_epoch,
+            args.split,
+        )
 
     dl = torch.utils.data.DataLoader(
         ds,
@@ -549,7 +560,7 @@ def main():
         loggers.append(
             TensorBoardLogger(save_dir=tb_dir, name="tb", version=args.experiment_name)
         )
-    if args.use_swanlab:
+    if args.use_swanlab and _is_rank_zero():
         try:
             from swanlab.integration.pytorch_lightning import SwanLabLogger  # type: ignore[import-untyped]
 
@@ -563,7 +574,7 @@ def main():
                 )
             )
         except ImportError:
-            log.warning("swanlab not installed, skip")
+            rank_zero_warn("swanlab not installed, skip")
     ckpt = Wan4DModelCheckpoint(
         dirpath=ckpt_dir,
         save_top_k=args.save_top_k,
@@ -588,9 +599,10 @@ def main():
         log_every_n_steps=args.log_every_n_steps,
         gradient_clip_val=None if args.max_grad_norm <= 0 else args.max_grad_norm,
         callbacks=cb,
-        logger=loggers or True,
+        logger=loggers if loggers else _is_rank_zero(),
     )
-    log.info("fit resume=%s", resume_pl)
+    if _is_rank_zero():
+        log.info("fit resume=%s", resume_pl)
     trainer.fit(model, dl, ckpt_path=resume_pl)
 
 
