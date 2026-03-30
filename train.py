@@ -169,17 +169,49 @@ class Wan4DTrainModule(pl.LightningModule):
 
     def _batch_to_model_device(self, batch):
         dt = self.pipe.torch_dtype
-        latents = batch["latents"].to(self.device, dtype=dt)
+        target_latents = batch["latents"].to(self.device, dtype=dt)
         context = batch["prompt_context"].to(self.device, dtype=dt)
         if context.ndim == 4 and context.shape[1] == 1:
             context = context.squeeze(1)
-        cam_emb = {
-            "tgt": batch["cam_emb"]["tgt"].to(self.device, dtype=dt),
-        }
-        tgt_progress = batch["tgt_progress"].to(self.device, dtype=dt)
-        return latents, context, cam_emb, tgt_progress
+            
+        temporal_coords = batch.get("temporal_coords")
+        if temporal_coords is not None:
+            temporal_coords = temporal_coords.to(self.device, dtype=dt).squeeze(0) # [F_latent]
+            # Since DiT expects identical shapes or batches
+            if temporal_coords.ndim == 1:
+                temporal_coords = temporal_coords.unsqueeze(0).expand(target_latents.shape[0], -1)
 
-    def _diffusion_loss(self, latents, context, cam_emb, tgt_progress):
+        # Assemble 33-channel Latents
+        B, _, F_latent, H_l, W_l = target_latents.shape
+        condition_latents = torch.zeros((B, 16, F_latent, H_l, W_l), dtype=dt, device=self.device)
+        condition_mask = torch.zeros((B, 1, F_latent, H_l, W_l), dtype=dt, device=self.device)
+
+        ref_frames_batch = batch.get("reference_frames", [])
+        ref_indices_batch = batch.get("reference_indices", [])
+
+        has_refs = any(len(r) > 0 for r in ref_frames_batch)
+        if has_refs:
+            self.pipe.load_models_to_device(["vae"])
+            for b_idx in range(B):
+                r_frames = ref_frames_batch[b_idx] if b_idx < len(ref_frames_batch) else []
+                r_indices = ref_indices_batch[b_idx] if b_idx < len(ref_indices_batch) else []
+                
+                for ref_img, idx in zip(r_frames, r_indices):
+                    # Runtime single image extraction trick (copy 4x)
+                    img_tensor = self.pipe.preprocess_video([ref_img] * 4) 
+                    z_i = self.pipe.vae.encode(img_tensor, device=self.device)
+                    z_i = z_i.to(dtype=dt, device=self.device)
+                    
+                    target_latent_idx = idx // 4
+                    if target_latent_idx < F_latent:
+                        condition_latents[b_idx, :, target_latent_idx:target_latent_idx+1, :, :] = z_i
+                        condition_mask[b_idx, :, target_latent_idx:target_latent_idx+1, :, :] = 1.0
+
+        latents_33 = torch.cat([target_latents, condition_latents, condition_mask], dim=1)
+        
+        return latents_33, context, temporal_coords
+
+    def _diffusion_loss(self, latents, context, temporal_coords):
         noise = torch.randn_like(latents)
         timestep_id = torch.randint(
             0, self.pipe.scheduler.num_train_timesteps, (1,), device="cpu"
@@ -196,9 +228,8 @@ class Wan4DTrainModule(pl.LightningModule):
         pred = self.dit(
             noisy,
             timestep=timestep,
-            cam_emb=cam_emb,
             context=context,
-            tgt_progress=tgt_progress,
+            temporal_coords=temporal_coords,
             use_gradient_checkpointing=self.hparams.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.hparams.use_gradient_checkpointing_offload,
         )
@@ -216,8 +247,8 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss * w
 
     def training_step(self, batch, batch_idx):
-        latents, context, cam_emb, tgt_progress = self._batch_to_model_device(batch)
-        loss = self._diffusion_loss(latents, context, cam_emb, tgt_progress)
+        latents, context, temporal_coords = self._batch_to_model_device(batch)
+        loss = self._diffusion_loss(latents, context, temporal_coords)
 
         every = int(self.hparams.log_metrics_every)
         if self.global_step % every == 0:
@@ -426,6 +457,18 @@ def parse_args():
     return p.parse_args()
 
 
+def custom_collate_fn(batch):
+    from torch.utils.data._utils.collate import default_collate
+    ref_frames = []
+    ref_indices = []
+    for b in batch:
+        ref_frames.append(b.pop("reference_frames", []))
+        ref_indices.append(b.pop("reference_indices", []))
+    collated = default_collate(batch)
+    collated["reference_frames"] = ref_frames
+    collated["reference_indices"] = ref_indices
+    return collated
+
 def main():
     args = parse_args()
     if args.resume_lightning_ckpt and args.resume_ckpt_path:
@@ -478,6 +521,7 @@ def main():
         batch_size=1,
         num_workers=args.dataloader_num_workers,
         pin_memory=True,
+        collate_fn=custom_collate_fn,
         persistent_workers=args.dataloader_num_workers > 0,
         worker_init_fn=ds.worker_init_fn if args.dataloader_num_workers else None,
         prefetch_factor=2 if args.dataloader_num_workers else None,

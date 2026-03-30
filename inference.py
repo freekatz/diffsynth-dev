@@ -28,9 +28,8 @@ from torchvision.transforms import v2
 from PIL import Image, ImageDraw, ImageFont
 
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
-from utils.camera import get_target_camera_from_source, load_camera_from_json
 from utils.image import load_frames_using_imageio
-from utils.time_pattern import VALID_TIME_PATTERNS, TimePatternType, generate_progress_curve
+from utils.time_pattern import VALID_TIME_PATTERNS, TimePatternType, generate_progress_curve, get_time_pattern
 
 
 def to_hwc_numpy(frame: torch.Tensor | Image.Image | np.ndarray) -> np.ndarray:
@@ -224,22 +223,7 @@ def derive_target_video_path(clip_path: Path, dataset_root: Path, pattern: str) 
     return dataset_root / "target_videos" / rel_path / f"{pattern}_video.mp4"
 
 
-def parse_preset_cam_indices(arg: Optional[str]) -> list[int]:
-    """Parse --preset_cam as '3' or '1,2,3' (1-10). Empty / None -> []."""
-    if arg is None or not str(arg).strip():
-        return []
-    out: list[int] = []
-    for part in re.split(r"[\s,]+", str(arg).strip()):
-        if not part:
-            continue
-        try:
-            v = int(part, 10)
-        except ValueError as e:
-            raise ValueError(f"Invalid --preset_cam token {part!r} (expected integers 1-10)") from e
-        if not (1 <= v <= 10):
-            raise ValueError(f"--preset_cam indices must be 1-10, got {v}")
-        out.append(v)
-    return out
+
 
 
 def resolve_run_output_path(default_subdir: str, run_tag: str, ts: str) -> str:
@@ -281,17 +265,10 @@ def parse_args():
         help="Time pattern(s), comma-separated, e.g. forward,reverse,pingpong",
     )
     p.add_argument(
-        "--preset_cam",
+        "--ref_indices",
         type=str,
-        default=None,
-        help="JSON preset cameras: one index or comma-separated batch (e.g. 1,2,3). "
-        "Requires a single --pattern (no commas) for target time embedding; output names include both.",
-    )
-    p.add_argument(
-        "--camera_json",
-        type=str,
-        default=None,
-        help="Camera JSON (default: {dataset_root}/cameras/camera_extrinsics.json)",
+        default="0",
+        help="Comma-separated physical indices of the source video to use as condition frames (e.g., '0' or '0,80')",
     )
 
     p.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
@@ -302,8 +279,6 @@ def parse_args():
     p.add_argument("--width", type=int, default=832)
     p.add_argument("--num_frames", type=int, default=81)
     p.add_argument("--tiled", default=True, action=argparse.BooleanOptionalAction)
-
-    p.add_argument("--no_latent_cache", action="store_true", help="Ignore caption_latents/ and latents/ caches")
 
     p.add_argument("--device", type=str, default="cuda", help="Device (cuda, cpu, mps)")
     p.add_argument(
@@ -360,7 +335,6 @@ def main():
 
     for path, label in (
         (clip_path / "video.mp4", "video.mp4"),
-        (clip_path / "meta.json", "meta.json"),
         (clip_path / "caption.txt", "caption.txt"),
     ):
         if not path.is_file():
@@ -370,62 +344,26 @@ def main():
     if not caption_text:
         raise ValueError(f"Empty caption: {clip_path / 'caption.txt'}")
 
-    meta = json.loads((clip_path / "meta.json").read_text(encoding="utf-8"))
-    src_c2w = np.array(meta["camera"]["extrinsics_c2w"], dtype=np.float32)
-
     prompt_context: Optional[torch.Tensor] = None
-    source_latents: Optional[torch.Tensor] = None
-    source_video: Optional[torch.Tensor] = None
 
-    if not args.no_latent_cache:
-        rel_video = (
-            f"videos/{clip_path.relative_to(dataset_root)}/video.mp4"
-            if clip_path.is_relative_to(dataset_root)
-            else str(clip_path / "video.mp4")
-        )
-        cap_latent_file = dataset_root / "caption_latents" / f"{caption_content_hash(caption_text)}.pt"
-        if cap_latent_file.is_file():
-            td = torch.load(cap_latent_file, weights_only=True, map_location="cpu")
-            prompt_context = td["text_embeds"].detach()
-            print(f"Using caption latent: {cap_latent_file}")
-        else:
-            print(f"No caption latent at {cap_latent_file}")
-
-        src_latent_file = dataset_root / "latents" / f"{video_path_hash(rel_video)}.pt"
-        if src_latent_file.is_file():
-            pack = torch.load(src_latent_file, weights_only=True, map_location="cpu")
-            source_latents = pack["latents"].detach().unsqueeze(0).to(torch.bfloat16)
-            print(f"Using source VAE latent: {src_latent_file}")
-        else:
-            print(f"No source latent at {src_latent_file}")
+    cap_latent_file = dataset_root / "caption_latents" / f"{caption_content_hash(caption_text)}.pt"
+    if cap_latent_file.is_file():
+        td = torch.load(cap_latent_file, weights_only=True, map_location="cpu")
+        prompt_context = td["text_embeds"].detach()
+        print(f"Using caption latent: {cap_latent_file}")
     else:
-        print("--no_latent_cache: ignoring latent caches")
+        print(f"No caption latent at {cap_latent_file}")
 
-    latent_t = (args.num_frames - 1) // 4 + 1
-    if source_latents is not None:
-        _, t, _, _ = source_latents.shape[1:]
-        if t != latent_t:
-            raise ValueError(f"Source latent T={t}, expected {latent_t} for num_frames={args.num_frames}")
-
-    if source_latents is None:
-        frame_process = v2.Compose(
-            [
-                v2.CenterCrop(size=(args.height, args.width)),
-                v2.ToTensor(),
-                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
-        video = load_frames_using_imageio(
-            str(clip_path / "video.mp4"),
-            num_frames=args.num_frames,
-            frame_process=frame_process,
-            target_h=args.height,
-            target_w=args.width,
-            permute_to_cthw=True,
-        )
-        if video is None:
-            raise ValueError(f"Cannot load {args.num_frames} frames from {clip_path / 'video.mp4'}")
-        source_video = video.unsqueeze(0).to(torch.bfloat16)
+    # Load Source Video frames to extract conditional reference frames
+    print(f"Loading reference indices {args.ref_indices} from {clip_path / 'video.mp4'}")
+    ref_indices = [int(v.strip()) for v in args.ref_indices.split(",") if v.strip()]
+    reference_frames = []
+    if len(ref_indices) > 0:
+        import torchvision
+        vframes, _, _ = torchvision.io.read_video(str(clip_path / "video.mp4"), pts_unit='sec', output_format="TCHW")
+        for idx in ref_indices:
+            frame_arr = vframes[idx].permute(1, 2, 0).numpy()
+            reference_frames.append(Image.fromarray(frame_arr))
 
     pipe = Wan4DPipeline.from_wan_model_dir(
         pretrained_model_dir=args.wan_model_dir,
@@ -450,45 +388,25 @@ def main():
 
     prompt_str = caption_text if prompt_context is None else ""
 
-    camera_json: Optional[Path] = None
-
     for run_idx, (run_kind, value) in enumerate(runs):
-        if run_kind == "preset":
-            pt = preset_tgt_pattern
-            assert pt is not None
-            run_tag = f"{pt}_preset_{int(value):02d}"
-            label = f"{pt} @ preset cam {value}"
-        else:
-            pattern = cast(TimePatternType, value)
-            run_tag = pattern
-            label = pattern
+        pattern = cast(TimePatternType, value)
+        run_tag = pattern
+        label = pattern
 
         print(f"\n{'='*50}")
         print(f"Processing run {run_idx + 1}/{len(runs)}: {label}")
         print(f"{'='*50}")
 
-        if run_kind == "preset":
-            if camera_json is None:
-                camera_json = Path(args.camera_json) if args.camera_json else dataset_root / "cameras" / "camera_extrinsics.json"
-                if not camera_json.is_file():
-                    raise FileNotFoundError(f"Camera JSON not found: {camera_json}")
-            tgt_camera = load_camera_from_json(
-                str(camera_json), cam_idx=int(value), num_frames=args.num_frames, dtype=torch.bfloat16
-            ).unsqueeze(0)
-            tgt_progress = generate_progress_curve(pt, args.num_frames).unsqueeze(0)
-        else:
-            tgt_camera = get_target_camera_from_source(
-                src_c2w, pattern, num_frames=args.num_frames, dtype=torch.bfloat16
-            ).unsqueeze(0)
-            tgt_progress = generate_progress_curve(pattern, args.num_frames).unsqueeze(0)
+        # Decode specific coords matching our `/4.0` strategy
+        raw_indices = get_time_pattern(pattern, args.num_frames)
+        temporal_coords = [float(v) / 4.0 for v in raw_indices]
 
         frames = pipe(
             prompt=prompt_str,
             negative_prompt=args.negative_prompt,
-            source_video=source_video,
-            source_latents=source_latents,
-            target_camera=tgt_camera,
-            tgt_progress=tgt_progress,
+            reference_frames=reference_frames,
+            reference_indices=ref_indices,
+            temporal_coords=temporal_coords,
             prompt_context=prompt_context,
             cfg_scale=args.cfg_scale,
             seed=args.seed,
@@ -500,8 +418,7 @@ def main():
         )
 
         target_frames: Optional[torch.Tensor] = None
-        tgt_pattern_for_video = str(value) if run_kind == "pattern" else preset_tgt_pattern
-        assert tgt_pattern_for_video is not None
+        tgt_pattern_for_video = str(value)
         try:
             target_video_path = derive_target_video_path(clip_path, dataset_root, tgt_pattern_for_video)
             if target_video_path.is_file():
@@ -528,8 +445,6 @@ def main():
         out_path = resolve_run_output_path(output_subdir, run_tag, ts)
 
         if run_kind == "pattern" and str(value) == "forward":
-            copy_input_video_to_output_dir(clip_path, output_subdir)
-        elif run_kind == "preset" and run_idx == 0:
             copy_input_video_to_output_dir(clip_path, output_subdir)
 
         print(f"Writing {out_path}")

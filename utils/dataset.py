@@ -140,11 +140,11 @@ class Wan4DDataset(torch.utils.data.Dataset):
             raise ValueError(
                 f"clip={clip_path}: latent C={c}, expected {WAN_LATENT_CHANNELS} (Wan VAE)"
             )
-        if t != self._expect_latent_t_concat:
+        if t != self._expect_latent_t_concat // 2:
             raise ValueError(
-                f"clip={clip_path}: latent T={t}, expected {self._expect_latent_t_concat} "
-                f"(2×((num_frames-1)//4+1) for num_frames={self.num_frames}). "
-                "Wrong T often causes GPU OOM (e.g. un-compressed time dim)."
+                f"clip={clip_path}: latent T={t}, expected {self._expect_latent_t_concat // 2} "
+                f"(((num_frames-1)//4+1) for num_frames={self.num_frames}). "
+                "Wrong T often causes GPU OOM."
             )
 
         if latents.dtype == torch.float32:
@@ -169,28 +169,19 @@ class Wan4DDataset(torch.utils.data.Dataset):
             )
 
     def _load_sample(self, clip, pattern: TimePatternType):
-        src_hash = clip["source_latent_hash"]
-        src_latent = torch.load(
-            self.latents_dir / f"{src_hash}.pt",
-            weights_only=True, map_location="cpu",
-        )["latents"].detach()
-
         tgt_hashes = clip.get("target_latent_hashes") or {}
         if pattern == "forward":
-            tgt_hash = tgt_hashes.get("forward", src_hash)
+            tgt_hash = tgt_hashes.get("forward", clip["source_latent_hash"])
         else:
             tgt_hash = tgt_hashes[pattern]
+            
         tgt_latent = torch.load(
             self.latents_dir / f"{tgt_hash}.pt",
             weights_only=True, map_location="cpu",
         )["latents"].detach()
 
-        if src_latent.shape != tgt_latent.shape:
-            raise ValueError(
-                f"latent shape mismatch src={src_latent.shape} tgt={tgt_latent.shape}"
-            )
-
-        latents = torch.cat([tgt_latent, src_latent], dim=1)
+        # Target Latents only (16 channels)
+        latents = tgt_latent
 
         cap_hash = clip["caption_hash"]
         text_data = torch.load(
@@ -202,21 +193,47 @@ class Wan4DDataset(torch.utils.data.Dataset):
         if self.validate_tensors:
             self._validate_sample_tensors(latents, prompt_context, clip["path"])
 
+        from utils.time_pattern import get_time_pattern
+        import torchvision
+        from PIL import Image
+
         meta_path = self.root / "videos" / clip["path"] / "meta.json"
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        src_c2w = np.array(meta["camera"]["extrinsics_c2w"])
-        tgt_cam = get_target_camera_from_source(src_c2w, pattern, num_frames=self.num_frames)
+        
+        # We don't need camera extraction based on the latest plan, simplifying to empty or ignored
+        tgt_cam = torch.zeros((self.num_frames, 0)) # Mock if needed
+        
+        # Accurate Float Temporal Coords (t / 4.0)
+        raw_indices = get_time_pattern(cast(TimePatternType, pattern), self.num_frames)
+        tgt_temporal_coords = torch.tensor([float(v) / 4.0 for v in raw_indices], dtype=torch.float32)
 
-        tgt_progress = generate_progress_curve(
-            cast(TimePatternType, pattern), self.num_frames
-        )
+        # Runtime Reference Pick (0 to 3 frames)
+        reference_frames = []
+        reference_indices = []
+        k = self.rng.randint(0, 3)
+        if k > 0:
+            if pattern == "forward":
+                video_path = self.root / "videos" / clip["path"] / "video.mp4"
+            else:
+                video_path = self.root / "target_videos" / clip["path"] / f"{pattern}_video.mp4"
+                
+            if video_path.exists():
+                vframes, _, _ = torchvision.io.read_video(str(video_path), pts_unit='sec', output_format="TCHW")
+                indices = self.rng.sample(range(self.num_frames), k)
+                reference_indices = sorted(indices)
+                for idx in reference_indices:
+                    # vframes is [T, C, H, W] uint8, need to convert to PIL Image
+                    frame_c_first = vframes[idx]
+                    frame_arr = frame_c_first.permute(1, 2, 0).numpy() # HWC
+                    reference_frames.append(Image.fromarray(frame_arr))
 
         return {
             "latents": latents,
             "prompt_context": prompt_context,
-            "cam_emb": {"tgt": tgt_cam},
-            "tgt_progress": tgt_progress,
+            "temporal_coords": tgt_temporal_coords,
+            "reference_frames": reference_frames,
+            "reference_indices": reference_indices,
             "time_pattern": pattern,
         }
 
