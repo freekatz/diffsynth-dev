@@ -1,8 +1,19 @@
 # DEPRECATED: This module is superseded by utils/time_progress.py which uses
-# continuous time-progress values (0.0~1.0) with forward/backward/freeze unit
+# continuous time-progress values (0.0~1.0) with forward/freeze unit
 # modes.  New code should import from utils.time_progress instead.  This file
 # is kept for backwards compatibility only and will be removed in a future
 # version.
+"""
+.. deprecated::
+    This module is deprecated. Use :mod:`utils.time_progress` instead.
+    Kept for backward compatibility only.
+"""
+import warnings
+warnings.warn(
+    "utils.time_pattern is deprecated, use utils.time_progress instead",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from typing import List, Literal, Union, cast
 
