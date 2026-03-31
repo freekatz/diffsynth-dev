@@ -1,7 +1,7 @@
 """Time progress simulation module for Wan4D training and inference.
 
 Generates a continuous time-progress sequence (values in [0.0, 1.0]) for a video
-by composing per-unit modes over equally-sized time units of ``fps`` frames each.
+by composing per-unit modes over equally-sized time units of ``unit_size`` frames each.
 
 Supported unit modes
 --------------------
@@ -13,13 +13,13 @@ Usage
 Training (random)::
 
     from utils.time_progress import simulate_time_progress
-    result = simulate_time_progress(num_frames=81, fps=8)
+    result = simulate_time_progress(num_frames=81, unit_size=24)
 
 Inference (user-specified)::
 
     from utils.time_progress import simulate_time_progress, parse_time_units
     result = simulate_time_progress(
-        num_frames=81, fps=8,
+        num_frames=81, unit_size=24,
         unit_modes=parse_time_units("forward3,freeze,forward6"),
         condition_units=[0, 4],
     )
@@ -98,7 +98,7 @@ def parse_time_units(s: str) -> list[str]:
 
 def simulate_time_progress(
     num_frames: int = 81,
-    fps: int = 8,
+    unit_size: int = 24,
     seed: Optional[int] = None,
     rng: Optional[random.Random] = None,
     unit_modes: Optional[list[str]] = None,
@@ -110,8 +110,8 @@ def simulate_time_progress(
     ----------
     num_frames:
         Total number of frames (e.g. 81 for Wan2.1).
-    fps:
-        Number of frames per time unit.  For 81 frames and fps=8 this gives
+    unit_size:
+        Number of frames per time unit.  For 81 frames and unit_size=24 this gives
         10 complete units plus 1 remainder frame.
     seed:
         Random seed used when ``unit_modes`` or ``condition_units`` is None
@@ -134,14 +134,14 @@ def simulate_time_progress(
     """
     if num_frames < 1:
         raise ValueError(f"num_frames must be >= 1, got {num_frames}")
-    if fps < 1:
-        raise ValueError(f"fps must be >= 1, got {fps}")
+    if unit_size < 1:
+        raise ValueError(f"unit_size must be >= 1, got {unit_size}")
 
     if rng is None:
         rng = random.Random(seed)
 
-    n_units = num_frames // fps
-    remainder = num_frames - n_units * fps
+    n_units = num_frames // unit_size
+    remainder = num_frames - n_units * unit_size
     max_val = max(num_frames - 1, 1)
     # F_latent: number of latent frames
     f_latent = (num_frames - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
@@ -170,8 +170,8 @@ def simulate_time_progress(
     # ------------------------------------------------------------------
     units: list[TimeUnit] = []
     for i, mode in enumerate(modes):
-        frame_start = i * fps
-        frame_end = (i + 1) * fps - 1
+        frame_start = i * unit_size
+        frame_end = (i + 1) * unit_size - 1
         latent_start = frame_start // WAN_LATENT_TEMPORAL_STRIDE
         latent_end = min(frame_end // WAN_LATENT_TEMPORAL_STRIDE, f_latent - 1)
         units.append(TimeUnit(
@@ -191,7 +191,7 @@ def simulate_time_progress(
     raw_progress: list[int] = []
 
     for unit in units:
-        for _ in range(fps):
+        for _ in range(unit_size):
             raw_progress.append(current)
             if unit.mode == "forward":
                 current = min(current + 1, max_val)

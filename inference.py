@@ -269,7 +269,7 @@ def build_condition_from_units(
     result,
     source_frames_tensor: torch.Tensor,
     F_latent: int,
-    fps: int,
+    unit_size: int,
     device: str,
     dtype: torch.dtype,
     tiled: bool = False,
@@ -285,7 +285,7 @@ def build_condition_from_units(
         result: :class:`TimeProgressResult` from :func:`simulate_time_progress`.
         source_frames_tensor: ``[C, T, H, W]`` source video in [-1, 1].
         F_latent: Number of latent frames.
-        fps: Frames per time unit.
+        unit_size: Frames per time unit.
 
     Returns:
         condition_latents: ``[1, 16, F_latent, H_l, W_l]``.
@@ -388,7 +388,7 @@ Examples:
              "If omitted, all units are set to 'forward' (normal playback).",
     )
     p.add_argument(
-        "--fps",
+        "--unit_size",
         type=int,
         default=8,
         help="Frames per time unit for simulate_time_progress.",
@@ -446,7 +446,7 @@ def main():
     # ------------------------------------------------------------------
     # Build time-unit mode list (supports shorthand syntax)
     # ------------------------------------------------------------------
-    n_units = args.num_frames // args.fps
+    n_units = args.num_frames // args.unit_size
     if args.time_units is not None:
         unit_modes = parse_time_units(args.time_units)
     else:
@@ -462,7 +462,7 @@ def main():
         if ui < 0 or ui >= n_units:
             raise SystemExit(
                 f"--condition_units: unit index {ui} out of range [0, {n_units - 1}] "
-                f"(num_frames={args.num_frames}, fps={args.fps} -> {n_units} units)."
+                f"(num_frames={args.num_frames}, unit_size={args.unit_size} -> {n_units} units)."
             )
 
     # ------------------------------------------------------------------
@@ -564,7 +564,7 @@ def main():
     # ------------------------------------------------------------------
     result = simulate_time_progress(
         num_frames=args.num_frames,
-        fps=args.fps,
+        unit_size=args.unit_size,
         unit_modes=unit_modes,
         condition_units=condition_units,
     )
@@ -601,7 +601,7 @@ def main():
     print(f"Building condition for units: {result.condition_unit_indices}")
     cond_latents, cond_mask = build_condition_from_units(
         pipe, result, source_frames_tensor, F_latent,
-        fps=args.fps, device=device, dtype=torch.bfloat16,
+        unit_size=args.unit_size, device=device, dtype=torch.bfloat16,
         tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
     )
 

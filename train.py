@@ -170,7 +170,7 @@ class Wan4DTrainModule(pl.LightningModule):
         compile_model=False,
         log_metrics_every=1,
         num_frames=NUM_FRAMES,
-        fps=8,
+        unit_size=24,
         height=480,
         width=832,
         vae_tiled=False,
@@ -244,7 +244,7 @@ class Wan4DTrainModule(pl.LightningModule):
         cond_frames = batch["condition_unit_frames"].to(self.device, dtype=dt)  # [B, n_units, C, H, W]
         cond_valid = batch["condition_unit_valid"].to(self.device, dtype=dt)   # [B, n_units]
 
-        fps = int(self.hparams.fps)
+        unit_size = int(self.hparams.unit_size)
         num_frames = int(self.hparams.num_frames)
         vae_tiled = bool(self.hparams.vae_tiled)
         vae_tile_size = tuple(self.hparams.vae_tile_size)
@@ -253,7 +253,7 @@ class Wan4DTrainModule(pl.LightningModule):
         B, C, T, H, W = target_video.shape
         F_latent = (T - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
         H_l, W_l = H // 8, W // 8
-        n_units = num_frames // fps
+        n_units = num_frames // unit_size
 
         with torch.no_grad():
             # Encode target video: pass as list of [C, T, H, W] tensors
@@ -284,7 +284,7 @@ class Wan4DTrainModule(pl.LightningModule):
                     z_frame = z[0, :, 0]  # [16, H_l, W_l]
 
                     # 只标记真正包含条件帧的 latent_start 位置
-                    latent_start = (ui * fps) // WAN_LATENT_TEMPORAL_STRIDE
+                    latent_start = (ui * unit_size) // WAN_LATENT_TEMPORAL_STRIDE
                     if latent_start < F_latent:
                         condition_latent[b, :, latent_start] = z_frame
                         condition_mask[b, 0, latent_start] = 1.0
@@ -478,7 +478,7 @@ def parse_args():
     p.add_argument("--steps_per_epoch", type=int, default=500)
     p.add_argument("--num_frames", type=int, default=81)
     p.add_argument(
-        "--fps",
+        "--unit_size",
         type=int,
         default=8,
         help="Frames per time unit for simulate_time_progress.",
@@ -581,7 +581,7 @@ def main():
         index_path=index_path,
         steps_per_epoch=args.steps_per_epoch,
         num_frames=args.num_frames,
-        fps=args.fps,
+        unit_size=args.unit_size,
         height=args.height,
         width=args.width,
         seed=args.seed,
@@ -625,7 +625,7 @@ def main():
         compile_model=args.compile_model,
         log_metrics_every=args.log_metrics_every,
         num_frames=args.num_frames,
-        fps=args.fps,
+        unit_size=args.unit_size,
         height=args.height,
         width=args.width,
         vae_tiled=args.vae_tiled,

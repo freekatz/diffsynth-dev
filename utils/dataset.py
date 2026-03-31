@@ -49,7 +49,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
         index_path=None,
         steps_per_epoch=500,
         num_frames=81,
-        fps=8,
+        unit_size=24,
         height=480,
         width=832,
         seed=42,
@@ -62,7 +62,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
             index_path: Path to index.json (default: {dataset_root}/index.json).
             steps_per_epoch: Number of samples per epoch (random sampling).
             num_frames: Number of frames per video (default 81).
-            fps: Frames per time unit used by simulate_time_progress (default 8).
+            unit_size: Frames per time unit used by simulate_time_progress (default 8).
             height: Video height for loading and cropping (default 480).
             width: Video width for loading and cropping (default 832).
             seed: Random seed for reproducibility.
@@ -85,7 +85,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
         self.caption_latents_dir = self.root / self.config["caption_latents_dir"]
         self.steps_per_epoch = steps_per_epoch
         self.num_frames = num_frames
-        self.fps = fps
+        self.unit_size = unit_size
         self.height = height
         self.width = width
         self.base_seed = seed
@@ -99,7 +99,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
             )
 
         self._f_latent = (self.num_frames - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
-        self._n_units = self.num_frames // self.fps
+        self._n_units = self.num_frames // self.unit_size
 
         # Video loading transform: CenterCrop + ToTensor + Normalize to [-1, 1]
         self._frame_process = v2.Compose([
@@ -154,7 +154,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
         # Randomly generate a time-progress sequence (training mode: unit_modes=None)
         result = simulate_time_progress(
             num_frames=self.num_frames,
-            fps=self.fps,
+            unit_size=self.unit_size,
             rng=self.rng,
         )
 
