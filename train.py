@@ -412,6 +412,12 @@ def parse_args():
     )
     p.add_argument("--steps_per_epoch", type=int, default=500)
     p.add_argument("--num_frames", type=int, default=81)
+    p.add_argument(
+        "--fps",
+        type=int,
+        default=8,
+        help="Frames per time unit for simulate_time_progress (default 8).",
+    )
     p.add_argument("--dataloader_num_workers", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=WAN21_T2V_13B_LR)
     p.add_argument("--weight_decay", type=float, default=WAN21_T2V_13B_WEIGHT_DECAY)
@@ -510,6 +516,7 @@ def main():
         index_path=index_path,
         steps_per_epoch=args.steps_per_epoch,
         num_frames=args.num_frames,
+        fps=args.fps,
         seed=args.seed,
         split=args.split,
         validate_tensors=not args.no_dataset_validate,
