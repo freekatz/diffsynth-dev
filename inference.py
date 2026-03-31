@@ -336,14 +336,14 @@ Examples:
         type=str,
         default=None,
         help="Time-unit modes for simulate_time_progress. Supports shorthand syntax: "
-             "e.g. 'forward3,freeze,forward6' expands to 10 units. "
+             "e.g. 'forward2,freeze,forward' expands to 4 units. "
              "Valid modes: forward, freeze. "
              "If omitted, all units are set to 'forward' (normal playback).",
     )
     p.add_argument(
         "--fps",
         type=int,
-        default=8,
+        default=24,
         help="Frames per time unit for simulate_time_progress (default 8).",
     )
 

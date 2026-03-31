@@ -205,12 +205,21 @@ class Wan4DDataset(torch.utils.data.Dataset):
         latents = target_latent
 
         # Build condition and mask using unit-based condition selection.
+        # If a condition unit is selected, mark the whole unit latent range
+        # as conditioned and fill condition with the unit's first source latent frame.
         h, w = latents.shape[2], latents.shape[3]
         mask = torch.zeros(1, F_latent, h, w)
-        for li in result.condition_latent_indices:
-            if 0 <= li < F_latent:
-                mask[:, li] = 1.0
-        condition = latents * mask
+        condition = torch.zeros_like(latents)
+        for ui in result.condition_unit_indices:
+            unit = result.units[ui]
+            ls = max(0, min(unit.latent_start, F_latent - 1))
+            le = max(0, min(unit.latent_end, F_latent - 1))
+            if le < ls:
+                continue
+            unit_first = source_latent[:, ls:ls + 1]  # [C,1,H,W]
+            unit_len = le - ls + 1
+            condition[:, ls:le + 1] = unit_first.expand(-1, unit_len, -1, -1)
+            mask[:, ls:le + 1] = 1.0
 
         return {
             "latents": latents,

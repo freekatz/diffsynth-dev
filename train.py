@@ -415,7 +415,7 @@ def parse_args():
     p.add_argument(
         "--fps",
         type=int,
-        default=8,
+        default=24,
         help="Frames per time unit for simulate_time_progress (default 8).",
     )
     p.add_argument("--dataloader_num_workers", type=int, default=4)
