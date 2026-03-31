@@ -61,7 +61,7 @@ WAN21_T2V_13B_LR_SCHEDULER = "constant"
 WAN21_T2V_13B_MAX_EPOCHS = 2
 WAN21_T2V_13B_GRAD_ACCUM = 1
 
-_TRAINABLE_SUBSTR = ("mask_embedding", "self_attn")
+_TRAINABLE_SUBSTR = ("patch_embedding", "temporal_coord_embedding", "self_attn")
 
 
 def _safe_run_segment(name):
