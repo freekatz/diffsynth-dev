@@ -205,79 +205,119 @@ def load_source_images(image_paths: list[str], height: int, width: int) -> list[
 # Latent helpers
 # ---------------------------------------------------------------------------
 
-def encode_source_frames(
+def encode_video_pixels(
     pipe: Wan4DPipeline,
-    frames: list[Image.Image],
+    video: torch.Tensor,
     device: str,
     dtype: torch.dtype,
+    tiled: bool = False,
+    tile_size: tuple = (34, 34),
+    tile_stride: tuple = (18, 16),
 ) -> torch.Tensor:
-    """Encode a list of PIL frames to a source latent ``[16, F_latent, H, W]``."""
-    if pipe.vae is None:
-        raise RuntimeError("VAE not loaded; cannot encode source frames.")
-
-    import torchvision.transforms.functional as TF
-
-    tensors = []
-    for img in frames:
-        t = TF.to_tensor(img).unsqueeze(0)  # [1, 3, H, W] float32 in [0,1]
-        t = t * 2.0 - 1.0                  # normalize to [-1, 1]
-        tensors.append(t)
-    video = torch.cat(tensors, dim=0).to(device=device, dtype=dtype)  # [T, 3, H, W]
-    # Add batch dim: [1, T, 3, H, W] -> expected by VAE encode
-    video = video.unsqueeze(0)
-
-    with torch.no_grad():
-        latent = pipe.vae.encode(video)  # [1, 16, F_latent, H, W]
-    return latent.squeeze(0)  # [16, F_latent, H, W]
-
-
-def remap_latent_frames(
-    source_latent: torch.Tensor,
-    latent_progress: list[float],
-) -> torch.Tensor:
-    """Return a new latent with frames remapped according to *latent_progress*.
+    """VAE-encode a pixel-space video tensor.
 
     Args:
-        source_latent: ``[16, F_latent, H, W]``.
-        latent_progress: List of F_latent float values in ``[0, 1]``.
-
-    Returns:
-        ``[16, F_latent, H, W]`` with frames reordered.
-    """
-    F_latent = source_latent.shape[1]
-    target_latent = torch.empty_like(source_latent)
-    for i, p in enumerate(latent_progress):
-        src_idx = round(p * (F_latent - 1))
-        src_idx = max(0, min(src_idx, F_latent - 1))
-        target_latent[:, i] = source_latent[:, src_idx]
-    return target_latent
-
-
-def build_condition(
-    target_latent: torch.Tensor,
-    mask_latent_indices: list[int],
-    device: str,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build condition_latents and condition_mask from *target_latent*.
-
-    Args:
-        target_latent: ``[16, F_latent, H, W]``.
-        mask_latent_indices: Latent frame indices to expose as condition.
+        pipe: Pipeline with VAE loaded.
+        video: ``[C, T, H, W]`` float in [-1, 1].
         device, dtype: Target device and dtype.
 
     Returns:
-        condition_latents: ``[1, 16, F_latent, H, W]``.
-        condition_mask:    ``[1, 1, F_latent, H, W]``.
+        ``[16, F_latent, H_l, W_l]`` latent tensor.
     """
-    c, f, h, w = target_latent.shape
-    mask = torch.zeros(1, 1, f, h, w, dtype=dtype, device=device)
-    for s in mask_latent_indices:
-        if 0 <= s < f:
-            mask[0, 0, s] = 1.0
-    tl = target_latent.unsqueeze(0).to(device=device, dtype=dtype)  # [1,16,F,H,W]
-    condition_latents = tl * mask
-    return condition_latents, mask
+    if pipe.vae is None:
+        raise RuntimeError("VAE not loaded; cannot encode video.")
+    video_batch = video.unsqueeze(0).to(device=device, dtype=dtype)  # [1, C, T, H, W]
+    with torch.no_grad():
+        latent = pipe.vae.encode(
+            video_batch, device=device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
+        )  # [1, 16, F_latent, H_l, W_l]
+    return latent.squeeze(0)  # [16, F_latent, H_l, W_l]
+
+
+def encode_condition_frame(
+    pipe: Wan4DPipeline,
+    frame: torch.Tensor,
+    device: str,
+    dtype: torch.dtype,
+    tiled: bool = False,
+    tile_size: tuple = (34, 34),
+    tile_stride: tuple = (18, 16),
+) -> torch.Tensor:
+    """Encode a single condition frame using the Video VAE 4-frame trick.
+
+    Replicates the frame 4 times so the 3D VAE produces exactly 1 latent frame.
+
+    Args:
+        frame: ``[C, H, W]`` float in [-1, 1].
+
+    Returns:
+        ``[16, H_l, W_l]`` latent tensor for the single frame.
+    """
+    if pipe.vae is None:
+        raise RuntimeError("VAE not loaded; cannot encode condition frame.")
+    # Replicate 4 times along T: [C, 4, H, W] → batch [1, C, 4, H, W]
+    frame_4x = frame.unsqueeze(1).expand(-1, 4, -1, -1)  # [C, 4, H, W]
+    frame_4x_batch = frame_4x.unsqueeze(0).to(device=device, dtype=dtype)  # [1, C, 4, H, W]
+    with torch.no_grad():
+        z = pipe.vae.encode(
+            frame_4x_batch, device=device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
+        )  # [1, 16, 1, H_l, W_l]
+    return z[0, :, 0]  # [16, H_l, W_l]
+
+
+def build_condition_from_units(
+    pipe: Wan4DPipeline,
+    result,
+    source_frames_tensor: torch.Tensor,
+    F_latent: int,
+    fps: int,
+    device: str,
+    dtype: torch.dtype,
+    tiled: bool = False,
+    tile_size: tuple = (34, 34),
+    tile_stride: tuple = (18, 16),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build condition latents and mask from selected condition units.
+
+    Uses the 4-frame VAE trick per condition unit, then fills the entire
+    unit latent range with the encoded latent frame.
+
+    Args:
+        result: :class:`TimeProgressResult` from :func:`simulate_time_progress`.
+        source_frames_tensor: ``[C, T, H, W]`` source video in [-1, 1].
+        F_latent: Number of latent frames.
+        fps: Frames per time unit.
+
+    Returns:
+        condition_latents: ``[1, 16, F_latent, H_l, W_l]``.
+        condition_mask:    ``[1, 1, F_latent, H_l, W_l]``.
+    """
+    if pipe.vae is None:
+        raise RuntimeError("VAE not loaded; cannot build condition.")
+
+    C, T, H, W = source_frames_tensor.shape
+    H_l, W_l = H // 8, W // 8
+
+    condition_latents = torch.zeros(1, 16, F_latent, H_l, W_l, dtype=dtype, device=device)
+    condition_mask = torch.zeros(1, 1, F_latent, H_l, W_l, dtype=dtype, device=device)
+
+    for ui in result.condition_unit_indices:
+        unit = result.units[ui]
+        # Condition frame: first pixel frame of this unit
+        cond_frame = source_frames_tensor[:, unit.frame_start]  # [C, H, W]
+        z_frame = encode_condition_frame(
+            pipe, cond_frame, device=device, dtype=dtype,
+            tiled=tiled, tile_size=tile_size, tile_stride=tile_stride,
+        )  # [16, H_l, W_l]
+
+        # Fill entire unit latent range
+        latent_start = (ui * fps) // 4
+        latent_end = min(((ui + 1) * fps - 1) // 4, F_latent - 1)
+        for lt in range(latent_start, latent_end + 1):
+            condition_latents[0, :, lt] = z_frame
+            condition_mask[0, 0, lt] = 1.0
+
+    return condition_latents, condition_mask
 
 
 # ---------------------------------------------------------------------------
@@ -343,8 +383,8 @@ Examples:
     p.add_argument(
         "--fps",
         type=int,
-        default=24,
-        help="Frames per time unit for simulate_time_progress (default 8).",
+        default=8,
+        help="Frames per time unit for simulate_time_progress.",
     )
 
     p.add_argument(
@@ -466,18 +506,20 @@ def main():
         print("No --ckpt: using base Wan2.1 model only")
 
     # ------------------------------------------------------------------
-    # Load source frames and resolve caption
+    # Load source frames as pixel tensors and resolve caption
     # ------------------------------------------------------------------
+    import torchvision.transforms.functional as TF
+
     if args.source_video is not None:
         source_path = Path(args.source_video)
         print(f"Loading source video: {source_path}")
-        source_frames = load_source_video(
+        source_frames_pil = load_source_video(
             source_path, args.num_frames, args.height, args.width
         )
         caption_txt_path = source_path.parent / "caption.txt"
     else:
         print(f"Loading {len(args.source_images)} source images")
-        source_frames = load_source_images(args.source_images, args.height, args.width)
+        source_frames_pil = load_source_images(args.source_images, args.height, args.width)
         caption_txt_path = Path(args.source_images[0]).parent / "caption.txt"
 
     # Caption / prompt
@@ -490,18 +532,16 @@ def main():
             caption_text = ""
             print("No caption found; using empty prompt.")
 
-    # ------------------------------------------------------------------
-    # VAE encode source frames -> source latent
-    # ------------------------------------------------------------------
-    print("Encoding source frames with VAE...")
-    source_latent = encode_source_frames(
-        pipe, source_frames, device=device, dtype=torch.bfloat16
-    )  # [16, F_latent, H, W]
-    F_latent = source_latent.shape[1]
-    print(f"Source latent shape: {tuple(source_latent.shape)}")
+    # Convert PIL frames to pixel tensor [C, T, H, W] in [-1, 1]
+    frame_tensors = []
+    for img in source_frames_pil:
+        t = TF.to_tensor(img)  # [3, H, W] float32 in [0, 1]
+        t = t * 2.0 - 1.0     # normalize to [-1, 1]
+        frame_tensors.append(t)
+    source_frames_tensor = torch.stack(frame_tensors, dim=1)  # [C, T, H, W]
 
     # ------------------------------------------------------------------
-    # Generate time progress and remap latent frames
+    # Generate time progress and remap source frames in pixel space
     # ------------------------------------------------------------------
     result = simulate_time_progress(
         num_frames=args.num_frames,
@@ -509,22 +549,41 @@ def main():
         unit_modes=unit_modes,
         condition_units=condition_units,
     )
+    F_latent = (args.num_frames - 1) // LATENT_TEMPORAL_STRIDE + 1
     latent_progress = [
-        result.progress[min(i * LATENT_TEMPORAL_STRIDE, args.num_frames - 1)] for i in range(F_latent)
+        result.progress[min(i * LATENT_TEMPORAL_STRIDE, args.num_frames - 1)]
+        for i in range(F_latent)
     ]
     temporal_coords = latent_progress
     print(f"Time progress ({len(result.progress)} frames): {result.progress[:10]}...")
-    print(f"Condition units: {result.condition_unit_indices} -> latent indices: {result.condition_latent_indices}")
+    print(f"Condition units: {result.condition_unit_indices}")
 
-    target_latent = remap_latent_frames(source_latent, latent_progress)
+    # Remap source frames in pixel space according to time progress
+    max_frame = args.num_frames - 1
+    target_frames_tensor = torch.empty_like(source_frames_tensor)
+    for i, p in enumerate(result.progress):
+        src_idx = round(p * max_frame)
+        src_idx = max(0, min(src_idx, max_frame))
+        target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
+
+    # VAE encode the remapped target video (pixel space → latent space)
+    print("Encoding target video with VAE...")
+    tile_size = (34, 34)
+    tile_stride = (18, 16)
+    target_latent = encode_video_pixels(
+        pipe, target_frames_tensor, device=device, dtype=torch.bfloat16,
+        tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
+    )  # [16, F_latent, H_l, W_l]
+    print(f"Target latent shape: {tuple(target_latent.shape)}")
 
     # ------------------------------------------------------------------
-    # Build condition from condition_units
+    # Build condition using 4-frame trick per condition unit
     # ------------------------------------------------------------------
-    print(f"Condition latent slots: {result.condition_latent_indices}")
-
-    cond_latents, cond_mask = build_condition(
-        target_latent, result.condition_latent_indices, device=device, dtype=torch.bfloat16
+    print(f"Building condition for units: {result.condition_unit_indices}")
+    cond_latents, cond_mask = build_condition_from_units(
+        pipe, result, source_frames_tensor, F_latent,
+        fps=args.fps, device=device, dtype=torch.bfloat16,
+        tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
     )
 
     # ------------------------------------------------------------------

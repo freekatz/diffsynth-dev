@@ -52,6 +52,8 @@ from utils.dataset import Wan4DDataset
 NUM_FRAMES = 81
 DEFAULT_SEED = 42
 TRAINING_OUTPUT_BASE = "training"
+# Temporal stride: number of pixel frames per latent frame (Wan VAE temporal downsampling).
+WAN_LATENT_TEMPORAL_STRIDE = 4
 
 # Default training parameters (align with Wan2.1-T2V-1.3B full dit recipe)
 WAN21_T2V_13B_LR = 1e-5
@@ -167,6 +169,13 @@ class Wan4DTrainModule(pl.LightningModule):
         seed=DEFAULT_SEED,
         compile_model=False,
         log_metrics_every=1,
+        num_frames=NUM_FRAMES,
+        fps=8,
+        height=480,
+        width=832,
+        vae_tiled=False,
+        vae_tile_size=(34, 34),
+        vae_tile_stride=(18, 16),
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -176,11 +185,14 @@ class Wan4DTrainModule(pl.LightningModule):
                 torch.cuda.manual_seed_all(seed)
 
         dit_path = resolve_dit_path(wan_model_dir)
-        # Load VAE for forward compatibility (not used during training itself).
+        # Load VAE for online encoding of target and condition frames during training.
         vae_path = resolve_vae_path(wan_model_dir)
-        model_configs = [ModelConfig(path=dit_path)]
-        if vae_path is not None:
-            model_configs.append(ModelConfig(path=vae_path))
+        if vae_path is None:
+            raise FileNotFoundError(
+                f"No Wan VAE weights found under `{wan_model_dir}`. "
+                "VAE is required for online encoding during training."
+            )
+        model_configs = [ModelConfig(path=dit_path), ModelConfig(path=vae_path)]
         self.pipe = Wan4DPipeline.from_pretrained(
             model_configs=model_configs,
             tokenizer_config=None,
@@ -189,8 +201,13 @@ class Wan4DTrainModule(pl.LightningModule):
         )
         if self.pipe.dit is None:
             raise ValueError("dit init failed")
+        if self.pipe.vae is None:
+            raise ValueError("vae init failed")
         self.pipe.scheduler.set_timesteps(1000, training=True)
         self.dit = self.pipe.dit
+        # Keep VAE in eval mode; no gradient needed for encoding
+        self.pipe.vae.eval()
+        self.pipe.vae.requires_grad_(False)
 
         if resume_ckpt_path is not None:
             self.dit.load_state_dict(
@@ -213,21 +230,76 @@ class Wan4DTrainModule(pl.LightningModule):
 
     def _batch_to_model_device(self, batch):
         dt = self.pipe.torch_dtype
-        target_latents = batch["latents"].to(self.device, dtype=dt)
         context = batch["prompt_context"].to(self.device, dtype=dt)
         if context.ndim == 4 and context.shape[1] == 1:
             context = context.squeeze(1)
 
         temporal_coords = batch.get("temporal_coords")
         if temporal_coords is not None:
-            # After DataLoader collation, temporal_coords is already (B, F_latent)
             temporal_coords = temporal_coords.to(self.device, dtype=dt)
 
-        # condition and mask are pre-computed in the dataset; no runtime VAE encode needed
-        condition = batch["condition"].to(self.device, dtype=dt)
-        mask = batch["mask"].to(self.device, dtype=dt)
+        # Online VAE encode: target video (full 81 frames) and condition frames
+        # (4-frame trick per condition unit, replicated across unit latent range).
+        target_video = batch["target_video"].to(self.device, dtype=dt)  # [B, C, T, H, W]
+        cond_frames = batch["condition_unit_frames"].to(self.device, dtype=dt)  # [B, n_units, C, H, W]
+        cond_valid = batch["condition_unit_valid"].to(self.device, dtype=dt)   # [B, n_units]
 
-        return target_latents, condition, mask, context, temporal_coords
+        fps = int(self.hparams.fps)
+        num_frames = int(self.hparams.num_frames)
+        vae_tiled = bool(self.hparams.vae_tiled)
+        vae_tile_size = tuple(self.hparams.vae_tile_size)
+        vae_tile_stride = tuple(self.hparams.vae_tile_stride)
+
+        B, C, T, H, W = target_video.shape
+        F_latent = (T - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
+        H_l, W_l = H // 8, W // 8
+        n_units = num_frames // fps
+
+        with torch.no_grad():
+            # Encode target video: pass as list of [C, T, H, W] tensors
+            target_latent = self.pipe.vae.encode(
+                target_video,
+                device=self.device,
+                tiled=vae_tiled,
+                tile_size=vae_tile_size,
+                tile_stride=vae_tile_stride,
+            )  # [B, 16, F_latent, H_l, W_l]
+
+            # Build condition latent using 4-frame trick per condition unit:
+            #   - Replicate the unit's first pixel frame 4 times
+            #   - VAE encode → 1 latent frame
+            #   - Fill the unit's full latent range with that latent frame
+            condition_latent = torch.zeros(B, 16, F_latent, H_l, W_l, dtype=dt, device=self.device)
+            condition_mask = torch.zeros(B, 1, F_latent, H_l, W_l, dtype=dt, device=self.device)
+
+            for b in range(B):
+                for ui in range(n_units):
+                    if cond_valid[b, ui] < 0.5:
+                        continue
+                    # cond_frames[b, ui]: [C, H, W] — the condition frame for this unit
+                    frame = cond_frames[b, ui]  # [C, H, W]
+                    # Replicate 4 times along T for the Video VAE 4-frame trick
+                    frame_4x = frame.unsqueeze(1).expand(-1, 4, -1, -1)  # [C, 4, H, W]
+                    # Encode: vae.encode expects a [B_inner, C, T, H, W] tensor treated as list
+                    frame_4x_batch = frame_4x.unsqueeze(0)  # [1, C, 4, H, W]
+                    z = self.pipe.vae.encode(
+                        frame_4x_batch,
+                        device=self.device,
+                        tiled=vae_tiled,
+                        tile_size=vae_tile_size,
+                        tile_stride=vae_tile_stride,
+                    )  # [1, 16, 1, H_l, W_l]
+                    z_frame = z[0, :, 0]  # [16, H_l, W_l]
+
+                    # Compute latent range for this unit
+                    latent_start = (ui * fps) // WAN_LATENT_TEMPORAL_STRIDE
+                    latent_end = min(((ui + 1) * fps - 1) // WAN_LATENT_TEMPORAL_STRIDE, F_latent - 1)
+                    # Fill entire unit latent range with this condition latent frame
+                    for lt in range(latent_start, latent_end + 1):
+                        condition_latent[b, :, lt] = z_frame
+                        condition_mask[b, 0, lt] = 1.0
+
+        return target_latent, condition_latent, condition_mask, context, temporal_coords
 
     def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords):
         # Only add noise to the target latents; condition tensors remain clean
@@ -372,7 +444,7 @@ def parse_args():
         "--dataset_root",
         type=str,
         required=True,
-        help="Root directory containing videos/, latents/, caption_latents/",
+        help="Root directory containing videos/, caption_latents/",
     )
     p.add_argument(
         "--index",
@@ -386,11 +458,14 @@ def parse_args():
         default=None,
         help="If set, only clips with this split field (e.g. train)",
     )
-    p.add_argument(
-        "--no_dataset_validate",
-        action="store_true",
-        help="Disable Wan4DDataset checks for latent/text shapes and dtypes (not recommended)",
-    )
+    p.add_argument("--height", type=int, default=480, help="Video height for loading (default 480).")
+    p.add_argument("--width", type=int, default=832, help="Video width for loading (default 832).")
+    p.add_argument("--vae_tiled", default=False, action="store_true",
+                   help="Use tiled VAE encoding for memory efficiency.")
+    p.add_argument("--vae_tile_size", type=int, nargs=2, default=[34, 34],
+                   metavar=("H", "W"), help="Tile size for tiled VAE (default 34 34).")
+    p.add_argument("--vae_tile_stride", type=int, nargs=2, default=[18, 16],
+                   metavar=("H", "W"), help="Tile stride for tiled VAE (default 18 16).")
     p.add_argument("--wan_model_dir", type=str, required=True)
     p.add_argument(
         "--project_name",
@@ -415,8 +490,8 @@ def parse_args():
     p.add_argument(
         "--fps",
         type=int,
-        default=24,
-        help="Frames per time unit for simulate_time_progress (default 8).",
+        default=8,
+        help="Frames per time unit for simulate_time_progress.",
     )
     p.add_argument("--dataloader_num_workers", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=WAN21_T2V_13B_LR)
@@ -517,9 +592,10 @@ def main():
         steps_per_epoch=args.steps_per_epoch,
         num_frames=args.num_frames,
         fps=args.fps,
+        height=args.height,
+        width=args.width,
         seed=args.seed,
         split=args.split,
-        validate_tensors=not args.no_dataset_validate,
     )
     if _is_rank_zero():
         log.info(
@@ -558,6 +634,13 @@ def main():
         seed=args.seed,
         compile_model=args.compile_model,
         log_metrics_every=args.log_metrics_every,
+        num_frames=args.num_frames,
+        fps=args.fps,
+        height=args.height,
+        width=args.width,
+        vae_tiled=args.vae_tiled,
+        vae_tile_size=tuple(args.vae_tile_size),
+        vae_tile_stride=tuple(args.vae_tile_stride),
     )
     loggers = []
     if args.use_tensorboard:
