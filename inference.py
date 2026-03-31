@@ -328,6 +328,86 @@ def resolve_gt_video_for_comparison(clip_path: Path, dataset_root: Path, pattern
 
 
 
+def load_target_latent_for_clip(
+    dataset_root: Path, clip_path: Path, pattern: str, latent_path: Optional[str] = None
+) -> torch.Tensor:
+    """Load pre-computed target latent tensor for a clip and pattern.
+
+    If ``latent_path`` is provided, loads directly from that file.
+    Otherwise, looks up the latent hash from ``dataset_root/index.json``.
+    Returns a tensor of shape ``[16, F_latent, H, W]``.
+    """
+    if latent_path is not None:
+        data = torch.load(latent_path, weights_only=True, map_location="cpu")
+        return data["latents"].detach()
+
+    index_file = dataset_root / "index.json"
+    if not index_file.is_file():
+        raise FileNotFoundError(f"index.json not found at {index_file}")
+    with open(index_file, "r") as f:
+        index = json.load(f)
+
+    # Find clip entry matching the relative path under videos/
+    videos_dir = dataset_root / "videos"
+    try:
+        rel_path = str(clip_path.relative_to(videos_dir))
+    except ValueError:
+        rel_path = str(clip_path)
+
+    clip_entry = None
+    for c in index["clips"]:
+        if c["path"].replace("\\", "/") == rel_path.replace("\\", "/"):
+            clip_entry = c
+            break
+    if clip_entry is None:
+        raise ValueError(
+            f"Clip path {rel_path!r} not found in {index_file}. "
+            "Use --latent_path to provide the latent file directly."
+        )
+
+    tgt_hashes = clip_entry.get("target_latent_hashes") or {}
+    if pattern == "forward":
+        tgt_hash = tgt_hashes.get("forward", clip_entry["source_latent_hash"])
+    else:
+        if pattern not in tgt_hashes:
+            raise KeyError(
+                f"Pattern {pattern!r} not found in target_latent_hashes for clip {rel_path!r}. "
+                f"Available: {list(tgt_hashes.keys())}"
+            )
+        tgt_hash = tgt_hashes[pattern]
+
+    latents_dir = dataset_root / index["config"]["latents_dir"]
+    latent_file = latents_dir / f"{tgt_hash}.pt"
+    data = torch.load(latent_file, weights_only=True, map_location="cpu")
+    return data["latents"].detach()
+
+
+def build_condition_from_latent(
+    target_latent: torch.Tensor, ref_slots: list[int], device: str, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build condition_latents and condition_mask tensors from a target latent and slot indices.
+
+    Args:
+        target_latent: Shape ``[16, F_latent, H, W]``.
+        ref_slots: List of latent frame slot indices to use as reference.
+        device: Target device string.
+        dtype: Target dtype.
+
+    Returns:
+        condition_latents: Shape ``[1, 16, F_latent, H, W]``.
+        condition_mask: Shape ``[1, 1, F_latent, H, W]``.
+    """
+    c, f, h, w = target_latent.shape
+    mask = torch.zeros(1, 1, f, h, w, dtype=dtype, device=device)
+    for s in ref_slots:
+        if 0 <= s < f:
+            mask[0, 0, s] = 1.0
+    # condition = target_latent masked to ref slots; broadcast [1,1,F,H,W] over [1,16,F,H,W]
+    tl = target_latent.unsqueeze(0).to(device=device, dtype=dtype)  # [1,16,F,H,W]
+    condition_latents = tl * mask  # [1,16,F,H,W]
+    return condition_latents, mask
+
+
 def resolve_run_output_path(default_subdir: str, run_tag: str, ts: str) -> str:
     """MP4 path under the clip output directory; run_tag e.g. ``reverse`` or ``reverse_preset_03``."""
     name = f"{run_tag}_{ts}.mp4"
@@ -357,8 +437,29 @@ def parse_args():
         "--ref_indices",
         type=str,
         default="0",
-        help="Comma-separated frame indices in the pattern target video (target_videos/.../{pattern}_video.mp4), "
-        "same timeline as training; falls back to clip video.mp4 if target file is missing",
+        help="(Mode B) Comma-separated pixel-frame indices in the pattern target video "
+        "(target_videos/.../{pattern}_video.mp4); falls back to clip video.mp4 if missing",
+    )
+    p.add_argument(
+        "--use_latent_condition",
+        action="store_true",
+        default=False,
+        help="(Mode A) Use pre-computed target latent for condition instead of encoding "
+        "reference images via the VAE. Mirrors the training data pipeline exactly.",
+    )
+    p.add_argument(
+        "--ref_slots",
+        type=str,
+        default=None,
+        help="(Mode A) Comma-separated latent slot indices to use as reference condition, "
+        "e.g. '0,10,20'. If omitted, defaults to first and last slot.",
+    )
+    p.add_argument(
+        "--latent_path",
+        type=str,
+        default=None,
+        help="(Mode A) Direct path to pre-computed target latent .pt file. "
+        "If not set, looks up the latent via index.json.",
     )
 
     p.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
@@ -431,13 +532,19 @@ def main():
     ref_indices_raw = [int(v.strip()) for v in args.ref_indices.split(",") if v.strip()]
 
     dit_path = resolve_dit_path(args.wan_model_dir)
-    vae_path = resolve_vae_path(args.wan_model_dir)
-    if vae_path is None:
-        raise FileNotFoundError(
-            f"No Wan VAE weights under `{args.wan_model_dir}`. "
-            "Place Wan2.1_VAE.pth, Wan2.1_VAE.safetensors, Wan2.2_VAE.*, or wan_video_vae*.{pth,safetensors} next to the DiT checkpoint."
-        )
-    model_configs = [ModelConfig(path=dit_path), ModelConfig(path=vae_path), ]
+    model_configs = [ModelConfig(path=dit_path)]
+
+    # Mode B (image-based references) requires the VAE for encoding.
+    # Mode A (latent condition) does not need the VAE.
+    if not args.use_latent_condition:
+        vae_path = resolve_vae_path(args.wan_model_dir)
+        if vae_path is None:
+            raise FileNotFoundError(
+                f"No Wan VAE weights under `{args.wan_model_dir}`. "
+                "Place Wan2.1_VAE.pth, Wan2.1_VAE.safetensors, Wan2.2_VAE.*, or wan_video_vae*.{{pth,safetensors}} "
+                "next to the DiT checkpoint. (For latent-condition mode, use --use_latent_condition.)"
+            )
+        model_configs.append(ModelConfig(path=vae_path))
     t5_path = resolve_text_encoder_path(args.wan_model_dir)
     if t5_path is None:
         raise FileNotFoundError(
@@ -494,37 +601,68 @@ def main():
         latent_pixel_indices = [raw_indices[min(i * 4, len(raw_indices) - 1)] for i in range(F_latent)]
         temporal_coords = [float(v) / 4.0 for v in latent_pixel_indices]
 
-        ref_video_path, ref_video_label = resolve_reference_video_path(
-            clip_path, dataset_root, str(pattern)
-        )
-        reference_frames, ref_indices = load_reference_frames_from_video(
-            ref_video_path, ref_indices_raw
-        )
-        if ref_indices_raw:
-            print(
-                f"Reference frames: indices {ref_indices} from {ref_video_path} ({ref_video_label})"
+        if args.use_latent_condition:
+            # Mode A: build condition directly from the pre-computed target latent
+            target_latent = load_target_latent_for_clip(
+                dataset_root, clip_path, str(pattern), args.latent_path
             )
-            if ref_video_label == "clip_source_fallback":
+            if args.ref_slots is not None:
+                ref_slots = [int(s.strip()) for s in args.ref_slots.split(",") if s.strip()]
+            else:
+                # Default: first and last latent slot
+                ref_slots = [0, F_latent - 1]
+            ref_slots = sorted(set(ref_slots))
+            print(f"Mode A: latent condition, ref_slots={ref_slots}")
+            cond_latents, cond_mask = build_condition_from_latent(
+                target_latent, ref_slots, device=device, dtype=torch.bfloat16
+            )
+            frames = pipe(
+                prompt=prompt_str,
+                negative_prompt=args.negative_prompt,
+                condition_latents=cond_latents,
+                condition_mask=cond_mask,
+                temporal_coords=temporal_coords,
+                prompt_context=prompt_context,
+                cfg_scale=args.cfg_scale,
+                seed=args.seed,
+                num_inference_steps=args.num_inference_steps,
+                height=args.height,
+                width=args.width,
+                num_frames=args.num_frames,
+                tiled=args.tiled,
+            )
+        else:
+            # Mode B: image-based reference frames via VAE encode
+            ref_video_path, ref_video_label = resolve_reference_video_path(
+                clip_path, dataset_root, str(pattern)
+            )
+            reference_frames, ref_indices = load_reference_frames_from_video(
+                ref_video_path, ref_indices_raw
+            )
+            if ref_indices_raw:
                 print(
-                    f"  (warning: target missing {derive_target_video_path(clip_path, dataset_root, str(pattern))}, "
-                    "using clip video.mp4 — not aligned with training for this pattern)"
+                    f"Reference frames: indices {ref_indices} from {ref_video_path} ({ref_video_label})"
                 )
-
-        frames = pipe(
-            prompt=prompt_str,
-            negative_prompt=args.negative_prompt,
-            reference_frames=reference_frames,
-            reference_indices=ref_indices,
-            temporal_coords=temporal_coords,
-            prompt_context=prompt_context,
-            cfg_scale=args.cfg_scale,
-            seed=args.seed,
-            num_inference_steps=args.num_inference_steps,
-            height=args.height,
-            width=args.width,
-            num_frames=args.num_frames,
-            tiled=args.tiled,
-        )
+                if ref_video_label == "clip_source_fallback":
+                    print(
+                        f"  (warning: target missing {derive_target_video_path(clip_path, dataset_root, str(pattern))}, "
+                        "using clip video.mp4 — not aligned with training for this pattern)"
+                    )
+            frames = pipe(
+                prompt=prompt_str,
+                negative_prompt=args.negative_prompt,
+                reference_frames=reference_frames,
+                reference_indices=ref_indices,
+                temporal_coords=temporal_coords,
+                prompt_context=prompt_context,
+                cfg_scale=args.cfg_scale,
+                seed=args.seed,
+                num_inference_steps=args.num_inference_steps,
+                height=args.height,
+                width=args.width,
+                num_frames=args.num_frames,
+                tiled=args.tiled,
+            )
 
         target_frames: Optional[torch.Tensor] = None
         tgt_pattern_for_video = str(value)

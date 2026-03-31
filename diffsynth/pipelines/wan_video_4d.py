@@ -15,24 +15,32 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
         )
 
     def process(self, pipe: WanVideoPipeline, num_frames, height, width, tiled, tile_size, tile_stride, **kwargs):
+        temporal_coords = getattr(pipe, "_temp_temporal_coords", None)
+        output = {"temporal_coords": temporal_coords}
+
+        # Mode A: pre-computed condition tensors (e.g. overfit-verification from target latent)
+        condition_latents = getattr(pipe, "_temp_condition_latents", None)
+        condition_mask = getattr(pipe, "_temp_condition_mask", None)
+        if condition_latents is not None and condition_mask is not None:
+            output["condition_latents"] = condition_latents.to(dtype=pipe.torch_dtype, device=pipe.device)
+            output["condition_mask"] = condition_mask.to(dtype=pipe.torch_dtype, device=pipe.device)
+            return output
+
+        # Mode B: sparse image references — encode each PIL Image via the VAE
         reference_frames = getattr(pipe, "_temp_reference_frames", None)
         reference_indices = getattr(pipe, "_temp_reference_indices", None)
-        temporal_coords = getattr(pipe, "_temp_temporal_coords", None)
-        
-        # We always output something to keep the dict happy.
-        output = {"temporal_coords": temporal_coords}
-        
+
         if reference_frames is not None and reference_indices is not None:
             pipe.load_models_to_device(self.onload_model_names)
-            
+
             F_latent = (num_frames - 1) // 4 + 1
             H_l = height // 8
             W_l = width // 8
-            
+
             # All-zero canvas for condition features and mask (batch_size=1; expanded in model_fn)
             condition_latents = torch.zeros((1, 16, F_latent, H_l, W_l), dtype=pipe.torch_dtype, device=pipe.device)
             condition_mask = torch.zeros((1, 1, F_latent, H_l, W_l), dtype=pipe.torch_dtype, device=pipe.device)
-            
+
             for ref_img, idx in zip(reference_frames, reference_indices):
                 ref_img = ref_img.resize((width, height))
                 # Extract single pure Image latent using Video VAE
@@ -40,15 +48,15 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
                 img_tensor = pipe.preprocess_video([ref_img] * 4)
                 z_i = pipe.vae.encode(img_tensor, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
                 z_i = z_i.to(dtype=pipe.torch_dtype, device=pipe.device) # shape: [1, 16, 1, H_l, W_l]
-                
+
                 target_latent_idx = idx // 4
                 if target_latent_idx < F_latent:
                     condition_latents[:, :, target_latent_idx:target_latent_idx+1, :, :] = z_i
                     condition_mask[:, :, target_latent_idx:target_latent_idx+1, :, :] = 1.0
-            
+
             output["condition_latents"] = condition_latents
             output["condition_mask"] = condition_mask
-            
+
         return output
 
 class WanVideoUnit_4DPromptContextOverride(PipelineUnit):
@@ -156,7 +164,9 @@ class Wan4DPipeline(WanVideoPipeline):
         self,
         *args,
         reference_frames: Optional[List[Image.Image]] = None,
-        reference_indices: Optional[List[int]] = None,      # Corresponding frame indices
+        reference_indices: Optional[List[int]] = None,      # Corresponding frame indices (pixel-space)
+        condition_latents: Optional[torch.Tensor] = None,   # Mode A: pre-computed condition latents (B,16,F,H,W)
+        condition_mask: Optional[torch.Tensor] = None,      # Mode A: pre-computed condition mask (B,1,F,H,W)
         temporal_coords: Optional[List[float]] = None,
         prompt_context: Optional[torch.Tensor] = None,
         **kwargs
@@ -164,6 +174,8 @@ class Wan4DPipeline(WanVideoPipeline):
         # We store arguments for our custom PipelineUnit to grab
         self._temp_reference_frames = reference_frames
         self._temp_reference_indices = reference_indices
+        self._temp_condition_latents = condition_latents
+        self._temp_condition_mask = condition_mask
         self._temp_temporal_coords = temporal_coords
         self._temp_prompt_context = prompt_context
         return super().__call__(*args, **kwargs)
