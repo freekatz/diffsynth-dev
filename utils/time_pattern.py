@@ -1,3 +1,9 @@
+# DEPRECATED: This module is superseded by utils/time_progress.py which uses
+# continuous time-progress values (0.0~1.0) with forward/backward/freeze unit
+# modes.  New code should import from utils.time_progress instead.  This file
+# is kept for backwards compatibility only and will be removed in a future
+# version.
+
 from typing import List, Literal, Union, cast
 
 import random
