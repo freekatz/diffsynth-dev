@@ -1,37 +1,44 @@
 import math
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional
 from einops import rearrange
-from diffsynth.models.wan_video_dit import WanModel, precompute_freqs_cis, precompute_freqs_cis_3d
+from diffsynth.models.wan_video_dit import WanModel, sinusoidal_embedding_1d
+from diffsynth.core.gradient import gradient_checkpoint_forward
 
-def precompute_freqs_cis_fractional(dim: int, coords: torch.Tensor, theta: float = 10000.0):
-    """
-    Computes 1D rotary positional embeddings for fractional temporal coordinates.
-    coords: Tensor of shape (F,) with continuous/fractional temporal coordinates.
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].double() / dim)).to(coords.device)
-    freqs = torch.outer(coords.double(), freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
 
 class Wan4DModel(WanModel):
+    """
+    Wan2.1 DiT for 4D spatiotemporal inpainting/completion.
+
+    Input: concat([noisy_x(16), condition_latents(16), condition_mask(1)]) → 33ch
+    patch_embedding: Conv3d(33, dim, ...)
+      Init: [:, 0:16]  = pretrained (noisy)
+            [:, 16:32] = pretrained copy (cond)
+            [:, 32:33] = zeros (mask)
+
+    RoPE: integer slot index (0..F-1)
+    temporal_coords: additive embedding (zero-init MLP)
+    """
+
     def __init__(self, *args, **kwargs):
-        # Keep in_dim=16 to remain compatible with pretrained Wan2.1 weights.
-        # condition_latents reuse patch_embedding; condition_mask uses a separate mask_embedding.
-        kwargs["in_dim"] = 16
+        kwargs["in_dim"] = 33
         super().__init__(*args, **kwargs)
-        # Small 1-channel mask embedding, zero-initialized so it doesn't disrupt pretrained features.
-        self.mask_embedding = nn.Conv3d(1, self.dim, kernel_size=self.patch_size, stride=self.patch_size)
-        nn.init.zeros_(self.mask_embedding.weight)
-        nn.init.zeros_(self.mask_embedding.bias)
+
+        # Fractional temporal coordinate additive embedding, zero-init last layer
+        self.temporal_coord_embedding = nn.Sequential(
+            nn.Linear(self.freq_dim, self.dim),
+            nn.SiLU(),
+            nn.Linear(self.dim, self.dim),
+        )
+        nn.init.zeros_(self.temporal_coord_embedding[-1].weight)
+        nn.init.zeros_(self.temporal_coord_embedding[-1].bias)
 
     @classmethod
     def from_wan_model(cls, wan_model: WanModel) -> "Wan4DModel":
-        """Upgrade a pretrained WanModel to Wan4DModel, copying all weights."""
         config = dict(
             dim=wan_model.dim,
-            in_dim=wan_model.in_dim,
+            in_dim=33,
             ffn_dim=wan_model.blocks[0].ffn[0].out_features,
             out_dim=wan_model.head.head.out_features // math.prod(wan_model.patch_size),
             text_dim=wan_model.text_embedding[0].in_features,
@@ -46,24 +53,28 @@ class Wan4DModel(WanModel):
             add_control_adapter=getattr(wan_model, "control_adapter", None) is not None,
         )
         instance = cls(**config)
-        # strict=False: mask_embedding keys are new and stay zero-initialized
-        instance.load_state_dict(wan_model.state_dict(), strict=False)
+
+        # Weight inflation for patch_embedding
+        old_w = wan_model.patch_embedding.weight.data   # (dim, 16, 1, 2, 2)
+        old_b = wan_model.patch_embedding.bias.data     # (dim,)
+
+        new_w = instance.patch_embedding.weight.data    # (dim, 33, 1, 2, 2)
+        with torch.no_grad():
+            new_w[:, 0:16,  ...] = old_w    # noisy channels ← pretrained
+            new_w[:, 16:32, ...] = old_w    # cond channels ← copy pretrained
+            new_w[:, 32:33, ...] = 0        # mask channel ← zeros
+        instance.patch_embedding.bias.data.copy_(old_b)
+
+        # Load remaining pretrained weights (skip patch_embedding, already handled)
+        pretrained_sd = wan_model.state_dict()
+        own_sd = instance.state_dict()
+        for k, v in pretrained_sd.items():
+            if k.startswith("patch_embedding."):
+                continue
+            if k in own_sd and own_sd[k].shape == v.shape:
+                own_sd[k] = v
+        instance.load_state_dict(own_sd, strict=False)
         return instance
-
-    def patchify(self, x: torch.Tensor):
-        """Apply patch embedding, record grid size, and rearrange to sequence."""
-        x = self.patch_embedding(x)
-        grid_size = x.shape[2:]  # (f, h, w)
-        x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
-        return x, grid_size
-
-    def unpatchify(self, x: torch.Tensor, grid_size):
-        f, h, w = grid_size
-        return rearrange(
-            x, "b (f h w) (x y z c) -> b c (f x) (h y) (w z)",
-            f=f, h=h, w=w,
-            x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2],
-        )
 
     def forward(
         self,
@@ -78,80 +89,76 @@ class Wan4DModel(WanModel):
         use_gradient_checkpointing_offload: bool = False,
         **kwargs,
     ):
-        """
-        Extended forward pass for 4D inpainting spatiotemporal completion.
-
-        x: Noisy target latent (B, 16, F_latent, H_l, W_l)
-        condition_latents: Clean reference latent (B, 16, F_latent, H_l, W_l), or None
-        condition_mask: Binary mask (B, 1, F_latent, H_l, W_l), or None
-        temporal_coords: Fractional temporal coordinates (B, F_latent), or None
-        """
-        from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
-        from diffsynth.core.gradient import gradient_checkpoint_forward
-
+        # Timestep & text
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
 
         if self.has_image_input and clip_feature is not None:
-            clip_embdding = self.img_emb(clip_feature)
-            context = torch.cat([clip_embdding, context], dim=1)
+            clip_embedding = self.img_emb(clip_feature)
+            context = torch.cat([clip_embedding, context], dim=1)
 
-        # 1. Patchify the noisy target latents -> (B, seq, dim)
-        x, grid_size = self.patchify(x)
+        # Concat: [noisy(16), cond(16), mask(1)] → (B, 33, F, H, W)
+        if condition_latents is None:
+            condition_latents = torch.zeros_like(x)
+        if condition_mask is None:
+            condition_mask = torch.zeros(
+                x.shape[0], 1, x.shape[2], x.shape[3], x.shape[4],
+                dtype=x.dtype, device=x.device,
+            )
+        x = torch.cat([x, condition_latents, condition_mask], dim=1)
+
+        # Patchify: Conv3d(33, dim)
+        x = self.patch_embedding(x)
+        grid_size = x.shape[2:]
         f, h, w = grid_size
+        x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
         b = x.shape[0]
 
-        # 2. Additive injection of condition latents and mask (after patchify)
-        if condition_latents is not None:
-            cond = self.patch_embedding(condition_latents)
-            cond = rearrange(cond, "b c f h w -> b (f h w) c").contiguous()
-            x = x + cond
-        if condition_mask is not None:
-            mask = self.mask_embedding(condition_mask)
-            mask = rearrange(mask, "b c f h w -> b (f h w) c").contiguous()
-            x = x + mask
-
-        # 3. Temporal RoPE: fractional coords if provided, integer fallback otherwise
-        head_dim = self.dim // self.blocks[0].self_attn.num_heads
-        f_dim = head_dim - 2 * (head_dim // 3)
-
-        h_freqs_cis = self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
-        w_freqs_cis = self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-
+        # Temporal coord additive embedding
         if temporal_coords is not None:
-            f_freqs_cis_list = []
-            for i in range(b):
-                coords = temporal_coords[i]  # (F_latent,)
-                f_freq = precompute_freqs_cis_fractional(f_dim, coords).to(x.device)
-                f_freqs_cis_list.append(f_freq.view(1, f, 1, 1, -1).expand(1, f, h, w, -1))
-            f_freqs_cis_tensor = torch.cat(f_freqs_cis_list, dim=0)  # (B, f, h, w, head_dim/2)
-            h_freqs_cis_b = h_freqs_cis.unsqueeze(0).expand(b, f, h, w, -1).to(x.device)
-            w_freqs_cis_b = w_freqs_cis.unsqueeze(0).expand(b, f, h, w, -1).to(x.device)
-            freqs = torch.cat([f_freqs_cis_tensor, h_freqs_cis_b, w_freqs_cis_b], dim=-1)
-            freqs = freqs.reshape(b, f * h * w, 1, -1)
-        else:
-            f_freqs_cis_tensor = self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1)
-            freqs = torch.cat([
-                f_freqs_cis_tensor,
-                h_freqs_cis,
-                w_freqs_cis,
-            ], dim=-1).reshape(1, f * h * w, 1, -1).to(x.device)
+            tc_flat = temporal_coords.reshape(-1)
+            tc_emb = sinusoidal_embedding_1d(self.freq_dim, tc_flat).to(x.dtype)
+            tc_emb = self.temporal_coord_embedding(tc_emb)
+            tc_emb = tc_emb.view(b, f, 1, 1, self.dim).expand(b, f, h, w, self.dim)
+            tc_emb = tc_emb.reshape(b, f * h * w, self.dim)
+            x = x + tc_emb
 
-        # 4. Transformer blocks
+        # RoPE: integer slot index
+        freqs = torch.cat([
+            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
+        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+
+        # Transformer
         for block in self.blocks:
             if self.training:
                 x = gradient_checkpoint_forward(
                     block,
                     use_gradient_checkpointing,
                     use_gradient_checkpointing_offload,
-                    x, context, t_mod, freqs
+                    x, context, t_mod, freqs,
                 )
             else:
                 x = block(x, context, t_mod, freqs)
 
-        # 5. Output head + unpatchify
+        # Output
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
         return x
+
+    def patchify(self, x: torch.Tensor):
+        x = self.patch_embedding(x)
+        grid_size = x.shape[2:]
+        x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
+        return x, grid_size
+
+    def unpatchify(self, x: torch.Tensor, grid_size):
+        f, h, w = grid_size
+        return rearrange(
+            x, "b (f h w) (x y z c) -> b c (f x) (h y) (w z)",
+            f=f, h=h, w=w,
+            x=self.patch_size[0], y=self.patch_size[1], z=self.patch_size[2],
+        )

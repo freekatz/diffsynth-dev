@@ -213,7 +213,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
         # Runtime Reference Pick (0 to 3 frames)
         reference_frames = []
         reference_indices = []
-        k = self.rng.randint(0, 3)
+        k = self.rng.randint(1, 3)
         if k > 0:
             if pattern == "forward":
                 video_path = self.root / "videos" / clip["path"] / "video.mp4"
