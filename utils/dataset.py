@@ -194,12 +194,6 @@ class Wan4DDataset(torch.utils.data.Dataset):
             self._validate_sample_tensors(latents, prompt_context, clip["path"])
 
         from utils.time_pattern import get_time_pattern
-        import torchvision
-        from PIL import Image
-
-        meta_path = self.root / "videos" / clip["path"] / "meta.json"
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
 
         # Temporal coords at latent-space resolution (one per latent frame, not per pixel frame)
         F_latent = (self.num_frames - 1) // 4 + 1  # e.g. 21 for num_frames=81
@@ -210,32 +204,22 @@ class Wan4DDataset(torch.utils.data.Dataset):
             [float(v) / 4.0 for v in latent_pixel_indices], dtype=torch.float32
         )
 
-        # Runtime Reference Pick (0 to 3 frames)
-        reference_frames = []
-        reference_indices = []
-        k = self.rng.randint(1, 3)
-        if k > 0:
-            if pattern == "forward":
-                video_path = self.root / "videos" / clip["path"] / "video.mp4"
-            else:
-                video_path = self.root / "target_videos" / clip["path"] / f"{pattern}_video.mp4"
-                
-            if video_path.exists():
-                vframes, _, _ = torchvision.io.read_video(str(video_path), pts_unit='sec', output_format="TCHW")
-                indices = self.rng.sample(range(self.num_frames), k)
-                reference_indices = sorted(indices)
-                for idx in reference_indices:
-                    # vframes is [T, C, H, W] uint8, need to convert to PIL Image
-                    frame_c_first = vframes[idx]
-                    frame_arr = frame_c_first.permute(1, 2, 0).numpy() # HWC
-                    reference_frames.append(Image.fromarray(frame_arr))
+        # Build condition and mask directly from target latents (no video file reading).
+        # Randomly select k reference slots (1 to F_latent inclusive).
+        h, w = latents.shape[2], latents.shape[3]
+        k = self.rng.randint(1, F_latent)
+        ref_slots = sorted(self.rng.sample(range(F_latent), k))
+        mask = torch.zeros(1, F_latent, h, w)
+        mask[:, ref_slots] = 1.0
+        # Broadcast mask [1, F_latent, H, W] over latents [16, F_latent, H, W]
+        condition = latents * mask
 
         return {
             "latents": latents,
             "prompt_context": prompt_context,
             "temporal_coords": tgt_temporal_coords,
-            "reference_frames": reference_frames,
-            "reference_indices": reference_indices,
+            "condition": condition,
+            "mask": mask,
             "time_pattern": pattern,
         }
 

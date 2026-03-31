@@ -132,8 +132,7 @@ def resolve_dit_path(wan_model_dir):
 def resolve_vae_path(wan_model_dir):
     """Find the Wan VAE weights file in wan_model_dir.
 
-    The VAE is needed at runtime to encode reference frames to latents during training.
-    Returns the path if found, or None if no VAE weights exist (encode will be skipped).
+    Returns the path if found, or None if no VAE weights exist.
     """
     patterns = [
         "Wan2.1_VAE.pth",
@@ -177,10 +176,7 @@ class Wan4DTrainModule(pl.LightningModule):
                 torch.cuda.manual_seed_all(seed)
 
         dit_path = resolve_dit_path(wan_model_dir)
-        # Also load the VAE so that runtime reference-frame encoding is available on
-        # every DDP rank.  In multi-GPU training each rank processes its own batch shard
-        # independently; any rank may receive samples that contain reference frames and
-        # must be able to call pipe.vae.encode() without relying on rank-0 state.
+        # Load VAE for forward compatibility (not used during training itself).
         vae_path = resolve_vae_path(wan_model_dir)
         model_configs = [ModelConfig(path=dit_path)]
         if vae_path is not None:
@@ -227,45 +223,11 @@ class Wan4DTrainModule(pl.LightningModule):
             # After DataLoader collation, temporal_coords is already (B, F_latent)
             temporal_coords = temporal_coords.to(self.device, dtype=dt)
 
-        # Build condition latents and mask from reference frames
-        B, _, F_latent, H_l, W_l = target_latents.shape
-        condition_latents = torch.zeros((B, 16, F_latent, H_l, W_l), dtype=dt, device=self.device)
-        condition_mask = torch.zeros((B, 1, F_latent, H_l, W_l), dtype=dt, device=self.device)
+        # condition and mask are pre-computed in the dataset; no runtime VAE encode needed
+        condition = batch["condition"].to(self.device, dtype=dt)
+        mask = batch["mask"].to(self.device, dtype=dt)
 
-        ref_frames_batch = batch.get("reference_frames", [])
-        ref_indices_batch = batch.get("reference_indices", [])
-
-        has_refs = any(len(r) > 0 for r in ref_frames_batch)
-        if has_refs:
-            # Runtime VAE encode: reference frames are stored as raw PIL Images in the
-            # dataset and must be encoded to latents at training time.  This must happen
-            # on every DDP rank because each rank independently receives batch shards that
-            # may contain reference frames — skipping encode on non-rank-0 ranks would
-            # leave condition_latents as all-zeros on those ranks, producing wrong
-            # gradients and diverging training.
-            if self.pipe.vae is None:
-                raise RuntimeError(
-                    "Runtime VAE encode is required for reference-frame conditioning but "
-                    "self.pipe.vae is None.  Ensure wan_model_dir contains a VAE weights "
-                    "file (e.g. Wan2.1_VAE.pth) so it is loaded during initialisation."
-                )
-            self.pipe.load_models_to_device(["vae"])
-            for b_idx in range(B):
-                r_frames = ref_frames_batch[b_idx] if b_idx < len(ref_frames_batch) else []
-                r_indices = ref_indices_batch[b_idx] if b_idx < len(ref_indices_batch) else []
-
-                for ref_img, idx in zip(r_frames, r_indices):
-                    # Runtime single image extraction trick (copy 4x)
-                    img_tensor = self.pipe.preprocess_video([ref_img] * 4)
-                    z_i = self.pipe.vae.encode(img_tensor, device=self.device)
-                    z_i = z_i.to(dtype=dt, device=self.device)
-
-                    target_latent_idx = idx // 4
-                    if target_latent_idx < F_latent:
-                        condition_latents[b_idx, :, target_latent_idx:target_latent_idx+1, :, :] = z_i
-                        condition_mask[b_idx, :, target_latent_idx:target_latent_idx+1, :, :] = 1.0
-
-        return target_latents, condition_latents, condition_mask, context, temporal_coords
+        return target_latents, condition, mask, context, temporal_coords
 
     def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords):
         # Only add noise to the target latents; condition tensors remain clean
@@ -511,18 +473,6 @@ def parse_args():
     return p.parse_args()
 
 
-def custom_collate_fn(batch):
-    from torch.utils.data._utils.collate import default_collate
-    ref_frames = []
-    ref_indices = []
-    for b in batch:
-        ref_frames.append(b.pop("reference_frames", []))
-        ref_indices.append(b.pop("reference_indices", []))
-    collated = default_collate(batch)
-    collated["reference_frames"] = ref_frames
-    collated["reference_indices"] = ref_indices
-    return collated
-
 def main():
     args = parse_args()
     if args.resume_lightning_ckpt and args.resume_ckpt_path:
@@ -580,7 +530,6 @@ def main():
         batch_size=1,
         num_workers=args.dataloader_num_workers,
         pin_memory=True,
-        collate_fn=custom_collate_fn,
         persistent_workers=args.dataloader_num_workers > 0,
         worker_init_fn=ds.worker_init_fn if args.dataloader_num_workers else None,
         prefetch_factor=2 if args.dataloader_num_workers else None,
