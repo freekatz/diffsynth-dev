@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import re
 from datetime import datetime
 
 import numpy as np
@@ -20,23 +21,29 @@ class Wan4DModelCheckpoint(ModelCheckpoint):
 
     def _remove_checkpoint(self, trainer, filepath):
         """Remove checkpoint and corresponding _model.ckpt file."""
-        # Call parent to remove the main checkpoint file
-        super()._remove_checkpoint(trainer, filepath)
+        log = logging.getLogger("wan4d_train")
+        try:
+            super()._remove_checkpoint(trainer, filepath)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("Could not remove Lightning checkpoint %s: %s", filepath, e)
 
-        # Also remove the corresponding _model.ckpt file
-        # Extract step number from filepath (e.g., "epoch=0-step=500.ckpt" -> 500)
-        import re
         match = re.search(r"step=(\d+)", filepath)
-        if match:
-            step = match.group(1)
-            model_ckpt_path = os.path.join(
-                os.path.dirname(filepath),
-                f"step{step}_model.ckpt"
-            )
-            if os.path.exists(model_ckpt_path):
-                os.remove(model_ckpt_path)
-                log = logging.getLogger("wan4d_train")
-                log.info(f"Model weights removed: {model_ckpt_path}")
+        if not match:
+            return
+        step = match.group(1)
+        model_ckpt_path = os.path.join(
+            os.path.dirname(filepath),
+            f"step{step}_model.ckpt",
+        )
+        try:
+            os.remove(model_ckpt_path)
+            log.info("Model weights removed: %s", model_ckpt_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("Could not remove model weights %s: %s", model_ckpt_path, e)
 
 from diffsynth.core import ModelConfig
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
