@@ -181,15 +181,16 @@ class Wan4DDataset(torch.utils.data.Dataset):
         F_latent = self._f_latent
 
         # Randomly generate a time-progress sequence (training mode: unit_modes=None).
-        progress = simulate_time_progress(
+        result = simulate_time_progress(
             num_frames=self.num_frames,
             fps=self.fps,
+            rng=self.rng,
         )
 
         # Map pixel-space time-progress to latent-space frame indices.
         # Latent frame i corresponds to pixel frame i * WAN_LATENT_TEMPORAL_STRIDE.
         latent_progress = [
-            progress[min(i * WAN_LATENT_TEMPORAL_STRIDE, self.num_frames - 1)]
+            result.progress[min(i * WAN_LATENT_TEMPORAL_STRIDE, self.num_frames - 1)]
             for i in range(F_latent)
         ]
         temporal_coords = torch.tensor(latent_progress, dtype=torch.float32)
@@ -203,13 +204,12 @@ class Wan4DDataset(torch.utils.data.Dataset):
 
         latents = target_latent
 
-        # Build condition and mask directly from target latents.
-        # Randomly select k reference slots (1 to F_latent inclusive).
+        # Build condition and mask using unit-based condition selection.
         h, w = latents.shape[2], latents.shape[3]
-        k = self.rng.randint(1, F_latent)
-        ref_slots = sorted(self.rng.sample(range(F_latent), k))
         mask = torch.zeros(1, F_latent, h, w)
-        mask[:, ref_slots] = 1.0
+        for li in result.condition_latent_indices:
+            if 0 <= li < F_latent:
+                mask[:, li] = 1.0
         condition = latents * mask
 
         return {

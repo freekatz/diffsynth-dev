@@ -7,11 +7,11 @@ Examples::
     python inference.py --source_video ./data/videos/src/vid/clip_0/video.mp4 \\
         --wan_model_dir ./models --ckpt ./training/proj/exp/checkpoints/step500_model.ckpt
 
-    # Specify condition frames and custom time units
+    # 3 forward units, 1 freeze, 6 forward — condition on units 0 and 4
     python inference.py --source_video ./data/.../video.mp4 \\
         --wan_model_dir ./models --ckpt ./step500_model.ckpt \\
-        --mask_indices 0,40 \\
-        --time_units forward,forward,backward,freeze,forward,forward,backward,forward,forward,freeze
+        --time_units forward3,freeze,forward6 \\
+        --condition_units 0,4
 
 Use the pure model weight file (*_model.ckpt) saved by training for inference.
 """
@@ -35,7 +35,7 @@ from PIL import Image
 
 from diffsynth.core import ModelConfig
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
-from utils.time_progress import VALID_UNIT_MODES, simulate_time_progress
+from utils.time_progress import parse_time_units, simulate_time_progress
 
 
 DEFAULT_NEGATIVE_PROMPT = (
@@ -284,17 +284,6 @@ def build_condition(
 # CLI
 # ---------------------------------------------------------------------------
 
-def parse_time_units(raw: str) -> list[str]:
-    """Parse and validate a comma-separated list of unit modes."""
-    modes: list[str] = []
-    for m in raw.split(","):
-        m = m.strip()
-        if m not in VALID_UNIT_MODES:
-            raise ValueError(f"Invalid time unit {m!r}. Valid: {sorted(VALID_UNIT_MODES)}")
-        modes.append(m)
-    return modes
-
-
 def parse_args():
     p = argparse.ArgumentParser(
         description="Wan4D inference — source video + time-unit control",
@@ -304,10 +293,10 @@ Examples:
   # Normal forward playback (default)
   python inference.py --source_video ./clip/video.mp4 --wan_model_dir ./models --ckpt step500_model.ckpt
 
-  # Backward then forward, condition on frames 0 and 40
+  # 3 forward units, 1 freeze, 6 forward — condition on units 0 and 4
   python inference.py --source_video ./clip/video.mp4 --wan_model_dir ./models \\
-      --mask_indices 0,40 \\
-      --time_units forward,backward,freeze,forward,backward,forward,forward,forward,forward,forward
+      --time_units forward3,freeze,forward6 \\
+      --condition_units 0,4
 """,
     )
 
@@ -336,19 +325,19 @@ Examples:
     )
 
     p.add_argument(
-        "--mask_indices",
+        "--condition_units",
         type=str,
         default="0",
-        help="Comma-separated pixel-frame indices to use as condition frames, e.g. '0,40'. "
-             "These are converted to latent-space indices automatically (default: 0).",
+        help="Comma-separated unit indices to use as condition frames, e.g. '0,4'. "
+             "Each selected unit contributes its first latent frame as a condition (default: 0).",
     )
     p.add_argument(
         "--time_units",
         type=str,
         default=None,
-        help="Comma-separated time-unit modes for simulate_time_progress, e.g. "
-             "'forward,forward,backward,freeze,forward,forward,backward,forward,forward,freeze'. "
-             "Valid modes: forward, backward, freeze. "
+        help="Time-unit modes for simulate_time_progress. Supports shorthand syntax: "
+             "e.g. 'forward3,freeze,forward6' expands to 10 units. "
+             "Valid modes: forward, freeze. "
              "If omitted, all units are set to 'forward' (normal playback).",
     )
     p.add_argument(
@@ -408,7 +397,7 @@ def main():
     device = resolve_inference_device(args.device, args.gpu_id)
 
     # ------------------------------------------------------------------
-    # Build time-unit mode list
+    # Build time-unit mode list (supports shorthand syntax)
     # ------------------------------------------------------------------
     n_units = args.num_frames // args.fps
     if args.time_units is not None:
@@ -416,6 +405,18 @@ def main():
     else:
         # Default: all forward
         unit_modes = ["forward"] * max(n_units, 1)
+
+    # Parse and validate condition unit indices
+    try:
+        condition_units = [int(v.strip()) for v in args.condition_units.split(",") if v.strip()]
+    except ValueError as exc:
+        raise SystemExit(f"--condition_units: invalid value ({exc}). Expected comma-separated integers, e.g. '0,4'.") from exc
+    for ui in condition_units:
+        if ui < 0 or ui >= n_units:
+            raise SystemExit(
+                f"--condition_units: unit index {ui} out of range [0, {n_units - 1}] "
+                f"(num_frames={args.num_frames}, fps={args.fps} -> {n_units} units)."
+            )
 
     # ------------------------------------------------------------------
     # Load models
@@ -502,34 +503,28 @@ def main():
     # ------------------------------------------------------------------
     # Generate time progress and remap latent frames
     # ------------------------------------------------------------------
-    progress = simulate_time_progress(
+    result = simulate_time_progress(
         num_frames=args.num_frames,
         fps=args.fps,
         unit_modes=unit_modes,
+        condition_units=condition_units,
     )
     latent_progress = [
-        progress[min(i * LATENT_TEMPORAL_STRIDE, args.num_frames - 1)] for i in range(F_latent)
+        result.progress[min(i * LATENT_TEMPORAL_STRIDE, args.num_frames - 1)] for i in range(F_latent)
     ]
     temporal_coords = latent_progress
-    print(f"Time progress ({len(progress)} frames): {progress[:10]}...")
+    print(f"Time progress ({len(result.progress)} frames): {result.progress[:10]}...")
+    print(f"Condition units: {result.condition_unit_indices} -> latent indices: {result.condition_latent_indices}")
 
     target_latent = remap_latent_frames(source_latent, latent_progress)
 
     # ------------------------------------------------------------------
-    # Build condition from mask_indices
+    # Build condition from condition_units
     # ------------------------------------------------------------------
-    mask_pixel_indices = [
-        int(v.strip()) for v in args.mask_indices.split(",") if v.strip()
-    ]
-    # Convert pixel frame indices to latent-space indices
-    mask_latent_indices = sorted(set(
-        max(0, min(idx // LATENT_TEMPORAL_STRIDE, F_latent - 1))
-        for idx in mask_pixel_indices
-    ))
-    print(f"Condition latent slots: {mask_latent_indices}")
+    print(f"Condition latent slots: {result.condition_latent_indices}")
 
     cond_latents, cond_mask = build_condition(
-        target_latent, mask_latent_indices, device=device, dtype=torch.bfloat16
+        target_latent, result.condition_latent_indices, device=device, dtype=torch.bfloat16
     )
 
     # ------------------------------------------------------------------
