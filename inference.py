@@ -7,6 +7,10 @@ Examples::
     python inference.py --source_video ./data/videos/src/vid/clip_0/video.mp4 \\
         --wan_model_dir ./models --ckpt ./training/proj/exp/checkpoints/step500_model.ckpt
 
+    # Infer from a dataset clip directory (auto uses video.mp4 + caption.txt)
+    python inference.py --clip ./data/videos/src/vid/clip_0 \\
+        --wan_model_dir ./models --ckpt ./training/proj/exp/checkpoints/step500_model.ckpt
+
     # 3 forward units, 1 freeze, 6 forward — condition on units 0 and 4
     python inference.py --source_video ./data/.../video.mp4 \\
         --wan_model_dir ./models --ckpt ./step500_model.ckpt \\
@@ -333,6 +337,9 @@ Examples:
   # Normal forward playback (default)
   python inference.py --source_video ./clip/video.mp4 --wan_model_dir ./models --ckpt step500_model.ckpt
 
+  # From dataset clip directory (auto reads video.mp4 + caption.txt)
+  python inference.py --clip ./clip --wan_model_dir ./models --ckpt step500_model.ckpt
+
   # 3 forward units, 1 freeze, 6 forward — condition on units 0 and 4
   python inference.py --source_video ./clip/video.mp4 --wan_model_dir ./models \\
       --time_units forward3,freeze,forward6 \\
@@ -341,6 +348,12 @@ Examples:
     )
 
     src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "--clip",
+        type=str,
+        default=None,
+        help="Dataset clip directory path. Expects video.mp4 and optional caption.txt.",
+    )
     src.add_argument(
         "--source_video",
         type=str,
@@ -510,13 +523,25 @@ def main():
     # ------------------------------------------------------------------
     import torchvision.transforms.functional as TF
 
-    if args.source_video is not None:
+    source_video_path: Optional[Path] = None
+    if args.clip is not None:
+        clip_dir = Path(args.clip)
+        source_video_path = clip_dir / "video.mp4"
+        caption_txt_path = clip_dir / "caption.txt"
+        if not source_video_path.is_file():
+            raise SystemExit(f"--clip expects `{source_video_path}` to exist.")
+        print(f"Loading clip video: {source_video_path}")
+        source_frames_pil = load_source_video(
+            source_video_path, args.num_frames, args.height, args.width
+        )
+    elif args.source_video is not None:
         source_path = Path(args.source_video)
         print(f"Loading source video: {source_path}")
         source_frames_pil = load_source_video(
             source_path, args.num_frames, args.height, args.width
         )
         caption_txt_path = source_path.parent / "caption.txt"
+        source_video_path = source_path
     else:
         print(f"Loading {len(args.source_images)} source images")
         source_frames_pil = load_source_images(args.source_images, args.height, args.width)
@@ -617,14 +642,22 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
-    out_fps = DEFAULT_OUTPUT_FPS
-    if args.source_video is not None:
-        out_fps = read_video_fps(Path(args.source_video))
-
-    print(f"Writing {out_path} ({len(frames)} frames @ {out_fps} fps)")
+    out_fps = read_video_fps(source_video_path) if source_video_path is not None else DEFAULT_OUTPUT_FPS
+    target_vis = ((target_frames_tensor.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
+    target_vis = target_vis.clamp(0, 255).byte().numpy()  # [T, H, W, C]
+    n_write = min(len(frames), target_vis.shape[0])
+    print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps), layout: left=target right=pred")
     with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
-        for frame in frames:
-            writer.append_data(to_hwc_numpy(frame))
+        for i in range(n_write):
+            pred = to_hwc_numpy(frames[i])
+            if pred.dtype != np.uint8:
+                pred = np.clip(pred, 0, 255).astype(np.uint8)
+            target = target_vis[i]
+            if target.shape != pred.shape:
+                raise RuntimeError(
+                    f"target/pred shape mismatch at frame {i}: {target.shape} vs {pred.shape}"
+                )
+            writer.append_data(np.concatenate([target, pred], axis=1))
 
     print("Done.")
 
