@@ -26,9 +26,13 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
             output["condition_mask"] = condition_mask.to(dtype=pipe.torch_dtype, device=pipe.device)
             return output
 
-        # Mode B: sparse image references — encode each PIL Image via the VAE
+        # Mode B: sparse image references — encode each PIL Image via the VAE using the
+        # 4-frame trick, then fill the entire unit latent range with the encoded frame.
         reference_frames = getattr(pipe, "_temp_reference_frames", None)
         reference_indices = getattr(pipe, "_temp_reference_indices", None)
+        # reference_unit_ranges: list of (latent_start, latent_end) per reference frame.
+        # When provided, fills entire unit range instead of a single latent frame.
+        reference_unit_ranges = getattr(pipe, "_temp_reference_unit_ranges", None)
 
         if reference_frames is not None and reference_indices is not None:
             pipe.load_models_to_device(self.onload_model_names)
@@ -41,7 +45,7 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
             condition_latents = torch.zeros((1, 16, F_latent, H_l, W_l), dtype=pipe.torch_dtype, device=pipe.device)
             condition_mask = torch.zeros((1, 1, F_latent, H_l, W_l), dtype=pipe.torch_dtype, device=pipe.device)
 
-            for ref_img, idx in zip(reference_frames, reference_indices):
+            for i, (ref_img, idx) in enumerate(zip(reference_frames, reference_indices)):
                 ref_img = ref_img.resize((width, height))
                 # Extract single pure Image latent using Video VAE
                 # We replicate the image 4 times to trick the 3D VAE into producing exactly 1 pure stable latent slot
@@ -50,7 +54,18 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
                 z_i = z_i.to(dtype=pipe.torch_dtype, device=pipe.device) # shape: [1, 16, 1, H_l, W_l]
 
                 target_latent_idx = idx // 4
-                if target_latent_idx < F_latent:
+                if target_latent_idx >= F_latent:
+                    continue
+
+                if reference_unit_ranges is not None and i < len(reference_unit_ranges):
+                    # Fill entire unit latent range with this condition latent frame
+                    lat_start, lat_end = reference_unit_ranges[i]
+                    lat_start = max(0, min(lat_start, F_latent - 1))
+                    lat_end = max(lat_start, min(lat_end, F_latent - 1))
+                    condition_latents[:, :, lat_start:lat_end + 1, :, :] = z_i.expand(-1, -1, lat_end - lat_start + 1, -1, -1)
+                    condition_mask[:, :, lat_start:lat_end + 1, :, :] = 1.0
+                else:
+                    # Fallback: fill only the single latent frame at the reference index
                     condition_latents[:, :, target_latent_idx:target_latent_idx+1, :, :] = z_i
                     condition_mask[:, :, target_latent_idx:target_latent_idx+1, :, :] = 1.0
 
@@ -165,6 +180,7 @@ class Wan4DPipeline(WanVideoPipeline):
         *args,
         reference_frames: Optional[List[Image.Image]] = None,
         reference_indices: Optional[List[int]] = None,      # Corresponding frame indices (pixel-space)
+        reference_unit_ranges: Optional[List[tuple]] = None, # (latent_start, latent_end) per reference
         condition_latents: Optional[torch.Tensor] = None,   # Mode A: pre-computed condition latents (B,16,F,H,W)
         condition_mask: Optional[torch.Tensor] = None,      # Mode A: pre-computed condition mask (B,1,F,H,W)
         temporal_coords: Optional[List[float]] = None,
@@ -174,6 +190,7 @@ class Wan4DPipeline(WanVideoPipeline):
         # We store arguments for our custom PipelineUnit to grab
         self._temp_reference_frames = reference_frames
         self._temp_reference_indices = reference_indices
+        self._temp_reference_unit_ranges = reference_unit_ranges
         self._temp_condition_latents = condition_latents
         self._temp_condition_mask = condition_mask
         self._temp_temporal_coords = temporal_coords
