@@ -258,27 +258,16 @@ def resolve_inference_device(device: str, gpu_id: Optional[int]) -> str:
     raise SystemExit(f"--gpu_id requires --device cuda or cuda:* (got --device {device!r})")
 
 
-def resolve_clip_path(
-    clip_dir: Optional[str],
-    dataset_root: Optional[str],
-    clip_relpath: Optional[str],
-) -> tuple[Path, Path]:
-    """Resolve (clip_path, dataset_root). Use --clip_dir or --dataset_root + --clip_relpath."""
-    if clip_dir:
-        clip_path = Path(clip_dir).resolve()
-        parts = clip_path.parts
-        if "videos" in parts:
-            idx = parts.index("videos")
-            inferred_root = Path(*parts[:idx]) if idx > 0 else Path(".")
-        else:
-            inferred_root = clip_path.parent
-        return clip_path, inferred_root
-
-    if dataset_root and clip_relpath:
-        clip_path = Path(dataset_root) / "videos" / clip_relpath
-        return clip_path.resolve(), Path(dataset_root).resolve()
-
-    raise ValueError("Provide --clip_dir or both --dataset_root and --clip_relpath")
+def resolve_clip_path(clip_dir: str) -> tuple[Path, Path]:
+    """Resolve (clip_path, dataset_root) from full clip directory path."""
+    clip_path = Path(clip_dir).resolve()
+    parts = clip_path.parts
+    if "videos" in parts:
+        idx = parts.index("videos")
+        inferred_root = Path(*parts[:idx]) if idx > 0 else Path(".")
+    else:
+        inferred_root = clip_path.parent
+    return clip_path, inferred_root
 
 
 def derive_target_video_path(clip_path: Path, dataset_root: Path, pattern: str) -> Path:
@@ -314,24 +303,11 @@ def resolve_run_output_path(default_subdir: str, run_tag: str, ts: str) -> str:
 def parse_args():
     p = argparse.ArgumentParser(description="Wan4D inference")
 
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument(
+    p.add_argument(
         "--clip_dir",
         type=str,
-        default=None,
+        required=True,
         help="Path to clip directory (e.g., .../videos/source/vid/clip_0)",
-    )
-    g.add_argument(
-        "--dataset_root",
-        type=str,
-        default=None,
-        help="Dataset root directory (requires --clip_relpath)",
-    )
-    p.add_argument(
-        "--clip_relpath",
-        type=str,
-        default=None,
-        help="Relative path under videos/, e.g., source/vid/clip_0",
     )
 
     p.add_argument("--wan_model_dir", type=str, required=True, help="Path to Wan model directory")
@@ -385,7 +361,7 @@ def main():
 
     runs = [("pattern", p) for p in parse_time_patterns(args.pattern)]
 
-    clip_path, dataset_root = resolve_clip_path(args.clip_dir, args.dataset_root, args.clip_relpath)
+    clip_path, dataset_root = resolve_clip_path(args.clip_dir)
 
     videos_root = dataset_root / "videos"
     if not clip_path.is_relative_to(videos_root):
@@ -393,7 +369,7 @@ def main():
             f"Clip directory must lie under the dataset videos folder:\n"
             f"  clip_path: {clip_path}\n"
             f"  expected under: {videos_root.resolve()}\n"
-            f"(Fix --clip_dir / --dataset_root so the clip lives under .../videos/...)"
+            f"(Use --clip_dir under .../videos/...)"
         )
 
     for path, label in (
