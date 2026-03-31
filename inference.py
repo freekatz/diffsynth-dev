@@ -25,6 +25,7 @@ from typing import Optional, cast
 import imageio
 import numpy as np
 import torch
+import torchvision
 from torchvision.transforms import v2
 from PIL import Image, ImageDraw, ImageFont
 
@@ -276,6 +277,39 @@ def derive_target_video_path(clip_path: Path, dataset_root: Path, pattern: str) 
     return dataset_root / "target_videos" / rel_path / f"{pattern}_video.mp4"
 
 
+def resolve_reference_video_path(clip_path: Path, dataset_root: Path, pattern: str) -> tuple[Path, str]:
+    """Reference conditioning video: same as training (target_videos/{pattern}_video.mp4 when present)."""
+    target_p = derive_target_video_path(clip_path, dataset_root, pattern)
+    if target_p.is_file():
+        return target_p, "target_videos"
+    fallback = clip_path / "video.mp4"
+    if fallback.is_file():
+        return fallback, "clip_source_fallback"
+    raise FileNotFoundError(
+        f"No reference video for pattern {pattern!r}: missing {target_p} and {fallback}"
+    )
+
+
+def load_reference_frames_from_video(video_path: Path, ref_indices: list[int]) -> tuple[list[Image.Image], list[int]]:
+    """Load PIL frames at sorted indices (matches training dataset ordering)."""
+    if not ref_indices:
+        return [], []
+    idx_sorted = sorted(ref_indices)
+    vframes, _, _ = torchvision.io.read_video(str(video_path), pts_unit="sec", output_format="TCHW")
+    n = int(vframes.shape[0])
+    for idx in idx_sorted:
+        if idx < 0 or idx >= n:
+            raise IndexError(
+                f"reference index {idx} out of range for {video_path} (T={n}); "
+                f"valid is 0..{n - 1}"
+            )
+    frames: list[Image.Image] = []
+    for idx in idx_sorted:
+        frame_arr = vframes[idx].permute(1, 2, 0).numpy()
+        frames.append(Image.fromarray(frame_arr))
+    return frames, idx_sorted
+
+
 def resolve_gt_video_for_comparison(clip_path: Path, dataset_root: Path, pattern: str) -> tuple[Optional[Path], str]:
     """Ground-truth video for the left panel of side-by-side output.
 
@@ -323,7 +357,8 @@ def parse_args():
         "--ref_indices",
         type=str,
         default="0",
-        help="Comma-separated physical indices of the source video to use as condition frames (e.g., '0' or '0,80')",
+        help="Comma-separated frame indices in the pattern target video (target_videos/.../{pattern}_video.mp4), "
+        "same timeline as training; falls back to clip video.mp4 if target file is missing",
     )
 
     p.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
@@ -393,17 +428,7 @@ def main():
     else:
         print(f"No caption latent at {cap_latent_file}")
 
-    # Load Source Video frames to extract conditional reference frames
-    print(f"Loading reference indices {args.ref_indices} from {clip_path / 'video.mp4'}")
-    ref_indices = [int(v.strip()) for v in args.ref_indices.split(",") if v.strip()]
-    reference_frames = []
-    if len(ref_indices) > 0:
-        import torchvision
-        vframes, _, _ = torchvision.io.read_video(str(clip_path / "video.mp4"), pts_unit='sec', output_format="TCHW")
-        for idx in ref_indices:
-            frame_arr = vframes[idx].permute(1, 2, 0).numpy()
-            reference_frames.append(Image.fromarray(frame_arr))
-
+    ref_indices_raw = [int(v.strip()) for v in args.ref_indices.split(",") if v.strip()]
 
     dit_path = resolve_dit_path(args.wan_model_dir)
     vae_path = resolve_vae_path(args.wan_model_dir)
@@ -468,6 +493,22 @@ def main():
         # Each latent frame i corresponds to pixel frame i*4; clamp to avoid out-of-bounds
         latent_pixel_indices = [raw_indices[min(i * 4, len(raw_indices) - 1)] for i in range(F_latent)]
         temporal_coords = [float(v) / 4.0 for v in latent_pixel_indices]
+
+        ref_video_path, ref_video_label = resolve_reference_video_path(
+            clip_path, dataset_root, str(pattern)
+        )
+        reference_frames, ref_indices = load_reference_frames_from_video(
+            ref_video_path, ref_indices_raw
+        )
+        if ref_indices_raw:
+            print(
+                f"Reference frames: indices {ref_indices} from {ref_video_path} ({ref_video_label})"
+            )
+            if ref_video_label == "clip_source_fallback":
+                print(
+                    f"  (warning: target missing {derive_target_video_path(clip_path, dataset_root, str(pattern))}, "
+                    "using clip video.mp4 — not aligned with training for this pattern)"
+                )
 
         frames = pipe(
             prompt=prompt_str,
