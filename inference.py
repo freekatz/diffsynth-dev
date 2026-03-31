@@ -247,9 +247,7 @@ def encode_condition_frame(
     tile_size: tuple = (34, 34),
     tile_stride: tuple = (18, 16),
 ) -> torch.Tensor:
-    """Encode a single condition frame using the Video VAE 4-frame trick.
-
-    Replicates the frame 4 times so the 3D VAE produces exactly 1 latent frame.
+    """Encode a single condition frame via the Video VAE (chunk 0 path).
 
     Args:
         frame: ``[C, H, W]`` float in [-1, 1].
@@ -259,13 +257,10 @@ def encode_condition_frame(
     """
     if pipe.vae is None:
         raise RuntimeError("VAE not loaded; cannot encode condition frame.")
-    # Replicate 4 times along T: [C, 4, H, W] → batch [1, C, 4, H, W]
-    frame_4x = frame.unsqueeze(1).expand(-1, 4, -1, -1)  # [C, 4, H, W]
-    frame_4x_batch = frame_4x.unsqueeze(0).to(device=device, dtype=dtype)  # [1, C, 4, H, W]
+    # 直接传单帧，走 chunk 0 的正常路径: [C, H, W] → [1, C, 1, H, W]
+    frame_batch = frame.unsqueeze(0).unsqueeze(2).to(device=device, dtype=dtype)  # [1, C, 1, H, W]
     with torch.no_grad():
-        z = pipe.vae.encode(
-            frame_4x_batch, device=device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
-        )  # [1, 16, 1, H_l, W_l]
+        z = pipe.vae.single_encode(frame_batch, device)  # [1, 16, 1, H_l, W_l]
     return z[0, :, 0]  # [16, H_l, W_l]
 
 
@@ -283,8 +278,8 @@ def build_condition_from_units(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build condition latents and mask from selected condition units.
 
-    Uses the 4-frame VAE trick per condition unit, then fills the entire
-    unit latent range with the encoded latent frame.
+    Encodes the condition frame (``unit.frame_start``) of each selected unit and
+    marks only the corresponding ``unit.latent_start`` position in the mask.
 
     Args:
         result: :class:`TimeProgressResult` from :func:`simulate_time_progress`.
@@ -314,12 +309,11 @@ def build_condition_from_units(
             tiled=tiled, tile_size=tile_size, tile_stride=tile_stride,
         )  # [16, H_l, W_l]
 
-        # Fill entire unit latent range
-        latent_start = (ui * fps) // 4
-        latent_end = min(((ui + 1) * fps - 1) // 4, F_latent - 1)
-        for lt in range(latent_start, latent_end + 1):
-            condition_latents[0, :, lt] = z_frame
-            condition_mask[0, 0, lt] = 1.0
+        # 只标记条件帧对应的 latent_start 位置
+        latent_start = unit.latent_start
+        if latent_start < F_latent:
+            condition_latents[0, :, latent_start] = z_frame
+            condition_mask[0, 0, latent_start] = 1.0
 
     return condition_latents, condition_mask
 

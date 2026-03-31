@@ -265,10 +265,7 @@ class Wan4DTrainModule(pl.LightningModule):
                 tile_stride=vae_tile_stride,
             )  # [B, 16, F_latent, H_l, W_l]
 
-            # Build condition latent using 4-frame trick per condition unit:
-            #   - Replicate the unit's first pixel frame 4 times
-            #   - VAE encode → 1 latent frame
-            #   - Fill the unit's full latent range with that latent frame
+            # 构建条件 latent：对每个条件 unit 的 frame_start 单帧编码，只标记 latent_start 位置
             condition_latent = torch.zeros(B, 16, F_latent, H_l, W_l, dtype=dt, device=self.device)
             condition_mask = torch.zeros(B, 1, F_latent, H_l, W_l, dtype=dt, device=self.device)
 
@@ -278,26 +275,19 @@ class Wan4DTrainModule(pl.LightningModule):
                         continue
                     # cond_frames[b, ui]: [C, H, W] — the condition frame for this unit
                     frame = cond_frames[b, ui]  # [C, H, W]
-                    # Replicate 4 times along T for the Video VAE 4-frame trick
-                    frame_4x = frame.unsqueeze(1).expand(-1, 4, -1, -1)  # [C, 4, H, W]
-                    # Encode: vae.encode expects a [B_inner, C, T, H, W] tensor treated as list
-                    frame_4x_batch = frame_4x.unsqueeze(0)  # [1, C, 4, H, W]
-                    z = self.pipe.vae.encode(
-                        frame_4x_batch,
-                        device=self.device,
-                        tiled=vae_tiled,
-                        tile_size=vae_tile_size,
-                        tile_stride=vae_tile_stride,
+                    # 直接传单帧，走 chunk 0 的正常路径: [C, H, W] → [1, C, 1, H, W]
+                    frame_batch = frame.unsqueeze(0).unsqueeze(2)  # [1, C, 1, H, W]
+                    z = self.pipe.vae.single_encode(
+                        frame_batch,
+                        self.device,
                     )  # [1, 16, 1, H_l, W_l]
                     z_frame = z[0, :, 0]  # [16, H_l, W_l]
 
-                    # Compute latent range for this unit
+                    # 只标记真正包含条件帧的 latent_start 位置
                     latent_start = (ui * fps) // WAN_LATENT_TEMPORAL_STRIDE
-                    latent_end = min(((ui + 1) * fps - 1) // WAN_LATENT_TEMPORAL_STRIDE, F_latent - 1)
-                    # Fill entire unit latent range with this condition latent frame
-                    for lt in range(latent_start, latent_end + 1):
-                        condition_latent[b, :, lt] = z_frame
-                        condition_mask[b, 0, lt] = 1.0
+                    if latent_start < F_latent:
+                        condition_latent[b, :, latent_start] = z_frame
+                        condition_mask[b, 0, latent_start] = 1.0
 
         return target_latent, condition_latent, condition_mask, context, temporal_coords
 

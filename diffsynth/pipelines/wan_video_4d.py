@@ -47,27 +47,18 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
 
             for i, (ref_img, idx) in enumerate(zip(reference_frames, reference_indices)):
                 ref_img = ref_img.resize((width, height))
-                # Extract single pure Image latent using Video VAE
-                # We replicate the image 4 times to trick the 3D VAE into producing exactly 1 pure stable latent slot
-                img_tensor = pipe.preprocess_video([ref_img] * 4)
-                z_i = pipe.vae.encode(img_tensor, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-                z_i = z_i.to(dtype=pipe.torch_dtype, device=pipe.device) # shape: [1, 16, 1, H_l, W_l]
+                # 直接传单帧，走 chunk 0 的正常路径
+                img_tensor = pipe.preprocess_video([ref_img])  # [1, C, 1, H, W]
+                z_i = pipe.vae.single_encode(img_tensor, device=pipe.device)
+                z_i = z_i.to(dtype=pipe.torch_dtype, device=pipe.device)  # [1, 16, 1, H_l, W_l]
 
                 target_latent_idx = idx // 4
                 if target_latent_idx >= F_latent:
                     continue
 
-                if reference_unit_ranges is not None and i < len(reference_unit_ranges):
-                    # Fill entire unit latent range with this condition latent frame
-                    lat_start, lat_end = reference_unit_ranges[i]
-                    lat_start = max(0, min(lat_start, F_latent - 1))
-                    lat_end = max(lat_start, min(lat_end, F_latent - 1))
-                    condition_latents[:, :, lat_start:lat_end + 1, :, :] = z_i.expand(-1, -1, lat_end - lat_start + 1, -1, -1)
-                    condition_mask[:, :, lat_start:lat_end + 1, :, :] = 1.0
-                else:
-                    # Fallback: fill only the single latent frame at the reference index
-                    condition_latents[:, :, target_latent_idx:target_latent_idx+1, :, :] = z_i
-                    condition_mask[:, :, target_latent_idx:target_latent_idx+1, :, :] = 1.0
+                # 只标记真正包含条件帧的 latent_start 位置，忽略 reference_unit_ranges
+                condition_latents[:, :, target_latent_idx:target_latent_idx+1, :, :] = z_i
+                condition_mask[:, :, target_latent_idx:target_latent_idx+1, :, :] = 1.0
 
             output["condition_latents"] = condition_latents
             output["condition_mask"] = condition_mask

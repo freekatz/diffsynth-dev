@@ -187,8 +187,10 @@ class Wan4DDataset(torch.utils.data.Dataset):
             if ui >= self._n_units:
                 continue
             unit = result.units[ui]
-            # Condition frame is the first pixel frame of this unit
-            cond_frames[ui] = source_video[:, unit.frame_start]
+            # 条件帧取 target_video（经过 time progress remap 后），而非 source_video。
+            # target_video[:, frame_start] = source_video[:, round(progress[frame_start] * max_frame)]
+            # 与模型要预测的 latent 对应，保证条件帧和目标一致。
+            cond_frames[ui] = target_video[:, unit.frame_start]
             cond_valid[ui] = 1.0
 
         return {
