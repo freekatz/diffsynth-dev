@@ -265,29 +265,39 @@ class Wan4DTrainModule(pl.LightningModule):
                 tile_stride=vae_tile_stride,
             )  # [B, 16, F_latent, H_l, W_l]
 
-            # 构建条件 latent：对每个条件 unit 的 frame_start 单帧编码，只标记 latent_start 位置
-            condition_latent = torch.zeros(B, 16, F_latent, H_l, W_l, dtype=dt, device=self.device)
-            condition_mask = torch.zeros(B, 1, F_latent, H_l, W_l, dtype=dt, device=self.device)
+            # 构建条件 latent（标准 InP 格式）：
+            #   1. 构造条件视频：条件帧位置填入 target_video，其余填 0
+            #   2. VAE 整体编码 → 16ch condition_latent
+            #   3. 构造像素空间 mask，经过时间折叠得到 4ch condition_mask
+            cond_video = torch.zeros_like(target_video)       # [B, C, T, H, W]
+            pixel_mask = torch.zeros(B, T, H_l, W_l, dtype=dt, device=self.device)  # [B, T, H_l, W_l]
 
             for b in range(B):
                 for ui in range(n_units):
                     if cond_valid[b, ui] < 0.5:
                         continue
-                    # cond_frames[b, ui]: [C, H, W] — the condition frame for this unit
-                    frame = cond_frames[b, ui]  # [C, H, W]
-                    # 直接传单帧，走 chunk 0 的正常路径: [C, H, W] → [1, C, 1, H, W]
-                    frame_batch = frame.unsqueeze(0).unsqueeze(2)  # [1, C, 1, H, W]
-                    z = self.pipe.vae.single_encode(
-                        frame_batch,
-                        self.device,
-                    )  # [1, 16, 1, H_l, W_l]
-                    z_frame = z[0, :, 0]  # [16, H_l, W_l]
+                    frame_start = ui * unit_size
+                    if frame_start < T:
+                        cond_video[b, :, frame_start] = target_video[b, :, frame_start]
+                        pixel_mask[b, frame_start] = 1.0
 
-                    # 只标记真正包含条件帧的 latent_start 位置
-                    latent_start = (ui * unit_size) // WAN_LATENT_TEMPORAL_STRIDE
-                    if latent_start < F_latent:
-                        condition_latent[b, :, latent_start] = z_frame
-                        condition_mask[b, 0, latent_start] = 1.0
+            # VAE 编码条件视频
+            condition_latent = self.pipe.vae.encode(
+                cond_video,
+                device=self.device,
+                tiled=vae_tiled,
+                tile_size=vae_tile_size,
+                tile_stride=vae_tile_stride,
+            )  # [B, 16, F_latent, H_l, W_l]
+
+            # 时间折叠：首帧 mask 重复 4 次，对应 VAE chunk 0 的单帧处理
+            # [B, T, H_l, W_l] → [B, T+3, H_l, W_l] → [B, 4, F_latent, H_l, W_l]
+            mask_folded = torch.cat([
+                pixel_mask[:, 0:1].expand(-1, 4, -1, -1),   # 首帧 × 4
+                pixel_mask[:, 1:],                            # 其余帧
+            ], dim=1)  # [B, T+3, H_l, W_l]
+            condition_mask = mask_folded.view(B, F_latent, 4, H_l, W_l).permute(0, 2, 1, 3, 4).contiguous()
+            # [B, 4, F_latent, H_l, W_l]
 
         return target_latent, condition_latent, condition_mask, context, temporal_coords
 

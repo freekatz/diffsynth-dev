@@ -11,18 +11,21 @@ class Wan4DModel(WanModel):
     """
     Wan2.1 DiT for 4D spatiotemporal inpainting/completion.
 
-    Input: concat([noisy_x(16), condition_latents(16), condition_mask(1)]) → 33ch
-    patch_embedding: Conv3d(33, dim, ...)
-      Init: [:, 0:16]  = pretrained (noisy)
-            [:, 16:32] = pretrained copy (cond)
-            [:, 32:33] = zeros (mask)
+    Input: concat([noisy_x(16), condition_mask(4), condition_latents(16)]) → 36ch
+    patch_embedding: Conv3d(36, dim, ...)
+      Matches standard Wan2.1 Fun-InP/I2V format (in_dim=36).
+      Init from T2V (16ch): [:, 0:16] = pretrained (noisy)
+                            [:, 16:20] = zeros     (mask)
+                            [:, 20:36] = pretrained copy (cond)
+      Init from InP (36ch): [:, 0:36] = pretrained directly
 
+    condition_mask: [B, 4, F, H, W] — 4ch time-folded pixel mask
     RoPE: integer slot index (0..F-1)
     temporal_coords: additive embedding (zero-init MLP)
     """
 
     def __init__(self, *args, **kwargs):
-        kwargs["in_dim"] = 33
+        kwargs["in_dim"] = 36
         super().__init__(*args, **kwargs)
 
         # Fractional temporal coordinate additive embedding, zero-init last layer
@@ -38,7 +41,7 @@ class Wan4DModel(WanModel):
     def from_wan_model(cls, wan_model: WanModel) -> "Wan4DModel":
         config = dict(
             dim=wan_model.dim,
-            in_dim=33,
+            in_dim=36,
             ffn_dim=wan_model.blocks[0].ffn[0].out_features,
             out_dim=wan_model.head.head.out_features // math.prod(wan_model.patch_size),
             text_dim=wan_model.text_embedding[0].in_features,
@@ -55,14 +58,21 @@ class Wan4DModel(WanModel):
         instance = cls(**config)
 
         # Weight inflation for patch_embedding
-        old_w = wan_model.patch_embedding.weight.data   # (dim, 16, 1, 2, 2)
-        old_b = wan_model.patch_embedding.bias.data     # (dim,)
+        old_w = wan_model.patch_embedding.weight.data  # (dim, old_in_dim, 1, 2, 2)
+        old_b = wan_model.patch_embedding.bias.data    # (dim,)
+        old_in_dim = old_w.shape[1]
 
-        new_w = instance.patch_embedding.weight.data    # (dim, 33, 1, 2, 2)
+        new_w = instance.patch_embedding.weight.data   # (dim, 36, 1, 2, 2)
         with torch.no_grad():
-            new_w[:, 0:16,  ...] = old_w    # noisy channels ← pretrained
-            new_w[:, 16:32, ...] = old_w    # cond channels ← copy pretrained
-            new_w[:, 32:33, ...] = 0        # mask channel ← zeros
+            if old_in_dim == 36:
+                # Source is already a 36ch InP/I2V model — copy directly
+                # Order: [noisy(16), mask(4), cond(16)] matches our format
+                new_w[:, 0:36, ...] = old_w
+            else:
+                # Source is T2V 16ch model — inflate to 36ch
+                new_w[:, 0:16, ...] = old_w   # noisy channels ← pretrained
+                new_w[:, 16:20, ...] = 0       # mask channels ← zeros
+                new_w[:, 20:36, ...] = old_w   # cond channels ← copy pretrained
         instance.patch_embedding.bias.data.copy_(old_b)
 
         # Load remaining pretrained weights (skip patch_embedding, already handled)
@@ -99,17 +109,17 @@ class Wan4DModel(WanModel):
             clip_embedding = self.img_emb(clip_feature)
             context = torch.cat([clip_embedding, context], dim=1)
 
-        # Concat: [noisy(16), cond(16), mask(1)] → (B, 33, F, H, W)
+        # Concat: [noisy(16), mask(4), cond(16)] → (B, 36, F, H, W), matches standard InP format
         if condition_latents is None:
             condition_latents = torch.zeros_like(x)
         if condition_mask is None:
             condition_mask = torch.zeros(
-                x.shape[0], 1, x.shape[2], x.shape[3], x.shape[4],
+                x.shape[0], 4, x.shape[2], x.shape[3], x.shape[4],
                 dtype=x.dtype, device=x.device,
             )
-        x = torch.cat([x, condition_latents, condition_mask], dim=1)
+        x = torch.cat([x, condition_mask, condition_latents], dim=1)
 
-        # Patchify: Conv3d(33, dim)
+        # Patchify: Conv3d(36, dim)
         x = self.patch_embedding(x)
         grid_size = x.shape[2:]
         f, h, w = grid_size

@@ -267,7 +267,7 @@ def encode_condition_frame(
 def build_condition_from_units(
     pipe: Wan4DPipeline,
     result,
-    source_frames_tensor: torch.Tensor,
+    target_frames_tensor: torch.Tensor,
     F_latent: int,
     unit_size: int,
     device: str,
@@ -276,10 +276,11 @@ def build_condition_from_units(
     tile_size: tuple = (34, 34),
     tile_stride: tuple = (18, 16),
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build condition latents and mask from selected condition units.
+    """Build condition latents and 4ch mask from selected condition units.
 
-    Encodes the condition frame (``unit.frame_start``) of each selected unit and
-    marks only the corresponding ``unit.latent_start`` position in the mask.
+    Builds a full-length condition video (target frames at condition positions,
+    zeros elsewhere), VAE-encodes it, and constructs the 4ch time-folded mask
+    that aligns with the standard Wan2.1 InP 36ch format.
 
     Args:
         result: :class:`TimeProgressResult` from :func:`simulate_time_progress`.
@@ -289,31 +290,37 @@ def build_condition_from_units(
 
     Returns:
         condition_latents: ``[1, 16, F_latent, H_l, W_l]``.
-        condition_mask:    ``[1, 1, F_latent, H_l, W_l]``.
+        condition_mask:    ``[1, 4, F_latent, H_l, W_l]``.
     """
     if pipe.vae is None:
         raise RuntimeError("VAE not loaded; cannot build condition.")
 
-    C, T, H, W = source_frames_tensor.shape
+    C, T, H, W = target_frames_tensor.shape
     H_l, W_l = H // 8, W // 8
 
-    condition_latents = torch.zeros(1, 16, F_latent, H_l, W_l, dtype=dtype, device=device)
-    condition_mask = torch.zeros(1, 1, F_latent, H_l, W_l, dtype=dtype, device=device)
+    # 1. 构建条件视频：条件帧位置填入 target frame，其余填 0
+    cond_video = torch.zeros(1, C, T, H, W, dtype=dtype, device=device)
+    pixel_mask = torch.zeros(1, T, H_l, W_l, dtype=dtype, device=device)
 
     for ui in result.condition_unit_indices:
         unit = result.units[ui]
-        # Condition frame: first pixel frame of this unit
-        cond_frame = source_frames_tensor[:, unit.frame_start]  # [C, H, W]
-        z_frame = encode_condition_frame(
-            pipe, cond_frame, device=device, dtype=dtype,
-            tiled=tiled, tile_size=tile_size, tile_stride=tile_stride,
-        )  # [16, H_l, W_l]
+        frame_start = unit.frame_start
+        if frame_start < T:
+            cond_video[0, :, frame_start] = target_frames_tensor[:, frame_start].to(device=device, dtype=dtype)
+            pixel_mask[0, frame_start] = 1.0
 
-        # 只标记条件帧对应的 latent_start 位置
-        latent_start = unit.latent_start
-        if latent_start < F_latent:
-            condition_latents[0, :, latent_start] = z_frame
-            condition_mask[0, 0, latent_start] = 1.0
+    # 2. VAE 整体编码条件视频
+    condition_latents = pipe.vae.single_encode(cond_video, device)  # [1, 16, F_latent, H_l, W_l]
+    condition_latents = condition_latents.to(dtype=dtype, device=device)
+
+    # 3. 时间折叠：首帧 mask 重复 4 次，对应 VAE chunk 0 的因果卷积
+    # [1, T, H_l, W_l] → [1, T+3, H_l, W_l] → [1, 4, F_latent, H_l, W_l]
+    mask_folded = torch.cat([
+        pixel_mask[:, 0:1].expand(-1, 4, -1, -1),   # 首帧 × 4
+        pixel_mask[:, 1:],                            # 其余帧
+    ], dim=1)  # [1, T+3, H_l, W_l]
+    condition_mask = mask_folded.view(1, F_latent, 4, H_l, W_l).permute(0, 2, 1, 3, 4).contiguous()
+    # [1, 4, F_latent, H_l, W_l]
 
     return condition_latents, condition_mask
 

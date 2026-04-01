@@ -41,24 +41,39 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
             H_l = height // 8
             W_l = width // 8
 
-            # All-zero canvas for condition features and mask (batch_size=1; expanded in model_fn)
-            condition_latents = torch.zeros((1, 16, F_latent, H_l, W_l), dtype=pipe.torch_dtype, device=pipe.device)
-            condition_mask = torch.zeros((1, 1, F_latent, H_l, W_l), dtype=pipe.torch_dtype, device=pipe.device)
+            # 构建条件视频 [1, C, T, H, W] 和像素空间 mask [1, T, H_l, W_l]
+            cond_video = torch.zeros(
+                (1, 3, num_frames, height, width),
+                dtype=pipe.torch_dtype, device=pipe.device,
+            )
+            pixel_mask = torch.zeros(
+                (1, num_frames, H_l, W_l),
+                dtype=pipe.torch_dtype, device=pipe.device,
+            )
 
-            for i, (ref_img, idx) in enumerate(zip(reference_frames, reference_indices)):
-                ref_img = ref_img.resize((width, height))
-                # 直接传单帧，走 chunk 0 的正常路径
-                img_tensor = pipe.preprocess_video([ref_img])  # [1, C, 1, H, W]
-                z_i = pipe.vae.single_encode(img_tensor, device=pipe.device)
-                z_i = z_i.to(dtype=pipe.torch_dtype, device=pipe.device)  # [1, 16, 1, H_l, W_l]
-
-                target_latent_idx = idx // 4
-                if target_latent_idx >= F_latent:
+            for ref_img, idx in zip(reference_frames, reference_indices):
+                if idx >= num_frames:
                     continue
+                ref_img = ref_img.resize((width, height))
+                # preprocess_video 返回 [1, C, 1, H, W]，取第 0 帧得 [C, H, W]
+                frame_t = pipe.preprocess_video([ref_img])[0, :, 0]
+                cond_video[0, :, idx] = frame_t
+                pixel_mask[0, idx] = 1.0
 
-                # 只标记真正包含条件帧的 latent_start 位置，忽略 reference_unit_ranges
-                condition_latents[:, :, target_latent_idx:target_latent_idx+1, :, :] = z_i
-                condition_mask[:, :, target_latent_idx:target_latent_idx+1, :, :] = 1.0
+            # VAE 整体编码条件视频 → 16ch 条件 latent
+            condition_latents = pipe.vae.encode(
+                cond_video, device=pipe.device,
+                tiled=tiled, tile_size=tile_size, tile_stride=tile_stride,
+            ).to(dtype=pipe.torch_dtype, device=pipe.device)  # [1, 16, F_latent, H_l, W_l]
+
+            # 时间折叠：首帧 mask 重复 4 次，与 VAE chunk 0 因果卷积对齐
+            # [1, T, H_l, W_l] → [1, T+3, H_l, W_l] → [1, 4, F_latent, H_l, W_l]
+            mask_folded = torch.cat([
+                pixel_mask[:, 0:1].expand(-1, 4, -1, -1),  # 首帧 × 4
+                pixel_mask[:, 1:],                           # 其余帧
+            ], dim=1)
+            condition_mask = mask_folded.view(1, F_latent, 4, H_l, W_l).permute(0, 2, 1, 3, 4).contiguous()
+            # [1, 4, F_latent, H_l, W_l]
 
             output["condition_latents"] = condition_latents
             output["condition_mask"] = condition_mask
@@ -84,10 +99,14 @@ def model_fn_wan4d_video(
     use_gradient_checkpointing_offload=False,
     **kwargs
 ):
-    # If the standard 32-channel I2V is used via `y` but there's no explicitly passed Inpaint latents,
-    # map `y` back for the `Wan4DModel` fallback to process.
+    # If the standard I2V/InP pipeline packs condition into `y`, unpack it.
     if condition_latents is None and y is not None:
-        condition_latents = y
+        if y.shape[1] == 20:
+            # Standard InP format: [B, 20, F, H, W] = mask(4) + latent(16)
+            condition_mask = y[:, 0:4]
+            condition_latents = y[:, 4:20]
+        else:
+            condition_latents = y
 
     # Expand condition tensors to match the actual batch size (e.g. CFG doubles the batch)
     B = latents.shape[0]
