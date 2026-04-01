@@ -283,7 +283,7 @@ def build_condition_from_units(
 
     Args:
         result: :class:`TimeProgressResult` from :func:`simulate_time_progress`.
-        source_frames_tensor: ``[C, T, H, W]`` source video in [-1, 1].
+        source_frames_tensor: ``[C, T, H, W]`` target video (remap 后) in [-1, 1].
         F_latent: Number of latent frames.
         unit_size: Frames per time unit.
 
@@ -596,11 +596,11 @@ def main():
     print(f"Target latent shape: {tuple(target_latent.shape)}")
 
     # ------------------------------------------------------------------
-    # Build condition using 4-frame trick per condition unit
+    # Build condition from target video (remap 后) per condition unit
     # ------------------------------------------------------------------
     print(f"Building condition for units: {result.condition_unit_indices}")
     cond_latents, cond_mask = build_condition_from_units(
-        pipe, result, source_frames_tensor, F_latent,
+        pipe, result, target_frames_tensor, F_latent,
         unit_size=args.unit_size, device=device, dtype=torch.bfloat16,
         tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
     )
