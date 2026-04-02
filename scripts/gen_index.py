@@ -1,24 +1,21 @@
-"""Generate index.json by scanning existing dataset directory.
-
-Scans videos/ and target_videos/ directories and generates index.json
-following the structure defined in docs/dataset-structure.md.
+"""Generate index.json by scanning an existing dataset directory or sampling from an existing index.
 
 Usage::
 
     # Scan from directory
-    python datasets/gen_index.py --dataset_root ./data
+    python scripts/gen_index.py --dataset_root ./data
 
     # Specify output path
-    python datasets/gen_index.py --dataset_root ./data --output ./data/index.json
+    python scripts/gen_index.py --dataset_root ./data --output ./data/index.json
 
     # Filter by source
-    python datasets/gen_index.py --dataset_root ./data --source omniworld_hoi4d
+    python scripts/gen_index.py --dataset_root ./data --source omniworld_hoi4d
 
     # Sample from existing index
-    python datasets/gen_index.py --input_index ./data/index.json --sample 1000 --output ./data/index_1k.json
+    python scripts/gen_index.py --input_index ./data/index.json --sample 1000 --output ./data/index_1k.json
 
     # Sample with seed for reproducibility
-    python datasets/gen_index.py --input_index ./data/index.json --sample 500 --seed 42 --output ./data/index_500.json
+    python scripts/gen_index.py --input_index ./data/index.json --sample 500 --seed 42 --output ./data/index_500.json
 """
 
 import argparse
@@ -41,6 +38,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def caption_content_hash(caption: str) -> str:
     """Hash caption content for deduplicated storage."""
     return hashlib.sha256(caption.encode()).hexdigest()[:16]
+
+
+def _compute_stats(clips: List[dict]) -> Dict[str, Dict[str, int]]:
+    sources: Dict[str, Dict[str, int]] = {}
+    vids_by_src: Dict[str, set] = {}
+    for c in clips:
+        s = c.get("source", "unknown")
+        vids_by_src.setdefault(s, set()).add(c.get("video_id", ""))
+        sources.setdefault(s, {"videos": 0, "clips": 0})["clips"] += 1
+    for s in sources:
+        sources[s]["videos"] = len(vids_by_src[s])
+    return sources
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +104,6 @@ def scan_videos_dir(videos_dir: Path) -> List[dict]:
                     except json.JSONDecodeError:
                         pass
 
-                # Compute clip path
                 clip_path = f"{source}/{video_id}/{clip_id}"
 
                 clips.append({
@@ -133,15 +141,7 @@ def generate_index(
     if source_filter:
         clips = [c for c in clips if c["source"] == source_filter]
 
-    # Compute statistics
-    sources: Dict[str, Dict[str, int]] = {}
-    vids_by_src: Dict[str, set] = {}
-    for c in clips:
-        s = c["source"]
-        vids_by_src.setdefault(s, set()).add(c["video_id"])
-        sources.setdefault(s, {"videos": 0, "clips": 0})["clips"] += 1
-    for s in sources:
-        sources[s]["videos"] = len(vids_by_src.get(s, set()))
+    sources = _compute_stats(clips)
 
     if resolution is None:
         resolution = [480, 832]
@@ -192,15 +192,7 @@ def sample_from_index(
     if sample_size < len(clips):
         clips = random.sample(clips, sample_size)
 
-    # Compute statistics
-    sources: Dict[str, Dict[str, int]] = {}
-    vids_by_src: Dict[str, set] = {}
-    for c in clips:
-        s = c.get("source", "unknown")
-        vids_by_src.setdefault(s, set()).add(c.get("video_id", ""))
-        sources.setdefault(s, {"videos": 0, "clips": 0})["clips"] += 1
-    for s in sources:
-        sources[s]["videos"] = len(vids_by_src.get(s, set()))
+    sources = _compute_stats(clips)
 
     index = {
         "version": "2.0",
@@ -232,7 +224,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset_root",
         type=str,
         default=None,
-        help="Root of the dataset (contains videos/ and target_videos/)",
+        help="Root of the dataset (contains videos/)",
     )
 
     # Mode 2: Sample from existing index

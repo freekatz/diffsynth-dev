@@ -1,12 +1,11 @@
 """Build 4D dataset from OmniWorld-HOI4D raw data.
 
-Produces the ``videos/``, ``target_videos/`` tree and ``index.json`` described in
-docs/dataset-structure.md.  Latent encoding (``latents/``) is handled
-by a separate downstream script (process.py).
+Produces the ``videos/`` tree and ``index.json``.
+Latent encoding (``caption_latents/``) is handled by a separate script (process.py).
 
 Usage::
 
-    python datasets/build_hoi4d.py --raw_root ./raw_data --out ./data
+    python scripts/build_hoi4d.py --raw_root ./raw_data --out ./data
 """
 
 import argparse
@@ -428,16 +427,6 @@ def write_index(
     entries: List[Dict[str, object]],
 ) -> None:
     """Write or merge index.json."""
-    # Compute statistics
-    sources: Dict[str, Dict[str, int]] = {}
-    vids_by_src: Dict[str, set] = {}
-    for e in entries:
-        s = str(e["source"])
-        vids_by_src.setdefault(s, set()).add(str(e["video_id"]))
-        sources.setdefault(s, {"videos": 0, "clips": 0})["clips"] += 1
-    for s in sources:
-        sources[s]["videos"] = len(vids_by_src.get(s, set()))
-
     # Merge with existing index.json if present
     index_path = out_root / "index.json"
     existing_clips: List[Dict[str, object]] = []
@@ -453,15 +442,15 @@ def write_index(
     new_paths = {str(e["path"]) for e in entries}
     merged = [e for e in existing_clips if str(e["path"]) not in new_paths] + entries
 
-    # Recompute statistics from merged list
-    sources = {}
-    vids_by_src = {}
+    # Compute statistics from merged list
+    sources: Dict[str, Dict[str, int]] = {}
+    vids_by_src: Dict[str, set] = {}
     for e in merged:
         s = str(e["source"])
         vids_by_src.setdefault(s, set()).add(str(e["video_id"]))
         sources.setdefault(s, {"videos": 0, "clips": 0})["clips"] += 1
     for s in sources:
-        sources[s]["videos"] = len(vids_by_src.get(s, set()))
+        sources[s]["videos"] = len(vids_by_src[s])
 
     index = {
         "version": "2.0",
