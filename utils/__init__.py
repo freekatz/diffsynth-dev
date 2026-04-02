@@ -1,4 +1,3 @@
-from . import camera, time_pattern, time_progress
+from . import camera, temporal_trajectory
 from .camera import *
-from .time_pattern import *
-from .time_progress import simulate_time_progress
+from .temporal_trajectory import sample_training_trajectory, build_inference_trajectory

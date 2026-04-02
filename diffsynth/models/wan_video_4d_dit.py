@@ -20,8 +20,10 @@ class Wan4DModel(WanModel):
       Init from InP (36ch): [:, 0:36] = pretrained directly
 
     condition_mask: [B, 4, F, H, W] — 4ch time-folded pixel mask
-    RoPE: integer slot index (0..F-1)
-    temporal_coords: additive embedding (zero-init MLP)
+    RoPE temporal dim: driven by continuous temporal_coords (not integer slot index),
+      so attention is aware of real temporal proximity.  Scale = f-1 maps [0,1] to
+      [0, f-1] for forward playback, matching the original integer-index behavior.
+    temporal_coords: also injected as additive embedding (zero-init MLP)
     """
 
     def __init__(self, *args, **kwargs):
@@ -36,6 +38,18 @@ class Wan4DModel(WanModel):
         )
         nn.init.zeros_(self.temporal_coord_embedding[-1].weight)
         nn.init.zeros_(self.temporal_coord_embedding[-1].bias)
+
+        # Base frequencies for the temporal RoPE dimension.
+        # Computed dynamically at runtime from continuous temporal_coords.
+        # Matches the temporal-dim allocation in precompute_freqs_cis_3d:
+        #   t_dim = head_dim - 2 * (head_dim // 3)  (e.g. 44 for head_dim=128)
+        head_dim = self.dim // self.blocks[0].self_attn.num_heads
+        t_dim = head_dim - 2 * (head_dim // 3)
+        theta = 10000.0
+        temporal_base_freqs = 1.0 / (
+            theta ** (torch.arange(0, t_dim, 2)[: t_dim // 2].double() / t_dim)
+        )
+        self.register_buffer("temporal_base_freqs", temporal_base_freqs, persistent=False)
 
     @classmethod
     def from_wan_model(cls, wan_model: WanModel) -> "Wan4DModel":
@@ -57,25 +71,20 @@ class Wan4DModel(WanModel):
         )
         instance = cls(**config)
 
-        # Weight inflation for patch_embedding
-        old_w = wan_model.patch_embedding.weight.data  # (dim, old_in_dim, 1, 2, 2)
-        old_b = wan_model.patch_embedding.bias.data    # (dim,)
+        old_w = wan_model.patch_embedding.weight.data
+        old_b = wan_model.patch_embedding.bias.data
         old_in_dim = old_w.shape[1]
 
-        new_w = instance.patch_embedding.weight.data   # (dim, 36, 1, 2, 2)
+        new_w = instance.patch_embedding.weight.data
         with torch.no_grad():
             if old_in_dim == 36:
-                # Source is already a 36ch InP/I2V model — copy directly
-                # Order: [noisy(16), mask(4), cond(16)] matches our format
                 new_w[:, 0:36, ...] = old_w
             else:
-                # Source is T2V 16ch model — inflate to 36ch
-                new_w[:, 0:16, ...] = old_w   # noisy channels ← pretrained
-                new_w[:, 16:20, ...] = 0       # mask channels ← zeros
-                new_w[:, 20:36, ...] = old_w   # cond channels ← copy pretrained
+                new_w[:, 0:16, ...] = old_w
+                new_w[:, 16:20, ...] = 0
+                new_w[:, 20:36, ...] = old_w
         instance.patch_embedding.bias.data.copy_(old_b)
 
-        # Load remaining pretrained weights (skip patch_embedding, already handled)
         pretrained_sd = wan_model.state_dict()
         own_sd = instance.state_dict()
         for k, v in pretrained_sd.items():
@@ -119,14 +128,12 @@ class Wan4DModel(WanModel):
             )
         x = torch.cat([x, condition_mask, condition_latents], dim=1)
 
-        # Patchify: Conv3d(36, dim)
         x = self.patch_embedding(x)
         grid_size = x.shape[2:]
         f, h, w = grid_size
         x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
         b = x.shape[0]
 
-        # Temporal coord additive embedding
         if temporal_coords is not None:
             tc_flat = temporal_coords.reshape(-1)
             tc_emb = sinusoidal_embedding_1d(self.freq_dim, tc_flat).to(x.dtype)
@@ -135,12 +142,30 @@ class Wan4DModel(WanModel):
             tc_emb = tc_emb.reshape(b, f * h * w, self.dim)
             x = x + tc_emb
 
-        # RoPE: integer slot index
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1),
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        if temporal_coords is not None:
+            scale = float(f - 1)
+            positions = temporal_coords.double() * scale
+
+            base_freqs = self.temporal_base_freqs.to(positions.device)
+            angles = torch.einsum(
+                "bf,d->bfd", positions, base_freqs
+            )
+            t_freqs = torch.polar(torch.ones_like(angles), angles)
+            t_freqs = t_freqs.to(torch.complex64) if t_freqs.device.type == "npu" else t_freqs
+
+            t_freqs = t_freqs[:, :, None, None, :].expand(b, f, h, w, -1)
+        else:
+            t_freqs = self.freqs[0][:f][None, :, None, None, :].expand(1, f, h, w, -1)
+
+        n_batch = t_freqs.shape[0]
+        device = t_freqs.device
+        h_freqs = self.freqs[1][:h][None, None, :, None, :].expand(n_batch, f, h, w, -1).to(device)
+        w_freqs = self.freqs[2][:w][None, None, None, :, :].expand(n_batch, f, h, w, -1).to(device)
+
+        freqs = torch.cat([t_freqs, h_freqs, w_freqs], dim=-1)
+        freqs = freqs.reshape(n_batch, f * h * w, 1, -1).to(x.device)
+        if n_batch == 1:
+            freqs = freqs.squeeze(0)
 
         # Transformer
         for block in self.blocks:

@@ -26,7 +26,6 @@ import numpy as np
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.time_pattern import get_time_pattern, VALID_TIME_PATTERNS, TimePatternType
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +33,6 @@ from utils.time_pattern import get_time_pattern, VALID_TIME_PATTERNS, TimePatter
 # ---------------------------------------------------------------------------
 
 SOURCE_NAME = "omniworld_hoi4d"
-TARGET_PATTERNS: List[TimePatternType] = [p for p in VALID_TIME_PATTERNS if p != "forward"]  # 12 patterns
 
 # Expected files per clip (source)
 CLIP_FILES = ["video.mp4", "caption.txt", "meta.json"]
@@ -307,22 +305,6 @@ def collect_clips(raw_root: Path, fps: int = 24) -> List[ClipDescriptor]:
 
 
 # ---------------------------------------------------------------------------
-# Target video generation
-# ---------------------------------------------------------------------------
-
-def generate_target_video(
-    rgb_frames: np.ndarray,
-    pattern: TimePatternType,
-    num_frames: int = 81,
-) -> np.ndarray:
-    """Generate target video by reindexing frames according to time pattern."""
-    time_indices = get_time_pattern(pattern, num_frames)
-    # Convert to integer indices for numpy indexing
-    int_indices = [int(idx) for idx in time_indices]
-    return rgb_frames[int_indices]
-
-
-# ---------------------------------------------------------------------------
 # Clip processing & writing
 # ---------------------------------------------------------------------------
 
@@ -350,13 +332,9 @@ def process_and_write_clip(
         "split": split,
     }
 
-    # Check for existing files (source + target_videos)
-    target_dir = out_root / "target_videos" / desc.source_dataset / desc.video_id / clip_id
-
     if skip_existing:
         source_ok = all((final_dir / f).exists() for f in CLIP_FILES)
-        target_ok = all((target_dir / f"{p}_video.mp4").exists() for p in TARGET_PATTERNS)
-        if source_ok and target_ok:
+        if source_ok:
             meta = json.loads((final_dir / "meta.json").read_text(encoding="utf-8"))
             return {
                 **entry_base,
@@ -366,13 +344,10 @@ def process_and_write_clip(
 
     # Write to local staging dir (if set) to avoid FUSE seek issues.
     write_dir = (staging_root / rel_path) if staging_root else final_dir
-    target_write_dir = (staging_root / "target_videos" / desc.source_dataset / desc.video_id / clip_id) if staging_root else target_dir
 
     _ensure_dir(write_dir)
-    _ensure_dir(target_write_dir)
     if staging_root:
         _ensure_dir(final_dir)
-        _ensure_dir(target_dir)
 
     # Load and process frames
     rgb = desc.load_frames()
@@ -430,19 +405,11 @@ def process_and_write_clip(
         json.dumps(meta, ensure_ascii=False), encoding="utf-8",
     )
 
-    # Generate and write target videos
-    for pattern in TARGET_PATTERNS:
-        tgt_frames = generate_target_video(rgb_u8, pattern, num_frames)
-        imageio.mimwrite(target_write_dir / f"{pattern}_video.mp4", list(tgt_frames), fps=desc.fps)
-
     # Copy from staging to final
     if staging_root:
         for fname in CLIP_FILES:
             shutil.copy2(write_dir / fname, final_dir / fname)
-        for pattern in TARGET_PATTERNS:
-            shutil.copy2(target_write_dir / f"{pattern}_video.mp4", target_dir / f"{pattern}_video.mp4")
         shutil.rmtree(write_dir, ignore_errors=True)
-        shutil.rmtree(target_write_dir, ignore_errors=True)
 
     return {
         **entry_base,
@@ -507,7 +474,6 @@ def write_index(
             "pad_mode": "reverse",
             "latents_dir": "latents",
             "caption_latents_dir": "caption_latents",
-            "time_patterns": list(VALID_TIME_PATTERNS),
         },
         "statistics": {
             "num_videos": len({str(e["video_id"]) for e in merged}),
@@ -566,7 +532,6 @@ def main() -> None:
     raw_root = Path(args.raw_root)
     out_root = Path(args.out)
     _ensure_dir(out_root / "videos")
-    _ensure_dir(out_root / "target_videos")
 
     skip_existing = not args.no_skip_existing
     staging_root = Path(args.tmp_dir) if args.tmp_dir else None

@@ -129,53 +129,8 @@ def load_camera_from_meta(meta_path: str, sample_rate: int = 4,
     with open(meta_path, "r") as f:
         meta = json.load(f)
     c2w = np.array(meta["camera"]["extrinsics_c2w"], dtype=np.float32)
-    # Normalize to first frame
     ref_inv = np.linalg.inv(c2w[0])
     c2w_norm = ref_inv @ c2w
-    # Scene scale normalization
-    translations = c2w_norm[:, :3, 3]
-    scene_scale = np.max(np.abs(translations))
-    if scene_scale < scene_scale_threshold:
-        scene_scale = 1.0
-    c2w_norm[:, :3, 3] /= scene_scale
-    # Sample and flatten
-    c2w_sampled = c2w_norm[::sample_rate]
-    poses = [torch.as_tensor(c2w_sampled[i], dtype=torch.float32)[:3, :]
-             for i in range(len(c2w_sampled))]
-    cam = torch.stack(poses, dim=0)
-    cam = rearrange(cam, "b c d -> b (c d)")
-    return cam.to(dtype)
-
-
-def get_target_camera_from_source(src_c2w: np.ndarray, pattern: str,
-                                   num_frames: int = 81,
-                                   sample_rate: int = 4,
-                                   scene_scale_threshold: float = 1e-2,
-                                   dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-    """Derive target camera from source camera by time_indices reindexing.
-
-    Args:
-        src_c2w: Source camera c2w matrices [T, 4, 4].
-        pattern: Time pattern name (e.g., "reverse", "pingpong").
-        num_frames: Must match ``src_c2w`` length and training ``num_frames``.
-        sample_rate: Frame sampling rate (default 4).
-        scene_scale_threshold: Minimum scene scale to apply normalization.
-        dtype: Output tensor dtype.
-
-    Returns:
-        Target camera embedding tensor [T', 12].
-    """
-    from utils.time_pattern import get_time_pattern
-    if src_c2w.shape[0] < num_frames:
-        raise ValueError(
-            f"src_c2w has T={src_c2w.shape[0]}, need at least num_frames={num_frames}"
-        )
-    time_indices = get_time_pattern(pattern, num_frames)
-    int_indices = [int(idx) for idx in time_indices]
-    tgt_c2w = src_c2w[int_indices]
-    # Same processing as source camera
-    ref_inv = np.linalg.inv(tgt_c2w[0])
-    c2w_norm = ref_inv @ tgt_c2w
     translations = c2w_norm[:, :3, 3]
     scene_scale = np.max(np.abs(translations))
     if scene_scale < scene_scale_threshold:

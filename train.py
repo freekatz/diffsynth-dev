@@ -52,7 +52,6 @@ from utils.dataset import Wan4DDataset
 NUM_FRAMES = 81
 DEFAULT_SEED = 42
 TRAINING_OUTPUT_BASE = "training"
-# Temporal stride: number of pixel frames per latent frame (Wan VAE temporal downsampling).
 WAN_LATENT_TEMPORAL_STRIDE = 4
 
 # Default training parameters (align with Wan2.1-T2V-1.3B full dit recipe)
@@ -132,10 +131,7 @@ def resolve_dit_path(wan_model_dir):
 
 
 def resolve_vae_path(wan_model_dir):
-    """Find the Wan VAE weights file in wan_model_dir.
-
-    Returns the path if found, or None if no VAE weights exist.
-    """
+    """Find the Wan VAE weights file in wan_model_dir. Returns path or None."""
     patterns = [
         "Wan2.1_VAE.pth",
         "Wan2.1_VAE.safetensors",
@@ -165,14 +161,13 @@ class Wan4DTrainModule(pl.LightningModule):
         train_steps=25000,
         use_gradient_checkpointing=False,
         use_gradient_checkpointing_offload=False,
-        resume_ckpt_path=None,
         seed=DEFAULT_SEED,
         compile_model=False,
         log_metrics_every=1,
         num_frames=NUM_FRAMES,
-        unit_size=24,
         height=480,
         width=832,
+        loss_mask_condition=True,
         vae_tiled=False,
         vae_tile_size=(34, 34),
         vae_tile_stride=(18, 16),
@@ -185,7 +180,6 @@ class Wan4DTrainModule(pl.LightningModule):
                 torch.cuda.manual_seed_all(seed)
 
         dit_path = resolve_dit_path(wan_model_dir)
-        # Load VAE for online encoding of target and condition frames during training.
         vae_path = resolve_vae_path(wan_model_dir)
         if vae_path is None:
             raise FileNotFoundError(
@@ -205,14 +199,8 @@ class Wan4DTrainModule(pl.LightningModule):
             raise ValueError("vae init failed")
         self.pipe.scheduler.set_timesteps(1000, training=True)
         self.dit = self.pipe.dit
-        # Keep VAE in eval mode; no gradient needed for encoding
         self.pipe.vae.eval()
         self.pipe.vae.requires_grad_(False)
-
-        if resume_ckpt_path is not None:
-            self.dit.load_state_dict(
-                torch.load(resume_ckpt_path, map_location="cpu"), strict=True
-            )
 
         self._apply_parameter_freeze()
 
@@ -238,14 +226,11 @@ class Wan4DTrainModule(pl.LightningModule):
         if temporal_coords is not None:
             temporal_coords = temporal_coords.to(self.device, dtype=dt)
 
-        # Online VAE encode: target video (full 81 frames) and condition frames
-        # (4-frame trick per condition unit, replicated across unit latent range).
-        target_video = batch["target_video"].to(self.device, dtype=dt)  # [B, C, T, H, W]
-        cond_frames = batch["condition_unit_frames"].to(self.device, dtype=dt)  # [B, n_units, C, H, W]
-        cond_valid = batch["condition_unit_valid"].to(self.device, dtype=dt)   # [B, n_units]
+        # Condition frame indices from dataset (padded with -1)
+        cond_pixel_indices = batch["condition_pixel_indices"]   # [B, MAX_COND_FRAMES] long
+        cond_latent_indices = batch["condition_latent_indices"]  # [B, MAX_COND_FRAMES] long
 
-        unit_size = int(self.hparams.unit_size)
-        num_frames = int(self.hparams.num_frames)
+        target_video = batch["target_video"].to(self.device, dtype=dt)  # [B, C, T, H, W]
         vae_tiled = bool(self.hparams.vae_tiled)
         vae_tile_size = tuple(self.hparams.vae_tile_size)
         vae_tile_stride = tuple(self.hparams.vae_tile_stride)
@@ -253,56 +238,54 @@ class Wan4DTrainModule(pl.LightningModule):
         B, C, T, H, W = target_video.shape
         F_latent = (T - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
         H_l, W_l = H // 8, W // 8
-        n_units = num_frames // unit_size
 
         with torch.no_grad():
-            # Encode target video: pass as list of [C, T, H, W] tensors
             target_latent = self.pipe.vae.encode(
                 target_video,
                 device=self.device,
                 tiled=vae_tiled,
                 tile_size=vae_tile_size,
                 tile_stride=vae_tile_stride,
-            )  # [B, 16, F_latent, H_l, W_l]
+            )
 
-            # 构建条件 latent（标准 InP 格式）：
-            #   1. 构造条件视频：条件帧位置填入 target_video，其余填 0
-            #   2. VAE 整体编码 → 16ch condition_latent
-            #   3. 构造像素空间 mask，经过时间折叠得到 4ch condition_mask
-            cond_video = torch.zeros_like(target_video)       # [B, C, T, H, W]
-            pixel_mask = torch.zeros(B, T, H_l, W_l, dtype=dt, device=self.device)  # [B, T, H_l, W_l]
+            cond_video = torch.zeros_like(target_video)
+            pixel_mask = torch.zeros(B, T, H_l, W_l, dtype=dt, device=self.device)
 
             for b in range(B):
-                for ui in range(n_units):
-                    if cond_valid[b, ui] < 0.5:
-                        continue
-                    frame_start = ui * unit_size
-                    if frame_start < T:
-                        cond_video[b, :, frame_start] = target_video[b, :, frame_start]
-                        pixel_mask[b, frame_start] = 1.0
+                for k in range(cond_pixel_indices.shape[1]):
+                    idx = cond_pixel_indices[b, k].item()
+                    if idx < 0:
+                        break
+                    cond_video[b, :, idx] = target_video[b, :, idx]
+                    pixel_mask[b, idx] = 1.0
 
-            # VAE 编码条件视频
             condition_latent = self.pipe.vae.encode(
                 cond_video,
                 device=self.device,
                 tiled=vae_tiled,
                 tile_size=vae_tile_size,
                 tile_stride=vae_tile_stride,
-            )  # [B, 16, F_latent, H_l, W_l]
+            )
 
-            # 时间折叠：首帧 mask 重复 4 次，对应 VAE chunk 0 的单帧处理
-            # [B, T, H_l, W_l] → [B, T+3, H_l, W_l] → [B, 4, F_latent, H_l, W_l]
             mask_folded = torch.cat([
-                pixel_mask[:, 0:1].expand(-1, 4, -1, -1),   # 首帧 × 4
-                pixel_mask[:, 1:],                            # 其余帧
-            ], dim=1)  # [B, T+3, H_l, W_l]
+                pixel_mask[:, 0:1].expand(-1, 4, -1, -1),
+                pixel_mask[:, 1:],
+            ], dim=1)
             condition_mask = mask_folded.view(B, F_latent, 4, H_l, W_l).permute(0, 2, 1, 3, 4).contiguous()
-            # [B, 4, F_latent, H_l, W_l]
 
-        return target_latent, condition_latent, condition_mask, context, temporal_coords
+            loss_mask = torch.ones(B, 1, F_latent, 1, 1, dtype=torch.float32, device=self.device)
+            if bool(self.hparams.loss_mask_condition):
+                for b in range(B):
+                    for k in range(cond_latent_indices.shape[1]):
+                        li = cond_latent_indices[b, k].item()
+                        if li < 0:
+                            break
+                        if 0 <= li < F_latent:
+                            loss_mask[b, 0, li, 0, 0] = 0.0
 
-    def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords):
-        # Only add noise to the target latents; condition tensors remain clean
+        return target_latent, condition_latent, condition_mask, context, temporal_coords, loss_mask
+
+    def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords, loss_mask):
         noise = torch.randn_like(target_latents)
         timestep_id = torch.randint(
             0, self.pipe.scheduler.num_train_timesteps, (1,), device="cpu"
@@ -324,7 +307,10 @@ class Wan4DTrainModule(pl.LightningModule):
             use_gradient_checkpointing=self.hparams.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.hparams.use_gradient_checkpointing_offload,
         )
-        loss = F.mse_loss(pred.float(), target.float())
+        per_element = F.mse_loss(pred.float(), target.float(), reduction="none")
+        masked = per_element * loss_mask.to(per_element.device, per_element.dtype)
+        valid_elements = loss_mask.sum() * pred.shape[1] * pred.shape[3] * pred.shape[4]
+        loss = masked.sum() / valid_elements.clamp(min=1.0)
         w = self.pipe.scheduler.training_weight(
             t_scalar.to(self.pipe.scheduler.timesteps.device)
         )
@@ -335,8 +321,8 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss * w
 
     def training_step(self, batch, batch_idx):
-        target_latents, condition_latents, condition_mask, context, temporal_coords = self._batch_to_model_device(batch)
-        loss = self._diffusion_loss(target_latents, condition_latents, condition_mask, context, temporal_coords)
+        target_latents, condition_latents, condition_mask, context, temporal_coords, loss_mask = self._batch_to_model_device(batch)
+        loss = self._diffusion_loss(target_latents, condition_latents, condition_mask, context, temporal_coords, loss_mask)
 
         every = int(self.hparams.log_metrics_every)
         if self.global_step % every == 0:
@@ -357,22 +343,10 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss
 
     def on_save_checkpoint(self, checkpoint):
-        """Save checkpoint with model weights for inference (DeepSpeed compatible).
-
-        Lightning default checkpoint contains:
-        - epoch, global_step
-        - state_dict (model weights)
-        - optimizer_states (for resuming training)
-        - lr_schedulers
-
-        We additionally save a pure state_dict file for inference.
-        In DeepSpeed ZeRO strategies, checkpoint['state_dict'] is already
-        the merged complete weights, so this is naturally DeepSpeed compatible.
-        """
+        """Also save a pure state_dict file for inference."""
         checkpoint_dir = self.trainer.checkpoint_callback.dirpath
         current_step = self.global_step
 
-        # 只在 rank 0 保存，避免多卡重复写入
         if self.global_rank == 0:
             state_dict = checkpoint['state_dict']
             model_ckpt_path = os.path.join(checkpoint_dir, f"step{current_step}_model.ckpt")
@@ -474,24 +448,18 @@ def parse_args():
         help="SwanLab project + folder under training/",
     )
     p.add_argument(
-        "--resume_ckpt_path",
+        "--resume_ckpt",
         type=str,
         default=None,
-        help="raw DiT state_dict .pt/.safetensors before fit",
-    )
-    p.add_argument(
-        "--resume_lightning_ckpt",
-        type=str,
-        default=None,
-        help="full Lightning .ckpt path (no auto pick)",
+        help="Lightning checkpoint path to resume from (mirrors trainer ckpt_path).",
     )
     p.add_argument("--steps_per_epoch", type=int, default=500)
     p.add_argument("--num_frames", type=int, default=81)
     p.add_argument(
-        "--unit_size",
-        type=int,
-        default=8,
-        help="Frames per time unit for simulate_time_progress.",
+        "--loss_mask_condition",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Zero-out loss at condition latent frame positions (default: True).",
     )
     p.add_argument("--dataloader_num_workers", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=WAN21_T2V_13B_LR)
@@ -556,8 +524,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.resume_lightning_ckpt and args.resume_ckpt_path:
-        raise ValueError("use either --resume_lightning_ckpt or --resume_ckpt_path, not both")
+
     if args.num_frames != 81:
         raise ValueError("num_frames must be 81")
 
@@ -591,7 +558,6 @@ def main():
         index_path=index_path,
         steps_per_epoch=args.steps_per_epoch,
         num_frames=args.num_frames,
-        unit_size=args.unit_size,
         height=args.height,
         width=args.width,
         seed=args.seed,
@@ -618,8 +584,7 @@ def main():
         prefetch_factor=2 if args.dataloader_num_workers else None,
     )
     train_steps = max(1, args.max_epochs * args.steps_per_epoch)
-    resume_pl = args.resume_lightning_ckpt
-    dit_weights = None if resume_pl else args.resume_ckpt_path
+    resume_pl = args.resume_ckpt
     model = Wan4DTrainModule(
         wan_model_dir=args.wan_model_dir,
         learning_rate=args.learning_rate,
@@ -630,14 +595,13 @@ def main():
         train_steps=train_steps,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
-        resume_ckpt_path=dit_weights,
         seed=args.seed,
         compile_model=args.compile_model,
         log_metrics_every=args.log_metrics_every,
         num_frames=args.num_frames,
-        unit_size=args.unit_size,
         height=args.height,
         width=args.width,
+        loss_mask_condition=args.loss_mask_condition,
         vae_tiled=args.vae_tiled,
         vae_tile_size=tuple(args.vae_tile_size),
         vae_tile_stride=tuple(args.vae_tile_stride),
@@ -648,12 +612,8 @@ def main():
             TensorBoardLogger(save_dir=tb_dir, name="tb", version=args.experiment_name)
         )
     if args.use_swanlab and _is_rank_zero():
-        # SwanLab is initialized only on rank 0 (main process).  In DDP/DeepSpeed
-        # every rank runs this code path, so the _is_rank_zero() guard ensures the
-        # logger is created exactly once — preventing duplicate uploads and avoiding
-        # init errors on worker ranks that have no SwanLab credentials/token.
         try:
-            from swanlab.integration.pytorch_lightning import SwanLabLogger  # type: ignore[import-untyped]
+            from swanlab.integration.pytorch_lightning import SwanLabLogger
 
             loggers.append(
                 SwanLabLogger(
@@ -693,7 +653,7 @@ def main():
         logger=loggers if loggers else _is_rank_zero(),
     )
     if _is_rank_zero():
-        log.info("fit resume=%s", resume_pl)
+        log.info("fit resume_ckpt=%s", resume_pl)
     trainer.fit(model, dl, ckpt_path=resume_pl)
 
 
