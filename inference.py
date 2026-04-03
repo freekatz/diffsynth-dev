@@ -536,6 +536,8 @@ def run_one_task(
     max_frame = args.num_frames - 1
     target_frames_tensor = torch.empty_like(source_frames_tensor)
     for i, p in enumerate(result.temporal_coords):
+        # p is absolute time in seconds; p * fps gives the source pixel frame index.
+        # E.g. p=1.0s at fps=24 → src_idx=24.  Clamped to [0, max_frame].
         src_idx = round(p * fps)
         src_idx = max(0, min(src_idx, max_frame))
         target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]

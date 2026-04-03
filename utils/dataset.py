@@ -150,6 +150,8 @@ class Wan4DDataset(torch.utils.data.Dataset):
         target_video = torch.empty_like(source_video)
         max_frame = self.num_frames - 1
         for i, p in enumerate(result.temporal_coords):
+            # p is absolute time in seconds; p * fps gives the source pixel frame index.
+            # E.g. p=1.0s at fps=24 → src_idx=24 (i.e. the 25th frame).
             src_idx = round(p * self.fps)
             src_idx = max(0, min(src_idx, max_frame))
             target_video[:, i] = source_video[:, src_idx]
