@@ -5,7 +5,7 @@ Core abstractions:
   - Trajectory: Unit 序列，产生时间坐标映射
 
 一个视频 = [(t₀, f₀, c₀), (t₁, f₁, c₁), ..., (tₙ, fₙ, cₙ)]：
-  - t: 源时间坐标 [0, 1]
+  - t: 源时间坐标（绝对时间，单位：秒）= frame_index / fps
   - f: 输出帧索引
   - c: 相机位姿 (c2w 4×4，由 dataset 延迟绑定)
 
@@ -14,7 +14,7 @@ Training algorithm:
   2. Create k units from these positions
   3. Randomly select direction (forward/backward)
   4. Scan units, dynamically assign types (F/Z/R)
-  5. Generate coordinates, flip if backward
+  5. Generate coordinates (seconds), flip if backward: max_time - t
 """
 
 from __future__ import annotations
@@ -119,19 +119,30 @@ class Trajectory:
         """Whether any unit has camera data bound."""
         return any(u.camera is not None for u in self.units)
 
-    def generate_coords(self) -> list[float]:
-        """Generate full temporal coordinate sequence."""
-        step = 1.0 / max(self.num_frames - 1, 1)
+    def generate_coords(self, fps: float = 24.0) -> list[float]:
+        """Generate full temporal coordinate sequence in absolute seconds.
+
+        Args:
+            fps: Frames per second; determines the time step per pixel frame.
+
+        Returns:
+            List of absolute time coordinates (seconds), one per pixel frame.
+            Frame i corresponds to i/fps seconds for a pure-forward trajectory.
+            Clamped to [0, max_time] where max_time = (num_frames - 1) / fps.
+            Flipped as (max_time - t) when backward=True.
+        """
+        step = 1.0 / max(fps, 1e-8)
         coords = []
         for unit in self.units:
             coords.extend(unit.generate_coords(step))
 
-        # Clamp to [0, 1]
-        coords = [max(0.0, min(1.0, c)) for c in coords]
+        # Clamp to [0, max_time]
+        max_time = (self.num_frames - 1) / max(fps, 1e-8)
+        coords = [max(0.0, min(max_time, c)) for c in coords]
 
-        # Flip if backward
+        # Flip if backward: t → max_time - t
         if self.backward:
-            coords = [1.0 - c for c in coords]
+            coords = [max_time - c for c in coords]
 
         return coords
 
@@ -142,14 +153,15 @@ class Trajectory:
         direction = "backward" if self.backward else "forward"
         return ",".join(parts) + "_" + direction
 
-    def to_result(self) -> TrajectoryResult:
+    def to_result(self, fps: float = 24.0) -> "TrajectoryResult":
         """Convert to TrajectoryResult for API compatibility."""
         return TrajectoryResult(
-            temporal_coords=self.generate_coords(),
+            temporal_coords=self.generate_coords(fps=fps),
             condition_frame_indices=self.condition_frame_indices,
             condition_latent_indices=self.condition_latent_indices,
             trajectory_type=self.type_string,
             reference_cameras=self.reference_cameras if self.has_camera else None,
+            fps=fps,
         )
 
 
@@ -165,6 +177,7 @@ class TrajectoryResult:
     condition_latent_indices: list[int]
     trajectory_type: str = "unknown"
     reference_cameras: list | None = None   # 与 condition_frame_indices 一一对应
+    fps: float = 24.0                        # frames-per-second used to compute absolute time coords
 
 
 # ---------------------------------------------------------------------------
@@ -183,14 +196,15 @@ def create_units_from_positions(positions: list[int], num_frames: int) -> list[U
     return units
 
 
-def assign_unit_types(units: list[Unit], rng: random.Random, num_frames: int) -> None:
-    """Scan units left-to-right, assign types based on current t position."""
+def assign_unit_types(units: list[Unit], rng: random.Random, num_frames: int, fps: float = 24.0) -> None:
+    """Scan units left-to-right, assign types based on current t position (in seconds)."""
     t = 0.0
-    step = 1.0 / max(num_frames - 1, 1)
+    step = 1.0 / max(fps, 1e-8)
+    max_t = (num_frames - 1) / max(fps, 1e-8)
 
     for unit in units:
         candidates = ["Z"]
-        if t < 1.0 - 1e-9:
+        if t < max_t - 1e-9:
             candidates.append("F")
         if t > 1e-9:
             candidates.append("R")
@@ -199,7 +213,7 @@ def assign_unit_types(units: list[Unit], rng: random.Random, num_frames: int) ->
         unit.t_start = t
 
         if unit.unit_type == "F":
-            delta = min(unit.length * step, 1.0 - t)
+            delta = min(unit.length * step, max_t - t)
             unit.t_end = t + delta
             t = unit.t_end
         elif unit.unit_type == "R":
@@ -210,16 +224,17 @@ def assign_unit_types(units: list[Unit], rng: random.Random, num_frames: int) ->
             unit.t_end = t
 
 
-def compute_unit_coords(units: list[Unit], num_frames: int) -> None:
-    """Compute t_start and t_end for units with pre-assigned types."""
+def compute_unit_coords(units: list[Unit], num_frames: int, fps: float = 24.0) -> None:
+    """Compute t_start and t_end for units with pre-assigned types (in seconds)."""
     t = 0.0
-    step = 1.0 / max(num_frames - 1, 1)
+    step = 1.0 / max(fps, 1e-8)
+    max_t = (num_frames - 1) / max(fps, 1e-8)
 
     for unit in units:
         unit.t_start = t
 
         if unit.unit_type == "F":
-            delta = min(unit.length * step, 1.0 - t)
+            delta = min(unit.length * step, max_t - t)
             unit.t_end = t + delta
             t = unit.t_end
         elif unit.unit_type == "R":
@@ -238,8 +253,19 @@ def sample_training_trajectory(
     num_frames: int = 81,
     rng: random.Random | None = None,
     max_condition_frames: int = MAX_CONDITION_FRAMES,
+    fps: float = 24.0,
 ) -> TrajectoryResult:
-    """Sample a random trajectory for training."""
+    """Sample a random trajectory for training.
+
+    Args:
+        num_frames: Total pixel frames in the video.
+        rng: Random number generator instance.
+        max_condition_frames: Upper bound on number of condition frames.
+        fps: Frames per second; used to compute absolute time coords (seconds).
+
+    Returns:
+        TrajectoryResult with temporal_coords in absolute seconds and fps field set.
+    """
     if rng is None:
         rng = random.Random()
 
@@ -255,9 +281,9 @@ def sample_training_trajectory(
 
     units = create_units_from_positions(positions, num_frames)
     backward = rng.random() < 0.5
-    assign_unit_types(units, rng, num_frames)
+    assign_unit_types(units, rng, num_frames, fps=fps)
     traj = Trajectory(units=units, backward=backward, num_frames=num_frames)
-    return traj.to_result()
+    return traj.to_result(fps=fps)
 
 
 # ---------------------------------------------------------------------------
@@ -269,17 +295,20 @@ def build_inference_trajectory(
     units: str = "F",
     backward: bool = False,
     condition_unit_indices: list[int] | None = None,
+    fps: float = 24.0,
 ) -> TrajectoryResult:
     """Build a trajectory for inference.
 
     Args:
-        units: "F:30,Z:20,F:31" or JSON array of floats.
+        num_frames: Total pixel frames.
+        units: "F:30,Z:20,F:31" or JSON array of floats (absolute seconds).
             F=forward, R=reverse, Z=freeze.
-        backward: If True, flip all coordinates (1 - c).
+        backward: If True, flip all coordinates (max_time - t).
         condition_unit_indices: Which unit indices (0-based) serve as reference
             (condition) frames. Defaults to [0] (first unit only).
             e.g. [0, 2, 5] means units 0, 2 and 5 each contribute a reference
             frame at their start_frame position.
+        fps: Frames per second; used to compute absolute time coords (seconds).
 
     Example — complex trajectory with reference at units 0, 3, 6:
         units="F:15,Z:5,R:10,F:15,Z:5,R:10,F:15,Z:6"
@@ -291,13 +320,15 @@ def build_inference_trajectory(
         coords = [float(c) for c in json.loads(units_str)]
         if len(coords) != num_frames:
             raise ValueError(f"JSON length {len(coords)} != num_frames {num_frames}")
+        max_time = (num_frames - 1) / max(fps, 1e-8)
         if backward:
-            coords = [1.0 - c for c in coords]
+            coords = [max_time - c for c in coords]
         return TrajectoryResult(
             temporal_coords=coords,
             condition_frame_indices=[0],
             condition_latent_indices=[0],
             trajectory_type="explicit",
+            fps=fps,
         )
 
     unit_specs = []
@@ -325,7 +356,7 @@ def build_inference_trajectory(
         unit_list.append(Unit(start_frame=pos, length=length, unit_type=utype))
         pos += length
 
-    compute_unit_coords(unit_list, num_frames)
+    compute_unit_coords(unit_list, num_frames, fps=fps)
 
     n_units = len(unit_list)
     if condition_unit_indices is None:
@@ -349,7 +380,7 @@ def build_inference_trajectory(
         backward=backward,
         num_frames=num_frames,
     )
-    result = traj.to_result()
+    result = traj.to_result(fps=fps)
     result.condition_frame_indices = cond_pixel_frames
     result.condition_latent_indices = cond_latent_frames
     return result
@@ -435,21 +466,24 @@ def _run_tests():
 
     # Trajectory: empty units
     traj = Trajectory(units=[], backward=False, num_frames=0)
-    assert_eq(traj.generate_coords(), [], "empty trajectory")
+    assert_eq(traj.generate_coords(fps=24.0), [], "empty trajectory")
     assert_eq(traj.condition_frame_indices, [], "empty condition frames")
 
-    # Trajectory: single F unit
-    units = [Unit(start_frame=0, length=81, unit_type="F", t_start=0.0, t_end=1.0)]
+    # Trajectory: single F unit (fps=24, 81 frames → max_time = 80/24)
+    # t_start=0.0, t_end=80/24 so coords go from 0.0 to 80/24 ≈ 3.333
+    _fps = 24.0
+    _max_time = 80 / _fps
+    units = [Unit(start_frame=0, length=81, unit_type="F", t_start=0.0, t_end=_max_time)]
     traj = Trajectory(units=units, backward=False, num_frames=81)
-    coords = traj.generate_coords()
+    coords = traj.generate_coords(fps=_fps)
     assert_eq(len(coords), 81, "single F length")
     assert_near(coords[0], 0.0, msg="single F start")
-    assert_near(coords[-1], 1.0, msg="single F end")
+    assert_near(coords[-1], _max_time, msg="single F end")
 
-    # Trajectory: backward flag
+    # Trajectory: backward flag — coords flip as max_time - t
     traj = Trajectory(units=units, backward=True, num_frames=81)
-    coords = traj.generate_coords()
-    assert_near(coords[0], 1.0, msg="backward start")
+    coords = traj.generate_coords(fps=_fps)
+    assert_near(coords[0], _max_time, msg="backward start")
     assert_near(coords[-1], 0.0, msg="backward end")
 
     # Trajectory: type_string
@@ -483,78 +517,91 @@ def _run_tests():
     cam = {"c2w": "test"}
     units = [Unit(start_frame=0, length=81, unit_type="F", camera=cam)]
     traj = Trajectory(units=units, backward=False, num_frames=81)
-    r = traj.to_result()
+    r = traj.to_result(fps=24.0)
     assert_eq(r.reference_cameras, [cam], "to_result carries cameras")
 
     # Trajectory: to_result omits cameras when absent
     units = [Unit(start_frame=0, length=81, unit_type="F")]
     traj = Trajectory(units=units, backward=False, num_frames=81)
-    r = traj.to_result()
+    r = traj.to_result(fps=24.0)
     assert r.reference_cameras is None, "to_result None when no cameras"
 
     print("Testing build_inference_trajectory...")
 
-    # Single letter: F
-    r = build_inference_trajectory(81, "F")
+    # fps=24, 81 frames → max_time = 80/24 ≈ 3.3333
+    _fps = 24.0
+    _max_time = 80 / _fps
+
+    # Single letter: F — goes from 0.0 to max_time
+    r = build_inference_trajectory(81, "F", fps=_fps)
     assert_eq(len(r.temporal_coords), 81, "F length")
     assert_near(r.temporal_coords[0], 0.0, msg="F start")
-    assert_near(r.temporal_coords[-1], 1.0, msg="F end")
+    assert_near(r.temporal_coords[-1], _max_time, tol=1e-6, msg="F end")
+    assert_near(r.fps, _fps, msg="fps stored in result")
 
     # Single letter: Z (freeze at 0)
-    r = build_inference_trajectory(81, "Z")
+    r = build_inference_trajectory(81, "Z", fps=_fps)
     assert_eq(r.temporal_coords, [0.0] * 81, "Z all zeros")
 
     # Single letter: R (can't reverse from 0)
-    r = build_inference_trajectory(81, "R")
+    r = build_inference_trajectory(81, "R", fps=_fps)
     assert_eq(r.temporal_coords, [0.0] * 81, "R from 0 stays at 0")
 
-    # F with backward
-    r = build_inference_trajectory(81, "F", backward=True)
-    assert_near(r.temporal_coords[0], 1.0, msg="F backward start")
-    assert_near(r.temporal_coords[-1], 0.0, msg="F backward end")
+    # F with backward — flips as max_time - t
+    r = build_inference_trajectory(81, "F", backward=True, fps=_fps)
+    assert_near(r.temporal_coords[0], _max_time, tol=1e-6, msg="F backward start")
+    assert_near(r.temporal_coords[-1], 0.0, tol=1e-6, msg="F backward end")
 
     # Complex: F:41,R:40 (pingpong)
-    r = build_inference_trajectory(81, "F:41,R:40")
+    r = build_inference_trajectory(81, "F:41,R:40", fps=_fps)
     assert_eq(len(r.temporal_coords), 81, "pingpong length")
     assert_near(r.temporal_coords[0], 0.0, msg="pingpong start")
-    assert_near(r.temporal_coords[-1], 0.0, tol=0.02, msg="pingpong end near 0")
-    # Peak should be around frame 40
-    assert r.temporal_coords[40] > 0.4, "pingpong peak"
+    assert_near(r.temporal_coords[-1], 0.0, tol=0.1, msg="pingpong end near 0")
+    # Peak should be positive (around 40/24 seconds)
+    assert r.temporal_coords[40] > 0.0, "pingpong peak"
 
-    # Complex: F:30,Z:20,F:31
-    r = build_inference_trajectory(81, "F:30,Z:20,F:31")
+    # Complex: F:30,Z:20,F:31 (default condition_unit_indices=[0] → only unit 0's frame)
+    r = build_inference_trajectory(81, "F:30,Z:20,F:31", fps=_fps)
     assert_eq(len(r.temporal_coords), 81, "FZF length")
-    assert_eq(r.condition_frame_indices, [0, 30, 50], "FZF condition frames")
+    assert_eq(r.condition_frame_indices, [0], "FZF condition frames (default unit 0 only)")
     # Z section should be constant
     z_section = r.temporal_coords[30:50]
     assert_near(max(z_section) - min(z_section), 0.0, tol=1e-9, msg="Z section constant")
 
-    # JSON array
-    r = build_inference_trajectory(5, "[0, 0.25, 0.5, 0.75, 1.0]")
-    assert_eq(r.temporal_coords, [0.0, 0.25, 0.5, 0.75, 1.0], "JSON array")
+    # With explicit condition_unit_indices for all 3 units
+    r = build_inference_trajectory(81, "F:30,Z:20,F:31", fps=_fps, condition_unit_indices=[0, 1, 2])
+    assert_eq(r.condition_frame_indices, [0, 30, 50], "FZF condition frames (all units)")
+
+    # JSON array — values interpreted as absolute seconds; backward flips with max_time - t
+    _fps5 = 24.0
+    _max5 = 4 / _fps5  # 5 frames → max_time = 4/24
+    r = build_inference_trajectory(5, "[0, 0.04167, 0.08333, 0.125, 0.16667]", fps=_fps5)
+    assert_near(r.temporal_coords[0], 0.0, tol=1e-4, msg="JSON array first")
     assert_eq(r.trajectory_type, "explicit", "JSON type")
 
     # JSON array with backward
-    r = build_inference_trajectory(5, "[0, 0.25, 0.5, 0.75, 1.0]", backward=True)
-    assert_eq(r.temporal_coords, [1.0, 0.75, 0.5, 0.25, 0.0], "JSON backward")
+    coords_in = [0.0, 0.0417, 0.0833, 0.125, 0.1667]
+    coords_str = str(coords_in)
+    r = build_inference_trajectory(5, coords_str, backward=True, fps=_fps5)
+    assert_near(r.temporal_coords[0], _max5 - 0.0, tol=0.01, msg="JSON backward first")
 
     # Error: invalid type
     try:
-        build_inference_trajectory(81, "X:81")
+        build_inference_trajectory(81, "X:81", fps=_fps)
         assert False, "should raise for invalid type"
     except ValueError as e:
         assert "Unknown type" in str(e)
 
     # Error: lengths don't sum
     try:
-        build_inference_trajectory(81, "F:40,Z:40")
+        build_inference_trajectory(81, "F:40,Z:40", fps=_fps)
         assert False, "should raise for wrong sum"
     except ValueError as e:
         assert "sum to" in str(e)
 
     # Error: JSON wrong length
     try:
-        build_inference_trajectory(81, "[0, 0.5, 1]")
+        build_inference_trajectory(81, "[0, 0.5, 1]", fps=_fps)
         assert False, "should raise for JSON length mismatch"
     except ValueError as e:
         assert "81" in str(e)
@@ -562,27 +609,30 @@ def _run_tests():
     print("Testing sample_training_trajectory...")
 
     rng = random.Random(42)
+    _fps = 24.0
+    _max_time = 80 / _fps  # for 81 frames
 
-    # Basic sampling
+    # Basic sampling — coords should be in [0, max_time]
     for _ in range(100):
-        r = sample_training_trajectory(81, rng, max_condition_frames=5)
+        r = sample_training_trajectory(81, rng, max_condition_frames=5, fps=_fps)
         assert_eq(len(r.temporal_coords), 81, "training length")
         assert r.condition_frame_indices[0] == 0, "first condition always 0"
+        assert_near(r.fps, _fps, msg="fps in result")
         for c in r.temporal_coords:
-            assert_in_range(c, 0.0, 1.0, "coord in [0,1]")
+            assert_in_range(c, 0.0, _max_time + 1e-9, "coord in [0, max_time]")
 
     # Edge: num_frames=1
-    r = sample_training_trajectory(1, rng)
+    r = sample_training_trajectory(1, rng, fps=_fps)
     assert_eq(len(r.temporal_coords), 1, "num_frames=1")
     assert_eq(r.condition_frame_indices, [0], "num_frames=1 cond")
 
     # Edge: num_frames=2
-    r = sample_training_trajectory(2, rng)
+    r = sample_training_trajectory(2, rng, fps=_fps)
     assert_eq(len(r.temporal_coords), 2, "num_frames=2")
 
     # Edge: max_condition_frames=1
     for _ in range(20):
-        r = sample_training_trajectory(81, rng, max_condition_frames=1)
+        r = sample_training_trajectory(81, rng, max_condition_frames=1, fps=_fps)
         assert_eq(len(r.condition_frame_indices), 1, "max_cond=1")
 
     print("Testing pixel_to_latent_temporal_coords...")
@@ -615,7 +665,7 @@ def _run_tests():
     rng = random.Random(123)
     for _ in range(50):
         units = create_units_from_positions([0, 40], 81)
-        assign_unit_types(units, rng, 81)
+        assign_unit_types(units, rng, 81, fps=24.0)
         assert units[0].unit_type in ("F", "Z"), "first unit not R"
 
     print("\n✓ All tests passed!")

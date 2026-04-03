@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from torchvision.transforms import v2
 
+from utils.camera import _c2w_to_embedding, load_camera_from_meta
 from utils.image import load_frames_using_imageio
 from utils.temporal_trajectory import (
     MAX_CONDITION_FRAMES,
@@ -91,6 +92,9 @@ class Wan4DDataset(torch.utils.data.Dataset):
         self.seed = seed
         self.rng = random.Random(seed)
 
+        # fps from index.json config (fallback to 24)
+        self.fps = float(self.config.get("fps", 24.0))
+
         cfg_nf = self.config.get("num_frames")
         if cfg_nf is not None and int(cfg_nf) != int(self.num_frames):
             raise ValueError(
@@ -141,12 +145,12 @@ class Wan4DDataset(torch.utils.data.Dataset):
         )
         prompt_context = text_data["text_embeds"].detach()
 
-        result = sample_training_trajectory(num_frames=self.num_frames, rng=self.rng)
+        result = sample_training_trajectory(num_frames=self.num_frames, rng=self.rng, fps=self.fps)
 
         target_video = torch.empty_like(source_video)
         max_frame = self.num_frames - 1
         for i, p in enumerate(result.temporal_coords):
-            src_idx = round(p * max_frame)
+            src_idx = round(p * self.fps)
             src_idx = max(0, min(src_idx, max_frame))
             target_video[:, i] = source_video[:, src_idx]
 
@@ -166,12 +170,52 @@ class Wan4DDataset(torch.utils.data.Dataset):
         for i, idx in enumerate(latent_indices[:pad]):
             latent_idx_t[i] = idx
 
+        # --- Camera embedding (optional) ---
+        # Try loading from videos/{path}/meta.json (preferred) or
+        # src_cam/{stem}_extrinsics.npy (legacy fallback).
+        camera_embedding: Optional[torch.Tensor] = None
+        clip_path_str = clip["path"]
+        meta_path = self.videos_dir / clip_path_str / "meta.json"
+        npy_path = self.root / "src_cam" / (Path(clip_path_str).stem + "_extrinsics.npy")
+
+        try:
+            if meta_path.is_file():
+                cam_raw = load_camera_from_meta(
+                    str(meta_path),
+                    sample_rate=WAN_LATENT_TEMPORAL_STRIDE,
+                    dtype=torch.float32,
+                )
+                camera_embedding = cam_raw  # [T', 12]
+            elif npy_path.is_file():
+                cam_raw = _c2w_to_embedding(
+                    np.linalg.inv(np.load(str(npy_path))),
+                    sample_rate=WAN_LATENT_TEMPORAL_STRIDE,
+                    dtype=torch.float32,
+                )
+                camera_embedding = cam_raw  # [T', 12]
+        except Exception:
+            camera_embedding = None
+
+        # Trim / pad camera_embedding to match self._f_latent
+        f_lat = self._f_latent
+        if camera_embedding is not None:
+            if camera_embedding.shape[0] < f_lat:
+                last = camera_embedding[-1:, :].expand(f_lat - camera_embedding.shape[0], -1)
+                camera_embedding = torch.cat([camera_embedding, last], dim=0)
+            elif camera_embedding.shape[0] > f_lat:
+                camera_embedding = camera_embedding[:f_lat, :]
+        else:
+            # No camera data: use identity (zeros in embedding space).
+            # Zero cam_rope_proj + zero CameraEmbeddingAdapter last layer → no effect on model.
+            camera_embedding = torch.zeros(f_lat, 12, dtype=torch.float32)
+
         return {
             "target_video": target_video,                       # [C, T, H, W]
             "prompt_context": prompt_context,                   # text embedding
-            "temporal_coords": temporal_coords,                 # [F_latent] float
+            "temporal_coords": temporal_coords,                 # [F_latent] float (seconds)
             "condition_pixel_indices": pixel_idx_t,             # [MAX_CONDITION_FRAMES] long, -1 padded
             "condition_latent_indices": latent_idx_t,           # [MAX_CONDITION_FRAMES] long, -1 padded
+            "camera_embedding": camera_embedding,               # [F_latent, 12] float
         }
 
     def __getitem__(self, index):
