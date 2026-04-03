@@ -4,12 +4,15 @@ import torch.nn as nn
 from typing import Optional
 from einops import rearrange
 from diffsynth.models.wan_video_dit import WanModel, sinusoidal_embedding_1d
+from diffsynth.models.wan_video_temporal_controller import TemporalController
+from diffsynth.models.wan_video_camera_controller import CameraEmbeddingAdapter
 from diffsynth.core.gradient import gradient_checkpoint_forward
 
 
 class Wan4DModel(WanModel):
     """
-    Wan2.1 DiT for 4D spatiotemporal inpainting/completion.
+    Wan2.1 DiT for 4D spatiotemporal inpainting/completion with dual-channel
+    camera + scene motion decoupling.
 
     Input: concat([noisy_x(16), condition_mask(4), condition_latents(16)]) → 36ch
     patch_embedding: Conv3d(36, dim, ...)
@@ -20,36 +23,57 @@ class Wan4DModel(WanModel):
       Init from InP (36ch): [:, 0:36] = pretrained directly
 
     condition_mask: [B, 4, F, H, W] — 4ch time-folded pixel mask
-    RoPE temporal dim: driven by continuous temporal_coords (not integer slot index),
-      so attention is aware of real temporal proximity.  Scale = f-1 maps [0,1] to
-      [0, f-1] for forward playback, matching the original integer-index behavior.
-    temporal_coords: also injected as additive embedding (zero-init MLP)
+
+    Dual-channel motion control:
+      - temporal_controller: sinusoidal + MLP, encodes absolute time (seconds)
+        → per-frame additive embedding (scene/object motion)
+      - camera_controller: Linear MLP, encodes per-frame c2w [B, F_latent, 12]
+        → per-frame additive embedding (camera motion)
+
+    Augmented RoPE (head_dim=128, t_dim=44 split into time=22 + cam=22):
+      freqs = [time_freqs(22 real) | cam_freqs(22 real) | h_freqs(42) | w_freqs(42)]
+      - time_freqs: from absolute time coords (seconds) via time_base_freqs (11 frequencies)
+      - cam_freqs:  from c2w embed [12] via cam_rope_proj (Linear(12, 11)), zero-init
+      - When camera_embedding=None, cam_freqs = identity (zero angles → no rotation)
+      - When temporal_coords=None, falls back to integer-index RoPE (backward compat)
     """
 
     def __init__(self, *args, **kwargs):
         kwargs["in_dim"] = 36
         super().__init__(*args, **kwargs)
 
-        # Fractional temporal coordinate additive embedding, zero-init last layer
-        self.temporal_coord_embedding = nn.Sequential(
-            nn.Linear(self.freq_dim, self.dim),
-            nn.SiLU(),
-            nn.Linear(self.dim, self.dim),
+        # --- Scene motion controller (replaces temporal_coord_embedding) ---
+        self.temporal_controller = TemporalController(
+            freq_dim=self.freq_dim,
+            out_dim=self.dim,
         )
-        nn.init.zeros_(self.temporal_coord_embedding[-1].weight)
-        nn.init.zeros_(self.temporal_coord_embedding[-1].bias)
 
-        # Base frequencies for the temporal RoPE dimension.
-        # Computed dynamically at runtime from continuous temporal_coords.
-        # Matches the temporal-dim allocation in precompute_freqs_cis_3d:
-        #   t_dim = head_dim - 2 * (head_dim // 3)  (e.g. 44 for head_dim=128)
+        # --- Camera motion controller ---
+        self.camera_controller = CameraEmbeddingAdapter(
+            in_dim=12,
+            out_dim=self.dim,
+        )
+
+        # --- Augmented RoPE: split temporal dim into scene-time and camera parts ---
+        # head_dim = dim // num_heads (e.g. 128 for Wan 1.3B)
+        # t_dim = head_dim - 2 * (head_dim // 3)  (e.g. 44)
+        # Split: t_time_dim = t_dim // 2 = 22 real (11 complex)
+        #        t_cam_dim  = t_dim // 2 = 22 real (11 complex)
         head_dim = self.dim // self.blocks[0].self_attn.num_heads
         t_dim = head_dim - 2 * (head_dim // 3)
+        t_time_dim = t_dim // 2   # = 22 for head_dim=128
+
         theta = 10000.0
-        temporal_base_freqs = 1.0 / (
-            theta ** (torch.arange(0, t_dim, 2)[: t_dim // 2].double() / t_dim)
+        time_base_freqs = 1.0 / (
+            theta ** (torch.arange(0, t_time_dim, 2)[: t_time_dim // 2].double() / t_time_dim)
         )
-        self.register_buffer("temporal_base_freqs", temporal_base_freqs, persistent=False)
+        self.register_buffer("time_base_freqs", time_base_freqs, persistent=False)
+
+        # Camera RoPE projection: Linear(12, t_time_dim // 2), zero-init → identity rotation
+        # Maps per-frame c2w embedding [12] to camera RoPE angles [t_time_dim // 2]
+        self.cam_rope_proj = nn.Linear(12, t_time_dim // 2, bias=True)
+        nn.init.zeros_(self.cam_rope_proj.weight)
+        nn.init.zeros_(self.cam_rope_proj.bias)
 
     @classmethod
     def from_wan_model(cls, wan_model: WanModel) -> "Wan4DModel":
@@ -101,6 +125,7 @@ class Wan4DModel(WanModel):
         timestep: torch.Tensor,
         context: torch.Tensor,
         temporal_coords: Optional[torch.Tensor] = None,
+        camera_embedding: Optional[torch.Tensor] = None,
         clip_feature: Optional[torch.Tensor] = None,
         condition_latents: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
@@ -108,6 +133,19 @@ class Wan4DModel(WanModel):
         use_gradient_checkpointing_offload: bool = False,
         **kwargs,
     ):
+        """
+        Args:
+            x: Noisy latent [B, 16, F, H, W].
+            timestep: Diffusion timestep [B].
+            context: Text embeddings [B, L, text_dim].
+            temporal_coords: Absolute time (seconds) [B, F_latent].
+                If None, falls back to integer-index RoPE for backward compat.
+            camera_embedding: Per-frame c2w embedding [B, F_latent, 12].
+                If None, camera branch produces identity RoPE (zero angles).
+            clip_feature: Optional CLIP image embedding.
+            condition_latents: [B, 16, F, H, W] condition latent.
+            condition_mask: [B, 4, F, H, W] binary mask.
+        """
         # Timestep & text
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
@@ -118,7 +156,7 @@ class Wan4DModel(WanModel):
             clip_embedding = self.img_emb(clip_feature)
             context = torch.cat([clip_embedding, context], dim=1)
 
-        # Concat: [noisy(16), mask(4), cond(16)] → (B, 36, F, H, W), matches standard InP format
+        # Concat: [noisy(16), mask(4), cond(16)] → (B, 36, F, H, W)
         if condition_latents is None:
             condition_latents = torch.zeros_like(x)
         if condition_mask is None:
@@ -134,27 +172,63 @@ class Wan4DModel(WanModel):
         x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
         b = x.shape[0]
 
+        # --- Scene motion: temporal controller (absolute time → additive emb) ---
         if temporal_coords is not None:
-            tc_flat = temporal_coords.reshape(-1)
-            tc_emb = sinusoidal_embedding_1d(self.freq_dim, tc_flat).to(x.dtype)
-            tc_emb = self.temporal_coord_embedding(tc_emb)
-            tc_emb = tc_emb.view(b, f, 1, 1, self.dim).expand(b, f, h, w, self.dim)
-            tc_emb = tc_emb.reshape(b, f * h * w, self.dim)
-            x = x + tc_emb
+            tc_coords = temporal_coords
+            if tc_coords.shape[0] != b:
+                tc_coords = tc_coords.expand(b, -1)
+            x = x + self.temporal_controller(tc_coords, b, f, h, w)
 
+        # --- Camera motion: camera controller (c2w embed → additive emb) ---
+        if camera_embedding is not None:
+            cam_emb = camera_embedding.to(dtype=x.dtype)
+            if cam_emb.shape[0] != b:
+                cam_emb = cam_emb.expand(b, -1, -1)
+            # Pad or trim temporal dimension to match latent f
+            if cam_emb.shape[1] < f:
+                pad = cam_emb[:, -1:, :].expand(b, f - cam_emb.shape[1], -1)
+                cam_emb = torch.cat([cam_emb, pad], dim=1)
+            elif cam_emb.shape[1] > f:
+                cam_emb = cam_emb[:, :f, :]
+            x = x + self.camera_controller(cam_emb, b, f, h, w)
+
+        # --- Augmented RoPE: [time_freqs | cam_freqs | h_freqs | w_freqs] ---
         if temporal_coords is not None:
-            scale = float(f - 1)
-            positions = temporal_coords.double() * scale
+            # Scene-time RoPE from absolute seconds
+            tc_pos = temporal_coords
+            if tc_pos.shape[0] != b:
+                tc_pos = tc_pos.expand(b, -1)
+            positions = tc_pos.double()  # [B, F_latent]
 
-            base_freqs = self.temporal_base_freqs.to(positions.device)
-            angles = torch.einsum(
-                "bf,d->bfd", positions, base_freqs
-            )
-            t_freqs = torch.polar(torch.ones_like(angles), angles)
+            base_freqs = self.time_base_freqs.to(positions.device)
+            time_angles = torch.einsum("bf,d->bfd", positions, base_freqs)  # [B, F, t_time_dim//2]
+            time_freqs = torch.polar(torch.ones_like(time_angles), time_angles)  # [B, F, 11] complex
+
+            # Camera RoPE from c2w embedding (zero-init → identity by default)
+            if camera_embedding is not None:
+                cam_for_rope = camera_embedding
+                if cam_for_rope.shape[0] != b:
+                    cam_for_rope = cam_for_rope.expand(b, -1, -1)
+                if cam_for_rope.shape[1] < f:
+                    pad = cam_for_rope[:, -1:, :].expand(b, f - cam_for_rope.shape[1], -1)
+                    cam_for_rope = torch.cat([cam_for_rope, pad], dim=1)
+                elif cam_for_rope.shape[1] > f:
+                    cam_for_rope = cam_for_rope[:, :f, :]
+                cam_angles = self.cam_rope_proj(cam_for_rope.float()).double()  # [B, F, 11]
+            else:
+                cam_angles = torch.zeros(
+                    b, f, self.time_base_freqs.shape[0],
+                    dtype=torch.double, device=x.device,
+                )
+
+            cam_freqs = torch.polar(torch.ones_like(cam_angles), cam_angles)  # [B, F, 11] complex
+
+            # Concatenate: [time_freqs(11) | cam_freqs(11)] = 22 complex = 44 real
+            t_freqs = torch.cat([time_freqs, cam_freqs], dim=-1)  # [B, F, 22] complex
             t_freqs = t_freqs.to(torch.complex64) if t_freqs.device.type == "npu" else t_freqs
-
             t_freqs = t_freqs[:, :, None, None, :].expand(b, f, h, w, -1)
         else:
+            # Backward compat: integer-index RoPE
             t_freqs = self.freqs[0][:f][None, :, None, None, :].expand(1, f, h, w, -1)
 
         n_batch = t_freqs.shape[0]
@@ -167,7 +241,7 @@ class Wan4DModel(WanModel):
         if n_batch == 1:
             freqs = freqs.squeeze(0)
 
-        # Transformer
+        # Transformer blocks
         for block in self.blocks:
             if self.training:
                 x = gradient_checkpoint_forward(

@@ -54,6 +54,14 @@ from PIL import Image
 
 from diffsynth.core import ModelConfig
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
+from utils.camera import (
+    _c2w_to_embedding,
+    load_camera_from_npy,
+    load_camera_from_json,
+    load_camera_from_meta,
+    make_identity_camera,
+    parse_cam_type,
+)
 from utils.temporal_trajectory import (
     build_inference_trajectory,
     pixel_to_latent_temporal_coords,
@@ -404,6 +412,27 @@ Examples:
         help="CUDA device index. Ignored for cpu/mps.",
     )
     p.add_argument(
+        "--fps",
+        type=float,
+        default=24.0,
+        help="Video frames per second used to compute absolute time coordinates (default: 24).",
+    )
+    p.add_argument(
+        "--camera",
+        type=str,
+        default=None,
+        help=(
+            "Optional camera file (.npy extrinsics or meta.json). "
+            "If omitted, identity camera is used (no camera motion control)."
+        ),
+    )
+    p.add_argument(
+        "--cam_type",
+        type=str,
+        default="0",
+        help="Camera index when --camera is a JSON file (e.g. 'cam00' or '0', default 0).",
+    )
+    p.add_argument(
         "--output",
         type=str,
         default=None,
@@ -480,6 +509,8 @@ def run_one_task(
     device: str,
     clip_id: str,
     out_fps: float,
+    fps: float = 24.0,
+    camera_embedding: Optional[torch.Tensor] = None,
 ):
     try:
         condition_unit_indices = [
@@ -495,16 +526,19 @@ def run_one_task(
         units=units_str,
         backward=backward,
         condition_unit_indices=condition_unit_indices,
+        fps=fps,
     )
     temporal_coords = pixel_to_latent_temporal_coords(result.temporal_coords, args.num_frames)
     F_latent = len(temporal_coords)
-    print(f"Trajectory: {result.trajectory_type} ({args.num_frames} frames)")
+    print(f"Trajectory: {result.trajectory_type} ({args.num_frames} frames @ {fps}fps)")
     print(f"Condition frames: {result.condition_frame_indices}")
 
     max_frame = args.num_frames - 1
     target_frames_tensor = torch.empty_like(source_frames_tensor)
     for i, p in enumerate(result.temporal_coords):
-        src_idx = round(p * max_frame)
+        # p is absolute time in seconds; p * fps gives the source pixel frame index.
+        # E.g. p=1.0s at fps=24 → src_idx=24.  Clamped to [0, max_frame].
+        src_idx = round(p * fps)
         src_idx = max(0, min(src_idx, max_frame))
         target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
 
@@ -527,6 +561,7 @@ def run_one_task(
         condition_latents=cond_latents,
         condition_mask=cond_mask,
         temporal_coords=temporal_coords,
+        camera_embedding=camera_embedding,
         cfg_scale=args.cfg_scale,
         seed=args.seed,
         num_inference_steps=args.num_inference_steps,
@@ -665,6 +700,40 @@ def main():
     clip_id = _derive_clip_id(args.clip, args.source_video, args.source_images)
     out_fps = read_video_fps(source_video_path) if source_video_path is not None else DEFAULT_OUTPUT_FPS
 
+    # --- Load camera embedding (optional) ---
+    camera_embedding: Optional[torch.Tensor] = None
+    if args.camera is not None:
+        cam_path = args.camera
+        print(f"Loading camera from {cam_path}")
+        WAN_TEMPORAL_STRIDE = 4
+        if cam_path.endswith(".npy"):
+            camera_embedding = load_camera_from_npy(
+                cam_path,
+                sample_rate=WAN_TEMPORAL_STRIDE,
+                dtype=torch.float32,
+            )
+        elif cam_path.endswith(".json"):
+            cam_type_idx = parse_cam_type(args.cam_type)
+            camera_embedding = load_camera_from_json(
+                cam_path,
+                cam_idx=cam_type_idx,
+                num_frames=args.num_frames,
+                sample_rate=WAN_TEMPORAL_STRIDE,
+                dtype=torch.float32,
+            )
+        else:
+            # Try meta.json format
+            camera_embedding = load_camera_from_meta(
+                cam_path,
+                sample_rate=WAN_TEMPORAL_STRIDE,
+                dtype=torch.float32,
+            )
+        if camera_embedding is not None:
+            camera_embedding = camera_embedding.to(device=device, dtype=torch.bfloat16)
+            print(f"Camera embedding shape: {camera_embedding.shape}")
+    else:
+        print("No --camera: using identity camera (no camera motion control)")
+
     tasks = _parse_tasks(args)
     print(f"Tasks: {len(tasks)}")
     for idx, (units_str, condition_units_str, backward) in enumerate(tasks):
@@ -682,6 +751,8 @@ def main():
             device=device,
             clip_id=clip_id,
             out_fps=out_fps,
+            fps=args.fps,
+            camera_embedding=camera_embedding,
         )
 
     print("\nDone.")

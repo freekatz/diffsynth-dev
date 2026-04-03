@@ -5,6 +5,59 @@ from einops import rearrange
 import os
 from typing_extensions import Literal
 
+
+class CameraEmbeddingAdapter(nn.Module):
+    """Encodes per-frame c2w embedding → per-frame additive token embedding.
+
+    Input:  camera_embedding  [B, F_latent, 12]  (flattened c2w 3×4 matrix)
+    Output: additive token embedding  [B, F_latent * H * W, out_dim]
+
+    Processing pipeline:
+        1. Linear(12 → out_dim) + SiLU + Linear(out_dim → out_dim)
+        2. Broadcast: [B, F_latent, out_dim]
+                      → [B, F_latent, H, W, out_dim]
+                      → [B, F_latent * H * W, out_dim]
+
+    The last linear layer is zero-initialised so that loading pretrained weights
+    results in no change to model output (additive zero).
+    """
+
+    def __init__(self, in_dim: int = 12, out_dim: int = 1536):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.SiLU(),
+            nn.Linear(out_dim, out_dim),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(
+        self,
+        camera_embedding: torch.Tensor,
+        b: int,
+        f: int,
+        h: int,
+        w: int,
+    ) -> torch.Tensor:
+        """Compute the additive camera embedding.
+
+        Args:
+            camera_embedding: [B, F_latent, 12] per-frame c2w embedding.
+            b: Batch size.
+            f: Latent temporal dimension (F_latent).
+            h: Latent height.
+            w: Latent width.
+
+        Returns:
+            [B, F_latent * H * W, out_dim] additive embedding.
+        """
+        cam_emb = self.mlp(camera_embedding)  # [B, F_latent, out_dim]
+        out_dim = cam_emb.shape[-1]
+        cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).expand(b, f, h, w, out_dim)
+        return cam_emb.reshape(b, f * h * w, out_dim)
+
+
 class SimpleAdapter(nn.Module):
     def __init__(self, in_dim, out_dim, kernel_size, stride, num_residual_blocks=1):
         super(SimpleAdapter, self).__init__()
