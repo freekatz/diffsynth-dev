@@ -159,3 +159,62 @@ def load_camera_from_meta(
         meta = json.load(f)
     c2w = np.array(meta["camera"]["extrinsics_c2w"], dtype=np.float32)
     return _c2w_to_embedding(c2w, sample_rate, scene_scale_threshold, dtype)
+
+
+# ---------------------------------------------------------------------------
+# Preset camera trajectory generator
+# ---------------------------------------------------------------------------
+
+# Available preset names and their axis / direction mappings.
+# Each preset is a (axis, sign) tuple:  axis ∈ {0,1,2} → X,Y,Z;  sign ∈ {+1,-1}
+_PRESET_AXES: dict[str, tuple[int, int]] = {
+    "pan_left":   (0, +1),   # translate +X  (camera moves left in world)
+    "pan_right":  (0, -1),   # translate -X
+    "pan_up":     (1, -1),   # translate -Y  (camera moves up in world)
+    "pan_down":   (1, +1),   # translate +Y
+    "zoom_in":    (2, -1),   # translate -Z  (move forward)
+    "zoom_out":   (2, +1),   # translate +Z  (move backward)
+}
+
+CAMERA_PRESETS = list(_PRESET_AXES.keys())
+
+
+def make_preset_camera(
+    preset: str,
+    num_frames: int = 81,
+    sample_rate: int = 4,
+    speed: float = 0.02,
+    scene_scale_threshold: float = 1e-2,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Generate a camera embedding for a named preset trajectory.
+
+    The camera starts at the world origin (identity c2w) and moves linearly
+    along one axis over ``num_frames`` pixel frames.
+
+    Args:
+        preset: One of ``CAMERA_PRESETS``: ``"pan_left"``, ``"pan_right"``,
+            ``"pan_up"``, ``"pan_down"``, ``"zoom_in"``, ``"zoom_out"``.
+        num_frames: Total pixel frames in the clip.
+        sample_rate: Temporal downsampling factor (matches VAE latent stride).
+        speed: Translation step per pixel frame in (normalised) world units.
+        scene_scale_threshold: Passed through to ``_c2w_to_embedding``.
+        dtype: Output tensor dtype.
+
+    Returns:
+        ``[F_latent, 12]`` camera embedding tensor, identical format to
+        ``load_camera_from_npy`` / ``load_camera_from_meta``.
+    """
+    preset = preset.lower().strip()
+    if preset not in _PRESET_AXES:
+        raise ValueError(
+            f"Unknown camera preset {preset!r}. "
+            f"Choose from: {', '.join(CAMERA_PRESETS)}"
+        )
+    axis, sign = _PRESET_AXES[preset]
+
+    c2w = np.tile(np.eye(4, dtype=np.float32)[np.newaxis], (num_frames, 1, 1))
+    for i in range(num_frames):
+        c2w[i, axis, 3] = sign * speed * i
+
+    return _c2w_to_embedding(c2w, sample_rate, scene_scale_threshold, dtype)

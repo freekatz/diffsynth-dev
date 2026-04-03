@@ -60,6 +60,8 @@ from utils.camera import (
     load_camera_from_json,
     load_camera_from_meta,
     make_identity_camera,
+    make_preset_camera,
+    CAMERA_PRESETS,
     parse_cam_type,
 )
 from utils.temporal_trajectory import (
@@ -433,6 +435,24 @@ Examples:
         help="Camera index when --camera is a JSON file (e.g. 'cam00' or '0', default 0).",
     )
     p.add_argument(
+        "--camera_preset",
+        type=str,
+        default=None,
+        choices=CAMERA_PRESETS,
+        metavar="PRESET",
+        help=(
+            "Preset camera trajectory. Choices: "
+            + ", ".join(CAMERA_PRESETS)
+            + ". Ignored when --camera is given."
+        ),
+    )
+    p.add_argument(
+        "--camera_speed",
+        type=float,
+        default=0.02,
+        help="Translation speed per pixel frame for --camera_preset (default: 0.02).",
+    )
+    p.add_argument(
         "--output",
         type=str,
         default=None,
@@ -702,6 +722,8 @@ def main():
 
     # --- Load camera embedding (optional) ---
     camera_embedding: Optional[torch.Tensor] = None
+    if args.camera is not None and args.camera_preset is not None:
+        print("Warning: --camera and --camera_preset both specified; --camera takes precedence.")
     if args.camera is not None:
         cam_path = args.camera
         print(f"Loading camera from {cam_path}")
@@ -731,8 +753,18 @@ def main():
         if camera_embedding is not None:
             camera_embedding = camera_embedding.to(device=device, dtype=torch.bfloat16)
             print(f"Camera embedding shape: {camera_embedding.shape}")
+    elif args.camera_preset is not None:
+        print(f"Using preset camera: {args.camera_preset}  speed={args.camera_speed}")
+        camera_embedding = make_preset_camera(
+            preset=args.camera_preset,
+            num_frames=args.num_frames,
+            sample_rate=4,
+            speed=args.camera_speed,
+            dtype=torch.float32,
+        ).to(device=device, dtype=torch.bfloat16)
+        print(f"Camera embedding shape: {camera_embedding.shape}")
     else:
-        print("No --camera: using identity camera (no camera motion control)")
+        print("No --camera / --camera_preset: using identity camera (no camera motion control)")
 
     tasks = _parse_tasks(args)
     print(f"Tasks: {len(tasks)}")
