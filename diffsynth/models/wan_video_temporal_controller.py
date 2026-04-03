@@ -65,7 +65,7 @@ class TemporalController(nn.Module):
             [B, F_latent * H * W, out_dim] additive embedding.
         """
         tc_flat = temporal_coords.reshape(-1)  # [B * F_latent]
-        tc_emb = sinusoidal_embedding_1d(self.freq_dim, tc_flat).to(temporal_coords.dtype)
+        tc_emb = sinusoidal_embedding_1d(self.freq_dim, tc_flat).to(self.mlp[0].weight.dtype)
         tc_emb = self.mlp(tc_emb)  # [B * F_latent, out_dim]
         out_dim = tc_emb.shape[-1]
         tc_emb = tc_emb.view(b, f, 1, 1, out_dim).expand(b, f, h, w, out_dim)

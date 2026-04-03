@@ -214,7 +214,7 @@ class Wan4DModel(WanModel):
                     cam_for_rope = torch.cat([cam_for_rope, pad], dim=1)
                 elif cam_for_rope.shape[1] > f:
                     cam_for_rope = cam_for_rope[:, :f, :]
-                cam_angles = self.cam_rope_proj(cam_for_rope.float()).double()  # [B, F, 11]
+                cam_angles = self.cam_rope_proj(cam_for_rope.to(self.cam_rope_proj.weight.dtype)).double()  # [B, F, 11]
             else:
                 cam_angles = torch.zeros(
                     b, f, self.time_base_freqs.shape[0],
