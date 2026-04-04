@@ -136,9 +136,9 @@ class Trajectory:
         for unit in self.units:
             coords.extend(unit.generate_coords(step))
 
-        # Clamp to [0, max_time]
+        # Clamp to [0, max_time] and round to 8 decimal places
         max_time = (self.num_frames - 1) / max(fps, 1e-8)
-        coords = [max(0.0, min(max_time, c)) for c in coords]
+        coords = [round(max(0.0, min(max_time, c)), 8) for c in coords]
 
         # Flip if backward: t → max_time - t
         if self.backward:
@@ -395,9 +395,9 @@ def pixel_to_latent_temporal_coords(
     num_frames: int,
     stride: int = WAN_LATENT_TEMPORAL_STRIDE,
 ) -> list[float]:
-    """Sample pixel coords at latent frame positions."""
+    """Sample pixel coords at latent frame positions, rounded to 8 decimal places."""
     n_latent = (num_frames - 1) // stride + 1
-    return [pixel_coords[min(i * stride, num_frames - 1)] for i in range(n_latent)]
+    return [round(pixel_coords[min(i * stride, num_frames - 1)], 8) for i in range(n_latent)]
 
 
 # ---------------------------------------------------------------------------

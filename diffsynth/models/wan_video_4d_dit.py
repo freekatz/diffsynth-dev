@@ -1,27 +1,14 @@
-"""Wan4D DiT: 4D spatiotemporal video generation with temporal and camera control.
-
-Architecture:
-    Input: concat([noisy_x(16), condition_mask(4), condition_latents(16)]) → 36ch
-    
-    Condition injection (additive, learnable scaling):
-        x = x + alpha * temporal_cond + beta * camera_cond
-    
-    - temporal_cond: TemporalController encodes absolute time (seconds) via sinusoidal + MLP
-    - camera_cond: SimpleAdapter encodes pixel-resolution Plücker embeddings [B, 24, F, H, W]
-    - alpha, beta: learnable scalars, zero-initialized for stable fine-tuning
-    
-    RoPE: standard WAN 3D (t, h, w), absolute time when temporal_coords provided.
-"""
-
 import math
 import torch
 import torch.nn as nn
 from typing import Optional
 from einops import rearrange
 from diffsynth.models.wan_video_dit import WanModel, sinusoidal_embedding_1d
-from diffsynth.models.wan_video_temporal_controller import TemporalController
 from diffsynth.models.wan_video_camera_controller import SimpleAdapter
 from diffsynth.core.gradient import gradient_checkpoint_forward
+
+
+TEMPORAL_ROPE_FPS = 24.0
 
 
 class Wan4DModel(WanModel):
@@ -30,16 +17,12 @@ class Wan4DModel(WanModel):
         kwargs["in_dim"] = 36
         super().__init__(*args, **kwargs)
 
-        num_heads = self.blocks[0].self_attn.num_heads
-
-        # Temporal controller: sinusoidal + MLP → [B, F*H*W, dim]
-        self.temporal_controller = TemporalController(
-            freq_dim=self.freq_dim,
-            out_dim=self.dim,
+        head_dim = self.dim // self.blocks[0].self_attn.num_heads
+        dim_t = head_dim - 2 * (head_dim // 3)
+        temporal_freqs_base = 1.0 / (
+            10000.0 ** (torch.arange(0, dim_t, 2)[: dim_t // 2].double() / dim_t)
         )
-
-        # Camera adapter: SimpleAdapter encodes Plücker [B, 24, F, H, W] → [B, dim, F, H_tok, W_tok]
-        # 24 = 6 Plücker channels × 4 time-folded
+        self.register_buffer("temporal_freqs_base", temporal_freqs_base, persistent=False)
         self.camera_adapter = SimpleAdapter(
             in_dim=24,
             out_dim=self.dim,
@@ -50,9 +33,6 @@ class Wan4DModel(WanModel):
         nn.init.zeros_(self.camera_adapter.conv.weight)
         nn.init.zeros_(self.camera_adapter.conv.bias)
 
-        # Learnable injection scales, zero-init so training starts from base model
-        self.alpha = nn.Parameter(torch.zeros(1))
-        self.beta = nn.Parameter(torch.zeros(1))
 
     @classmethod
     def from_wan_model(cls, wan_model: WanModel) -> "Wan4DModel":
@@ -114,19 +94,6 @@ class Wan4DModel(WanModel):
         use_gradient_checkpointing_offload: bool = False,
         **kwargs,
     ):
-        """Forward pass.
-
-        Args:
-            x: Noisy latent [B, 16, F, H, W].
-            timestep: Diffusion timestep [B].
-            context: Text embeddings [B, L, text_dim].
-            temporal_coords: Absolute time in seconds [B, F_latent].
-            plucker_embedding: Pixel-resolution Plücker [B, 24, F, H, W].
-                24 = 6 Plücker channels × 4 time-folded.
-            clip_feature: Optional CLIP image embedding.
-            condition_latents: [B, 16, F, H, W] condition latent.
-            condition_mask: [B, 4, F, H, W] binary mask.
-        """
         b = x.shape[0]
 
         # Timestep embedding
@@ -146,19 +113,24 @@ class Wan4DModel(WanModel):
         f, h, w = x.shape[2:]
         x = rearrange(x, "b c f h w -> b (f h w) c")
 
-        # Condition injection: x = x + alpha * t_cond + beta * cam_cond
-        if temporal_coords is not None:
-            t_cond = self.temporal_controller(temporal_coords, b, f, h, w)
-            x = x + self.alpha * t_cond
-
+        # Camera injection: x = x + beta * cam_cond
         if plucker_embedding is not None:
             cam_cond = self.camera_adapter(plucker_embedding.to(dtype=x.dtype))
             cam_cond = rearrange(cam_cond, "b c f h w -> b (f h w) c")
-            x = x + self.beta * cam_cond
+            x = x + cam_cond
 
-        # 3D RoPE (standard WAN)
+        # 3D RoPE: continuous-time temporal axis + integer spatial axes
+        if temporal_coords is not None:
+            # Continuous-time temporal RoPE: position = seconds * fps
+            t_pos = temporal_coords[0].to(torch.float64) * TEMPORAL_ROPE_FPS  # [F]
+            t_angles = torch.outer(t_pos, self.temporal_freqs_base.to(t_pos.device))  # [F, dim_t//2]
+            t_freqs_cis = torch.polar(torch.ones_like(t_angles), t_angles)  # [F, dim_t//2]
+        else:
+            # Fallback: integer indices (standard WAN behavior)
+            t_freqs_cis = self.freqs[0][:f]
+
         freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            t_freqs_cis.view(f, 1, 1, -1).expand(f, h, w, -1),
             self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)

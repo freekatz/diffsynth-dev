@@ -17,10 +17,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 
 
 class Wan4DModelCheckpoint(ModelCheckpoint):
-    """ModelCheckpoint that also cleans up standalone dit model weights."""
-
     def _remove_checkpoint(self, trainer, filepath):
-        """Remove checkpoint and corresponding _model.ckpt file."""
         log = logging.getLogger("wan4d_train")
         try:
             super()._remove_checkpoint(trainer, filepath)
@@ -64,11 +61,7 @@ WAN21_T2V_13B_GRAD_ACCUM = 1
 
 _TRAINABLE_SUBSTR = (
     "patch_embedding",
-    "temporal_controller",     # scene motion (additive)
     "camera_adapter",          # camera motion via SimpleAdapter
-    "alpha",                   # learnable temporal injection scale
-    "beta",                    # learnable camera injection scale
-    "time_base_freqs",         # scene-time RoPE base frequencies
     "self_attn",
 )
 
@@ -79,13 +72,6 @@ def _safe_run_segment(name):
 
 
 def _is_rank_zero() -> bool:
-    """Return True only on global rank 0 (main process) in DDP / DeepSpeed runs.
-
-    SwanLab must be initialized on a single process only.  If every rank creates
-    a SwanLabLogger the tracker receives duplicate metric reports, and some SwanLab
-    backends reject concurrent init from the same run.  All metric reporting to
-    SwanLab is therefore guarded by this helper so that only rank 0 writes logs.
-    """
     return int(getattr(rank_zero_only, "rank", 0)) == 0
 
 
@@ -122,42 +108,7 @@ def save_run_meta(run_root, config):
         f.write(readme)
 
 
-def resolve_dit_path(wan_model_dir):
-    patterns = [
-        "diffusion_pytorch_model*.safetensors",
-        "wan_video_dit*.safetensors",
-        "model*.safetensors",
-        "dit*.safetensors",
-    ]
-    for pattern in patterns:
-        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
-        if len(matched) == 1:
-            return matched[0]
-        if len(matched) > 1:
-            raise ValueError(f"multiple DiT for `{pattern}`: {matched}")
-    raise FileNotFoundError(f"no DiT under `{wan_model_dir}`")
-
-
-def resolve_vae_path(wan_model_dir):
-    """Find the Wan VAE weights file in wan_model_dir. Returns path or None."""
-    patterns = [
-        "Wan2.1_VAE.pth",
-        "Wan2.1_VAE.safetensors",
-        "Wan2.2_VAE.pth",
-        "Wan2.2_VAE.safetensors",
-        "wan_video_vae*.pth",
-        "wan_video_vae*.safetensors",
-    ]
-    for pattern in patterns:
-        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
-        if matched:
-            return matched[0]
-    return None
-
-
 class Wan4DTrainModule(pl.LightningModule):
-    """Fine-tunes selected DiT blocks for Wan4D (noise prediction on first half of latent time)."""
-
     def __init__(
         self,
         wan_model_dir,
@@ -187,13 +138,8 @@ class Wan4DTrainModule(pl.LightningModule):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-        dit_path = resolve_dit_path(wan_model_dir)
-        vae_path = resolve_vae_path(wan_model_dir)
-        if vae_path is None:
-            raise FileNotFoundError(
-                f"No Wan VAE weights found under `{wan_model_dir}`. "
-                "VAE is required for online encoding during training."
-            )
+        dit_path = os.path.join(wan_model_dir, "diffusion_pytorch_model.safetensors")
+        vae_path = os.path.join(wan_model_dir, "Wan2.1_VAE.pth")
         model_configs = [ModelConfig(path=dit_path), ModelConfig(path=vae_path)]
         self.pipe = Wan4DPipeline.from_pretrained(
             model_configs=model_configs,
@@ -201,10 +147,6 @@ class Wan4DTrainModule(pl.LightningModule):
             device="cuda",
             torch_dtype=torch.bfloat16,
         )
-        if self.pipe.dit is None:
-            raise ValueError("dit init failed")
-        if self.pipe.vae is None:
-            raise ValueError("vae init failed")
         self.pipe.scheduler.set_timesteps(1000, training=True)
         self.dit = self.pipe.dit
         self.pipe.vae.eval()
