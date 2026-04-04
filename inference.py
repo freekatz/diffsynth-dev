@@ -80,7 +80,24 @@ DEFAULT_OUTPUT_FPS = 16.0
 
 WAN_TEMPORAL_STRIDE = 4
 
-WAN_TEMPORAL_STRIDE = 4
+
+def _compute_unit_total(units_str: str) -> int:
+    """Compute total frames from units string like 'F:40,Z:8,R:11,F:22'.
+
+    Returns -1 if units uses shorthand without explicit lengths.
+    """
+    units_str = units_str.strip()
+    if units_str.startswith("["):
+        return -1  # JSON explicit coords, length determined externally
+    total = 0
+    for part in units_str.split(","):
+        part = part.strip()
+        if ":" in part:
+            _, length_str = part.split(":", 1)
+            total += int(length_str.strip())
+        else:
+            return -1  # Single letter (F/R/Z) means full length, unknown here
+    return total
 
 
 def _load_c2w_from_path(cam_path: str, num_frames: int, cam_type_arg=None) -> Optional[np.ndarray]:
@@ -819,50 +836,68 @@ def run_one_task(
             f"condition_units invalid ({exc}). Expected comma-separated integers."
         ) from exc
 
+    # Check if unit total exceeds source frames (pred_only mode)
+    unit_total = _compute_unit_total(units_str)
+    pred_only = False
+    actual_num_frames = args.num_frames
+    if unit_total > 0 and unit_total > args.num_frames:
+        print(f"Warning: unit total ({unit_total}) > num_frames ({args.num_frames}), "
+              "saving prediction only (no GT comparison)")
+        actual_num_frames = unit_total
+        pred_only = True
+
     result = build_inference_trajectory(
-        num_frames=args.num_frames,
+        num_frames=actual_num_frames,
         units=units_str,
         backward=backward,
         condition_unit_indices=condition_unit_indices,
         fps=fps,
     )
     temporal_coords = torch.tensor(
-        pixel_to_latent_temporal_coords(result.temporal_coords, args.num_frames),
+        pixel_to_latent_temporal_coords(result.temporal_coords, actual_num_frames),
         dtype=torch.float32,
         device=device,
     ).unsqueeze(0)
     F_latent = temporal_coords.shape[1]
-    print(f"Trajectory: {result.trajectory_type} ({args.num_frames} frames @ {fps}fps)")
+    print(f"Trajectory: {result.trajectory_type} ({actual_num_frames} frames @ {fps}fps)")
     print(f"Condition frames: {result.condition_frame_indices}")
 
-    max_frame = args.num_frames - 1
-    target_frames_tensor = torch.empty_like(source_frames_tensor)
-    for i, p in enumerate(result.temporal_coords):
-        # p is absolute time in seconds; p * fps gives the source pixel frame index.
-        # E.g. p=1.0s at fps=24 → src_idx=24.  Clamped to [0, max_frame].
-        src_idx = round(p * fps)
-        src_idx = max(0, min(src_idx, max_frame))
-        target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
+    # Build target frames tensor (for condition encoding and GT comparison)
+    # In pred_only mode, we still need some frames for condition, so clamp to available
+    max_src_frame = source_frames_tensor.shape[1] - 1
+    if pred_only:
+        # Allocate tensor for actual_num_frames, clamping source indices
+        target_frames_tensor = torch.empty(
+            source_frames_tensor.shape[0], actual_num_frames,
+            source_frames_tensor.shape[2], source_frames_tensor.shape[3],
+            dtype=source_frames_tensor.dtype, device=source_frames_tensor.device
+        )
+        for i, p in enumerate(result.temporal_coords):
+            src_idx = round(p * fps)
+            src_idx = max(0, min(src_idx, max_src_frame))  # Clamp to available
+            target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
+    else:
+        target_frames_tensor = torch.empty_like(source_frames_tensor)
+        for i, p in enumerate(result.temporal_coords):
+            src_idx = round(p * fps)
+            src_idx = max(0, min(src_idx, max_src_frame))
+            target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
 
     # Remap camera trajectory to match temporal trajectory
     plucker_embedding: Optional[torch.Tensor] = None
     if c2w is not None:
-        c2w_remapped = np.empty((args.num_frames, 4, 4), dtype=np.float32)
+        c2w_remapped = np.empty((actual_num_frames, 4, 4), dtype=np.float32)
         c2w_max = len(c2w) - 1
         for i, p in enumerate(result.temporal_coords):
             src_idx = round(p * fps)
             src_idx = max(0, min(src_idx, c2w_max))
             c2w_remapped[i] = c2w[src_idx]
         plucker_embedding = _c2w_to_plucker(
-            c2w_remapped, args.height, args.width, args.num_frames, F_latent
+            c2w_remapped, args.height, args.width, actual_num_frames, F_latent
         ).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
 
     tile_size = (34, 34)
     tile_stride = (18, 16)
-    target_latent = encode_video_pixels(
-        pipe, target_frames_tensor, device=device, dtype=torch.bfloat16,
-        tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
-    )
 
     cond_latents, cond_mask = build_condition_from_frames(
         pipe, result.condition_frame_indices, target_frames_tensor, F_latent,
@@ -896,7 +931,7 @@ def run_one_task(
         num_inference_steps=args.num_inference_steps,
         height=args.height,
         width=args.width,
-        num_frames=args.num_frames,
+        num_frames=actual_num_frames,
         tiled=args.tiled,
     )
 
@@ -908,7 +943,7 @@ def run_one_task(
         try:
             signal_maps = cam_attn_hook.get_signal_maps(F_latent, H_tok, W_tok)
             cam_attn_frames = prepare_cam_attn_frames(
-                signal_maps, num_pixel_frames=args.num_frames,
+                signal_maps, num_pixel_frames=actual_num_frames,
                 height=args.height, width=args.width,
             )
         except Exception as e:
@@ -921,36 +956,48 @@ def run_one_task(
         out_path = os.path.join(RESULTS_DIR, auto_name)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
-    target_vis = ((target_frames_tensor.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
-    target_vis = target_vis.clamp(0, 255).byte().numpy()
-    n_write = min(len(frames), target_vis.shape[0])
+    n_write = len(frames)
 
-    # Output: 2x2 composite if cam_attn_frames available, else [GT | Pred] side-by-side
-    composite_2x2 = cam_attn_frames is not None and len(cam_attn_frames) >= n_write
-    if composite_2x2:
-        print(f"Writing 2x2 composite: {out_path} ({n_write} frames @ {out_fps} fps)")
+    if pred_only:
+        # Save prediction only (no GT comparison)
+        print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps) [prediction only]")
+        with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
+            for i in range(n_write):
+                pred = to_hwc_numpy(frames[i])
+                if pred.dtype != np.uint8:
+                    pred = np.clip(pred, 0, 255).astype(np.uint8)
+                writer.append_data(pred)
     else:
-        print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps)")
-    with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
-        for i in range(n_write):
-            pred = to_hwc_numpy(frames[i])
-            if pred.dtype != np.uint8:
-                pred = np.clip(pred, 0, 255).astype(np.uint8)
-            target = target_vis[i]
-            if target.shape != pred.shape:
-                raise RuntimeError(
-                    f"target/pred shape mismatch at frame {i}: {target.shape} vs {pred.shape}"
-                )
-            if composite_2x2:
-                # 2x2 layout: GT | Pred / CamAttn | Overlay
-                heatmap = cam_attn_frames[i]
-                overlay = blend_heatmap_on_image(heatmap, pred, alpha_blend=0.4)
-                top_row = np.concatenate([target, pred], axis=1)
-                bottom_row = np.concatenate([heatmap, overlay], axis=1)
-                composite = np.concatenate([top_row, bottom_row], axis=0)
-                writer.append_data(composite)
-            else:
-                writer.append_data(np.concatenate([target, pred], axis=1))
+        # Standard mode: GT | Pred side-by-side (or 2x2 with cam_attn)
+        target_vis = ((target_frames_tensor.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
+        target_vis = target_vis.clamp(0, 255).byte().numpy()
+        n_write = min(len(frames), target_vis.shape[0])
+
+        composite_2x2 = cam_attn_frames is not None and len(cam_attn_frames) >= n_write
+        if composite_2x2:
+            print(f"Writing 2x2 composite: {out_path} ({n_write} frames @ {out_fps} fps)")
+        else:
+            print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps)")
+        with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
+            for i in range(n_write):
+                pred = to_hwc_numpy(frames[i])
+                if pred.dtype != np.uint8:
+                    pred = np.clip(pred, 0, 255).astype(np.uint8)
+                target = target_vis[i]
+                if target.shape != pred.shape:
+                    raise RuntimeError(
+                        f"target/pred shape mismatch at frame {i}: {target.shape} vs {pred.shape}"
+                    )
+                if composite_2x2:
+                    # 2x2 layout: GT | Pred / CamAttn | Overlay
+                    heatmap = cam_attn_frames[i]
+                    overlay = blend_heatmap_on_image(heatmap, pred, alpha_blend=0.4)
+                    top_row = np.concatenate([target, pred], axis=1)
+                    bottom_row = np.concatenate([heatmap, overlay], axis=1)
+                    composite = np.concatenate([top_row, bottom_row], axis=0)
+                    writer.append_data(composite)
+                else:
+                    writer.append_data(np.concatenate([target, pred], axis=1))
 
 
 def to_hwc_numpy(frame) -> np.ndarray:
