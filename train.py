@@ -64,10 +64,11 @@ WAN21_T2V_13B_GRAD_ACCUM = 1
 
 _TRAINABLE_SUBSTR = (
     "patch_embedding",
-    "temporal_controller",     # scene motion (replaces temporal_coord_embedding)
-    "camera_controller",       # camera motion additive embedding
+    "temporal_controller",     # scene motion (additive)
+    "camera_adapter",          # camera motion via SimpleAdapter
+    "alpha",                   # learnable temporal injection scale
+    "beta",                    # learnable camera injection scale
     "time_base_freqs",         # scene-time RoPE base frequencies
-    "cam_rope_proj",           # camera RoPE projection
     "self_attn",
 )
 
@@ -233,9 +234,9 @@ class Wan4DTrainModule(pl.LightningModule):
         if temporal_coords is not None:
             temporal_coords = temporal_coords.to(self.device, dtype=dt)
 
-        camera_embedding = batch.get("camera_embedding")
-        if camera_embedding is not None:
-            camera_embedding = camera_embedding.to(self.device, dtype=dt)
+        plucker_embedding = batch.get("plucker_embedding")
+        if plucker_embedding is not None:
+            plucker_embedding = plucker_embedding.to(self.device, dtype=dt)
 
         # Condition frame indices from dataset (padded with -1)
         cond_pixel_indices = batch["condition_pixel_indices"]   # [B, MAX_COND_FRAMES] long
@@ -294,9 +295,9 @@ class Wan4DTrainModule(pl.LightningModule):
                         if 0 <= li < F_latent:
                             loss_mask[b, 0, li, 0, 0] = 0.0
 
-        return target_latent, condition_latent, condition_mask, context, temporal_coords, camera_embedding, loss_mask
+        return target_latent, condition_latent, condition_mask, context, temporal_coords, plucker_embedding, loss_mask
 
-    def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords, camera_embedding, loss_mask):
+    def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, loss_mask):
         noise = torch.randn_like(target_latents)
         timestep_id = torch.randint(
             0, self.pipe.scheduler.num_train_timesteps, (1,), device="cpu"
@@ -313,7 +314,7 @@ class Wan4DTrainModule(pl.LightningModule):
             timestep=timestep,
             context=context,
             temporal_coords=temporal_coords,
-            camera_embedding=camera_embedding,
+            plucker_embedding=plucker_embedding,
             condition_latents=condition_latents,
             condition_mask=condition_mask,
             use_gradient_checkpointing=self.hparams.use_gradient_checkpointing,
@@ -333,8 +334,8 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss * w
 
     def training_step(self, batch, batch_idx):
-        target_latents, condition_latents, condition_mask, context, temporal_coords, camera_embedding, loss_mask = self._batch_to_model_device(batch)
-        loss = self._diffusion_loss(target_latents, condition_latents, condition_mask, context, temporal_coords, camera_embedding, loss_mask)
+        target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, loss_mask = self._batch_to_model_device(batch)
+        loss = self._diffusion_loss(target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, loss_mask)
 
         every = int(self.hparams.log_metrics_every)
         if self.global_step % every == 0:
@@ -525,8 +526,8 @@ def parse_args():
         ),
     )
     p.add_argument("--swanlab_mode", type=str, default=None)
-    p.add_argument(
-        "--experiment_name",
+
+    p.add_argument(        "--experiment_name",
         type=str,
         default="run",
         help="run folder + SwanLab experiment; use a new name per trial",

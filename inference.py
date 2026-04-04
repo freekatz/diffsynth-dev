@@ -43,24 +43,23 @@ import glob
 import hashlib
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import imageio
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision
 from PIL import Image
 
 from diffsynth.core import ModelConfig
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
 from utils.camera import (
-    _c2w_to_embedding,
-    load_camera_from_npy,
-    load_camera_from_json,
-    load_camera_from_meta,
-    make_identity_camera,
-    make_preset_camera,
+    compute_plucker_pixel_resolution,
+    timefold_plucker,
+    make_preset_c2w,
     CAMERA_PRESETS,
     parse_cam_type,
 )
@@ -78,6 +77,276 @@ DEFAULT_NEGATIVE_PROMPT = (
 RESULTS_DIR = "results"
 # Default output video FPS when no source video metadata is available.
 DEFAULT_OUTPUT_FPS = 16.0
+
+WAN_TEMPORAL_STRIDE = 4
+
+WAN_TEMPORAL_STRIDE = 4
+
+
+def _load_c2w_from_path(cam_path: str, num_frames: int, cam_type_arg=None) -> Optional[np.ndarray]:
+    """Load c2w [F, 4, 4] from .npy, meta.json, or ReCam JSON. Returns None on failure."""
+    try:
+        if cam_path.endswith(".npy"):
+            return np.linalg.inv(np.load(cam_path)).astype(np.float32)
+        import json as _json
+        with open(cam_path) as f:
+            data = _json.load(f)
+        if "camera" in data and "extrinsics_c2w" in data["camera"]:
+            # meta.json format
+            return np.array(data["camera"]["extrinsics_c2w"], dtype=np.float32)
+        else:
+            # ReCam per-frame JSON — not c2w directly, handled separately
+            return None
+    except Exception as e:
+        print(f"Warning: failed to load c2w from {cam_path}: {e}")
+        return None
+
+
+def _c2w_to_plucker(
+    c2w: np.ndarray,
+    height: int,
+    width: int,
+    num_frames: int,
+    F_latent: int,
+    dtype=torch.float32,
+) -> torch.Tensor:
+    """Normalize c2w and compute Plücker embeddings at pixel resolution, time-folded.
+
+    Args:
+        c2w: Raw c2w [F_pixel, 4, 4].
+        height: Pixel height.
+        width: Pixel width.
+        num_frames: Number of pixel frames.
+        F_latent: Number of latent frames.
+        dtype: Output dtype.
+
+    Returns:
+        [24, F_latent, H, W] time-folded Plücker for SimpleAdapter.
+    """
+    ref_inv = np.linalg.inv(c2w[0])
+    c2w_rel = ref_inv @ c2w
+    scene_scale = float(np.max(np.abs(c2w_rel[:, :3, 3])))
+    if scene_scale < 1e-2:
+        scene_scale = 1.0
+    c2w_rel[:, :3, 3] /= scene_scale
+
+    # Pad/trim to num_frames
+    if len(c2w_rel) < num_frames:
+        last = c2w_rel[-1:]
+        c2w_rel = np.concatenate(
+            [c2w_rel, np.tile(last, (num_frames - len(c2w_rel), 1, 1))], axis=0
+        )
+    else:
+        c2w_rel = c2w_rel[:num_frames]
+
+    plucker_raw = compute_plucker_pixel_resolution(
+        c2w_rel, height, width, dtype=torch.float32
+    )  # [F_pixel, H, W, 6]
+    plucker_folded = timefold_plucker(
+        plucker_raw, F_latent, temporal_stride=WAN_TEMPORAL_STRIDE
+    )  # [24, F_latent, H, W]
+    return plucker_folded.to(dtype=dtype)
+
+
+# ---------------------------------------------------------------------------
+# Camera attention visualization
+# ---------------------------------------------------------------------------
+
+def _apply_colormap_viridis(values: np.ndarray) -> np.ndarray:
+    """Apply Viridis-like colormap: low=purple, mid=teal, high=yellow.
+
+    Args:
+        values: [H, W] array in [0, 1].
+
+    Returns:
+        [H, W, 3] uint8 RGB image.
+    """
+    # Simplified 4-stop Viridis: purple → blue → teal → yellow
+    # 0.0 → (68, 1, 84)
+    # 0.33 → (59, 82, 139)
+    # 0.66 → (33, 145, 140)
+    # 1.0 → (253, 231, 37)
+    t = values
+    r = np.where(t < 0.33, 68 + (59 - 68) * (t / 0.33),
+          np.where(t < 0.66, 59 + (33 - 59) * ((t - 0.33) / 0.33),
+                   33 + (253 - 33) * ((t - 0.66) / 0.34)))
+    g = np.where(t < 0.33, 1 + (82 - 1) * (t / 0.33),
+          np.where(t < 0.66, 82 + (145 - 82) * ((t - 0.33) / 0.33),
+                   145 + (231 - 145) * ((t - 0.66) / 0.34)))
+    b = np.where(t < 0.33, 84 + (139 - 84) * (t / 0.33),
+          np.where(t < 0.66, 139 + (140 - 139) * ((t - 0.33) / 0.33),
+                   140 + (37 - 140) * ((t - 0.66) / 0.34)))
+    return np.stack([r, g, b], axis=-1).clip(0, 255).astype(np.uint8)
+
+
+class CameraAttnCaptureHook:
+    """Forward hook to capture camera cross-attention signal strength.
+
+    Uses the L2 norm of the cross-attention output (residual) as a lightweight
+    proxy for "camera signal strength" per token — avoids computing the full
+    N×N attention matrix which would OOM on high-resolution videos.
+
+    Usage::
+        hook = CameraAttnCaptureHook()
+        handle = pipe.dit.camera_cross_attn.register_forward_hook(hook)
+        # run inference...
+        handle.remove()
+        signal_maps = hook.get_signal_maps(F_latent, H_token, W_token)
+    """
+
+    def __init__(self):
+        self._cam_signals: List[torch.Tensor] = []
+
+    def __call__(self, module, inputs, output):
+        """Hook callback: capture the norm of camera adapter output."""
+        # output is the camera condition from SimpleAdapter [B, dim, F, H, W]
+        # This hook may need adjustment for the new architecture
+        with torch.no_grad():
+            signal = output[-1].norm(dim=-1)  # [N]
+            self._cam_signals.append(signal.cpu())
+
+    def clear(self):
+        self._cam_signals.clear()
+
+    def get_signal_maps(self, f: int, h: int, w: int) -> List[np.ndarray]:
+        """Reshape captured signals to [F, H, W] arrays.
+
+        Higher value = stronger camera signal contribution at that token.
+
+        Returns:
+            List of [F, H, W] numpy arrays, one per denoising step.
+        """
+        expected_n = f * h * w
+        maps = []
+        for i, s in enumerate(self._cam_signals):
+            actual_n = s.numel()
+            if actual_n != expected_n:
+                raise ValueError(
+                    f"Signal shape mismatch at step {i}: expected {expected_n} tokens "
+                    f"(F={f}, H={h}, W={w}), got {actual_n}."
+                )
+            arr = s.float().numpy().reshape(f, h, w)
+            maps.append(arr)
+        return maps
+
+
+def render_cam_attn_video(
+    entropy_maps: List[np.ndarray],
+    out_path: str,
+    height: int,
+    width: int,
+    fps: float,
+    use_last_n_steps: int = 5,
+):
+    """Render camera attention entropy heatmap video.
+
+    Args:
+        entropy_maps: List of [F, H, W] entropy arrays (one per denoising step).
+        out_path: Output video path.
+        height, width: Target pixel resolution.
+        fps: Output video FPS.
+        use_last_n_steps: Average the last N denoising steps.
+    """
+    if not entropy_maps:
+        print("Warning: No entropy maps captured, skipping heatmap video.")
+        return
+
+    n = min(use_last_n_steps, len(entropy_maps))
+    avg_entropy = np.mean(entropy_maps[-n:], axis=0)  # [F, H, W]
+
+    # Normalize to [0, 1]
+    e_min, e_max = avg_entropy.min(), avg_entropy.max()
+    e_mean, e_std = avg_entropy.mean(), avg_entropy.std()
+    print(f"Cam-attn entropy: min={e_min:.3f}, max={e_max:.3f}, mean={e_mean:.3f}, std={e_std:.3f}")
+    if e_max - e_min < 1e-6:
+        print("Warning: Entropy values have no variance; heatmap will be uniform.")
+        avg_entropy = np.ones_like(avg_entropy) * 0.5
+    else:
+        avg_entropy = (avg_entropy - e_min) / (e_max - e_min)
+
+    f_lat, h_lat, w_lat = avg_entropy.shape
+    print(f"Rendering cam-attn heatmap: latent shape ({f_lat}, {h_lat}, {w_lat}) -> ({height}, {width})")
+
+    # Upsample to pixel resolution
+    entropy_tensor = torch.from_numpy(avg_entropy).unsqueeze(1).float()  # [F, 1, H, W]
+    entropy_up = F.interpolate(entropy_tensor, size=(height, width), mode="bilinear", align_corners=False)
+    entropy_up = entropy_up.squeeze(1).numpy()  # [F, H, W]
+
+    with imageio.get_writer(out_path, fps=fps, codec="libx264") as writer:
+        for i in range(entropy_up.shape[0]):
+            frame = _apply_colormap_viridis(entropy_up[i])
+            writer.append_data(frame)
+
+    print(f"Camera attention heatmap saved: {out_path}")
+
+
+def prepare_cam_attn_frames(
+    signal_maps: List[np.ndarray],
+    num_pixel_frames: int,
+    height: int,
+    width: int,
+    use_last_n_steps: int = 5,
+) -> Optional[np.ndarray]:
+    """Prepare camera signal heatmap frames for 2x2 video composition.
+
+    Args:
+        signal_maps: List of [F_lat, H_token, W_token] signal strength arrays.
+        num_pixel_frames: Target number of pixel frames.
+        height, width: Target pixel resolution.
+        use_last_n_steps: Average the last N denoising steps.
+
+    Returns:
+        [num_pixel_frames, H, W, 3] uint8 RGB array of heatmap frames,
+        or None if signal_maps is empty.
+    """
+    if not signal_maps:
+        return None
+
+    n = min(use_last_n_steps, len(signal_maps))
+    avg_signal = np.mean(signal_maps[-n:], axis=0)  # [F_lat, H_token, W_token]
+
+    # Normalize
+    s_min, s_max = avg_signal.min(), avg_signal.max()
+    s_mean, s_std = avg_signal.mean(), avg_signal.std()
+    print(f"Cam-attn signal: min={s_min:.3f}, max={s_max:.3f}, mean={s_mean:.3f}, std={s_std:.3f}")
+    if s_std < 0.01:
+        print(
+            "Warning: Signal values have very low variance (std < 0.01). "
+            "This usually means camera_cross_attn was not trained."
+        )
+    if s_max - s_min < 1e-6:
+        avg_signal = np.ones_like(avg_signal) * 0.5
+    else:
+        avg_signal = (avg_signal - s_min) / (s_max - s_min)
+
+    f_lat, h_token, w_token = avg_signal.shape
+
+    # Upsample spatially: [F_lat, 1, H_token, W_token] -> [F_lat, 1, H, W]
+    signal_tensor = torch.from_numpy(avg_signal).unsqueeze(1).float()
+    signal_spatial = F.interpolate(signal_tensor, size=(height, width), mode="bilinear", align_corners=False)
+    # Upsample temporally using trilinear: [1, 1, F_lat, H, W] -> [1, 1, num_pixel_frames, H, W]
+    signal_5d = signal_spatial.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [1, 1, F_lat, H, W]
+    signal_upsampled = F.interpolate(signal_5d, size=(num_pixel_frames, height, width), mode="trilinear", align_corners=False)
+    signal_final = signal_upsampled[0, 0].numpy()  # [num_pixel_frames, H, W]
+
+    # Apply colormap to each frame
+    heatmap_frames = np.stack([_apply_colormap_viridis(signal_final[i]) for i in range(num_pixel_frames)], axis=0)
+    return heatmap_frames  # [num_pixel_frames, H, W, 3] uint8
+
+
+def blend_heatmap_on_image(heatmap: np.ndarray, image: np.ndarray, alpha_blend: float = 0.5) -> np.ndarray:
+    """Blend heatmap on top of an image.
+
+    Args:
+        heatmap: [H, W, 3] uint8 RGB heatmap.
+        image: [H, W, 3] uint8 RGB image.
+        alpha_blend: Blend weight for heatmap (0 = image only, 1 = heatmap only).
+
+    Returns:
+        [H, W, 3] uint8 blended image.
+    """
+    blended = (1 - alpha_blend) * image.astype(np.float32) + alpha_blend * heatmap.astype(np.float32)
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +722,14 @@ Examples:
         help="Translation speed per pixel frame for --camera_preset (default: 0.02).",
     )
     p.add_argument(
+        "--save_cam_attn",
+        action="store_true",
+        help=(
+            "Save camera cross-attention entropy heatmap video. "
+            "Output: <video>_cam_attn.mp4 showing per-token attention distribution."
+        ),
+    )
+    p.add_argument(
         "--output",
         type=str,
         default=None,
@@ -530,7 +807,8 @@ def run_one_task(
     clip_id: str,
     out_fps: float,
     fps: float = 24.0,
-    camera_embedding: Optional[torch.Tensor] = None,
+    plucker_embedding: Optional[torch.Tensor] = None,
+    save_cam_attn: bool = False,
 ):
     try:
         condition_unit_indices = [
@@ -575,13 +853,27 @@ def run_one_task(
         tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
     )
 
+    # --- Set up camera attention hook if requested ---
+    cam_attn_hook = None
+    hook_handle = None
+    H_tok = args.height // 16
+    W_tok = args.width // 16
+    if save_cam_attn and plucker_embedding is not None:
+        cam_attn_hook = CameraAttnCaptureHook()
+        if hasattr(pipe.dit, "camera_cross_attn") and pipe.dit.camera_cross_attn is not None:
+            hook_handle = pipe.dit.camera_cross_attn.register_forward_hook(cam_attn_hook)
+            print("Camera attention capture enabled.")
+        else:
+            print("Warning: --save_cam_attn but no camera_cross_attn module found.")
+            cam_attn_hook = None
+
     frames = pipe(
         prompt=caption_text,
         negative_prompt=args.negative_prompt,
         condition_latents=cond_latents,
         condition_mask=cond_mask,
         temporal_coords=temporal_coords,
-        camera_embedding=camera_embedding,
+        plucker_embedding=plucker_embedding,
         cfg_scale=args.cfg_scale,
         seed=args.seed,
         num_inference_steps=args.num_inference_steps,
@@ -590,6 +882,20 @@ def run_one_task(
         num_frames=args.num_frames,
         tiled=args.tiled,
     )
+
+    # --- Remove hook and prepare heatmap frames ---
+    cam_attn_frames: Optional[np.ndarray] = None
+    if hook_handle is not None:
+        hook_handle.remove()
+    if cam_attn_hook is not None and cam_attn_hook._cam_signals:
+        try:
+            signal_maps = cam_attn_hook.get_signal_maps(F_latent, H_tok, W_tok)
+            cam_attn_frames = prepare_cam_attn_frames(
+                signal_maps, num_pixel_frames=args.num_frames,
+                height=args.height, width=args.width,
+            )
+        except Exception as e:
+            print(f"Warning: failed to prepare cam-attn heatmap: {e}")
 
     auto_name = _auto_filename(units_str, condition_units_str, clip_id, backward)
     if args.output is not None:
@@ -601,7 +907,13 @@ def run_one_task(
     target_vis = ((target_frames_tensor.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
     target_vis = target_vis.clamp(0, 255).byte().numpy()
     n_write = min(len(frames), target_vis.shape[0])
-    print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps)")
+
+    # Output: 2x2 composite if cam_attn_frames available, else [GT | Pred] side-by-side
+    composite_2x2 = cam_attn_frames is not None and len(cam_attn_frames) >= n_write
+    if composite_2x2:
+        print(f"Writing 2x2 composite: {out_path} ({n_write} frames @ {out_fps} fps)")
+    else:
+        print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps)")
     with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
         for i in range(n_write):
             pred = to_hwc_numpy(frames[i])
@@ -612,7 +924,16 @@ def run_one_task(
                 raise RuntimeError(
                     f"target/pred shape mismatch at frame {i}: {target.shape} vs {pred.shape}"
                 )
-            writer.append_data(np.concatenate([target, pred], axis=1))
+            if composite_2x2:
+                # 2x2 layout: GT | Pred / CamAttn | Overlay
+                heatmap = cam_attn_frames[i]
+                overlay = blend_heatmap_on_image(heatmap, pred, alpha_blend=0.4)
+                top_row = np.concatenate([target, pred], axis=1)
+                bottom_row = np.concatenate([heatmap, overlay], axis=1)
+                composite = np.concatenate([top_row, bottom_row], axis=0)
+                writer.append_data(composite)
+            else:
+                writer.append_data(np.concatenate([target, pred], axis=1))
 
 
 def to_hwc_numpy(frame) -> np.ndarray:
@@ -669,9 +990,14 @@ def main():
 
     if args.ckpt:
         sd = load_checkpoint(args.ckpt, device=device)
-        pipe.dit.load_state_dict(sd, strict=False)
+        missing, unexpected = pipe.dit.load_state_dict(sd, strict=False)
         pipe.dit.to(device=device, dtype=torch.bfloat16)
         print(f"Loaded DiT from {args.ckpt}")
+        cam_keys = [k for k in sd.keys() if "camera_cross_attn" in k]
+        if cam_keys:
+            print(f"  camera_cross_attn keys: {len(cam_keys)} loaded")
+        else:
+            print("  WARNING: No camera_cross_attn keys in checkpoint (using zero-init).")
     else:
         print("No --ckpt: using base Wan2.1 model only")
 
@@ -720,49 +1046,52 @@ def main():
     clip_id = _derive_clip_id(args.clip, args.source_video, args.source_images)
     out_fps = read_video_fps(source_video_path) if source_video_path is not None else DEFAULT_OUTPUT_FPS
 
-    # --- Load camera embedding (optional) ---
-    camera_embedding: Optional[torch.Tensor] = None
+    # --- Load camera (optional) → Plücker embedding ---
+    # Auto-detect camera from clip directory when --camera / --camera_preset are not given.
+    auto_camera: Optional[str] = None
+    if args.camera is None and args.camera_preset is None and args.clip is not None:
+        _clip_dir = Path(args.clip)
+        _meta = _clip_dir / "meta.json"
+        _npy_candidates = list(_clip_dir.glob("src_cam/*_extrinsics.npy"))
+        if _meta.is_file():
+            auto_camera = str(_meta)
+            print(f"[auto] Detected camera: {auto_camera}")
+        elif _npy_candidates:
+            auto_camera = str(_npy_candidates[0])
+            print(f"[auto] Detected camera: {auto_camera}")
+
+    # F_latent: number of latent frames (VAE temporal stride 4, but trajectory dependent)
+    # Use a conservative estimate here; the model handles variable F at runtime.
+    F_latent_est = (args.num_frames - 1) // WAN_TEMPORAL_STRIDE + 1
+
+    plucker_embedding: Optional[torch.Tensor] = None
+    _effective_camera = args.camera if args.camera is not None else auto_camera
     if args.camera is not None and args.camera_preset is not None:
         print("Warning: --camera and --camera_preset both specified; --camera takes precedence.")
-    if args.camera is not None:
-        cam_path = args.camera
+    if _effective_camera is not None:
+        cam_path = _effective_camera
         print(f"Loading camera from {cam_path}")
-        WAN_TEMPORAL_STRIDE = 4
-        if cam_path.endswith(".npy"):
-            camera_embedding = load_camera_from_npy(
-                cam_path,
-                sample_rate=WAN_TEMPORAL_STRIDE,
-                dtype=torch.float32,
+        c2w = _load_c2w_from_path(cam_path, args.num_frames, args.cam_type)
+        if c2w is not None:
+            plucker_embedding = _c2w_to_plucker(
+                c2w, args.height, args.width, args.num_frames, F_latent_est
             )
-        elif cam_path.endswith(".json"):
-            cam_type_idx = parse_cam_type(args.cam_type)
-            camera_embedding = load_camera_from_json(
-                cam_path,
-                cam_idx=cam_type_idx,
-                num_frames=args.num_frames,
-                sample_rate=WAN_TEMPORAL_STRIDE,
-                dtype=torch.float32,
-            )
+            plucker_embedding = plucker_embedding.to(device=device, dtype=torch.bfloat16)
+            print(f"Plücker embedding shape: {plucker_embedding.shape}")
         else:
-            # Try meta.json format
-            camera_embedding = load_camera_from_meta(
-                cam_path,
-                sample_rate=WAN_TEMPORAL_STRIDE,
-                dtype=torch.float32,
-            )
-        if camera_embedding is not None:
-            camera_embedding = camera_embedding.to(device=device, dtype=torch.bfloat16)
-            print(f"Camera embedding shape: {camera_embedding.shape}")
+            print("Warning: could not load c2w from camera file; using identity camera.")
     elif args.camera_preset is not None:
         print(f"Using preset camera: {args.camera_preset}  speed={args.camera_speed}")
-        camera_embedding = make_preset_camera(
+        c2w = make_preset_c2w(
             preset=args.camera_preset,
             num_frames=args.num_frames,
-            sample_rate=4,
             speed=args.camera_speed,
-            dtype=torch.float32,
-        ).to(device=device, dtype=torch.bfloat16)
-        print(f"Camera embedding shape: {camera_embedding.shape}")
+        )
+        plucker_embedding = _c2w_to_plucker(
+            c2w, args.height, args.width, args.num_frames, F_latent_est
+        )
+        plucker_embedding = plucker_embedding.to(device=device, dtype=torch.bfloat16)
+        print(f"Plücker embedding shape: {plucker_embedding.shape}")
     else:
         print("No --camera / --camera_preset: using identity camera (no camera motion control)")
 
@@ -784,7 +1113,8 @@ def main():
             clip_id=clip_id,
             out_fps=out_fps,
             fps=args.fps,
-            camera_embedding=camera_embedding,
+            plucker_embedding=plucker_embedding,
+            save_cam_attn=args.save_cam_attn,
         )
 
     print("\nDone.")

@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from torchvision.transforms import v2
 
-from utils.camera import _c2w_to_embedding, load_camera_from_meta
+from utils.camera import compute_plucker_pixel_resolution, timefold_plucker
 from utils.image import load_frames_using_imageio
 from utils.temporal_trajectory import (
     MAX_CONDITION_FRAMES,
@@ -172,44 +172,46 @@ class Wan4DDataset(torch.utils.data.Dataset):
         for i, idx in enumerate(latent_indices[:pad]):
             latent_idx_t[i] = idx
 
-        # --- Camera embedding (optional) ---
-        # Try loading from videos/{path}/meta.json (preferred) or
-        # src_cam/{stem}_extrinsics.npy (legacy fallback).
-        camera_embedding: Optional[torch.Tensor] = None
+        # --- Camera embedding: pixel-resolution Plücker time-folded for SimpleAdapter ---
         clip_path_str = clip["path"]
         meta_path = self.videos_dir / clip_path_str / "meta.json"
         npy_path = self.root / "src_cam" / (Path(clip_path_str).stem + "_extrinsics.npy")
-
-        try:
-            if meta_path.is_file():
-                cam_raw = load_camera_from_meta(
-                    str(meta_path),
-                    sample_rate=WAN_LATENT_TEMPORAL_STRIDE,
-                    dtype=torch.float32,
-                )
-                camera_embedding = cam_raw  # [T', 12]
-            elif npy_path.is_file():
-                cam_raw = _c2w_to_embedding(
-                    np.linalg.inv(np.load(str(npy_path))),
-                    sample_rate=WAN_LATENT_TEMPORAL_STRIDE,
-                    dtype=torch.float32,
-                )
-                camera_embedding = cam_raw  # [T', 12]
-        except Exception:
-            camera_embedding = None
-
-        # Trim / pad camera_embedding to match self._f_latent
         f_lat = self._f_latent
-        if camera_embedding is not None:
-            if camera_embedding.shape[0] < f_lat:
-                last = camera_embedding[-1:, :].expand(f_lat - camera_embedding.shape[0], -1)
-                camera_embedding = torch.cat([camera_embedding, last], dim=0)
-            elif camera_embedding.shape[0] > f_lat:
-                camera_embedding = camera_embedding[:f_lat, :]
+
+        c2w_raw = None
+        if meta_path.is_file():
+            with open(str(meta_path), "r") as _f:
+                _meta = json.load(_f)
+            c2w_raw = np.array(_meta["camera"]["extrinsics_c2w"], dtype=np.float32)
+        elif npy_path.is_file():
+            c2w_raw = np.linalg.inv(np.load(str(npy_path))).astype(np.float32)
+
+        if c2w_raw is not None:
+            # Normalize: relative to first frame, scale-normalize
+            ref_inv = np.linalg.inv(c2w_raw[0])
+            c2w_rel = ref_inv @ c2w_raw
+            scene_scale = float(np.max(np.abs(c2w_rel[:, :3, 3])))
+            if scene_scale < 1e-2:
+                scene_scale = 1.0
+            c2w_rel[:, :3, 3] /= scene_scale
+            # Trim/pad to num_frames
+            if len(c2w_rel) < self.num_frames:
+                last = c2w_rel[-1:]
+                c2w_rel = np.concatenate(
+                    [c2w_rel, np.tile(last, (self.num_frames - len(c2w_rel), 1, 1))], axis=0
+                )
+            else:
+                c2w_rel = c2w_rel[:self.num_frames]
         else:
-            # No camera data: use identity (zeros in embedding space).
-            # Zero cam_rope_proj + zero CameraEmbeddingAdapter last layer → no effect on model.
-            camera_embedding = torch.zeros(f_lat, 12, dtype=torch.float32)
+            c2w_rel = np.tile(np.eye(4, dtype=np.float32)[None], (self.num_frames, 1, 1))
+
+        # Compute Plücker at pixel resolution, then time-fold
+        plucker_raw = compute_plucker_pixel_resolution(
+            c2w_rel, self.height, self.width, dtype=torch.float32
+        )  # [F_pixel, H, W, 6]
+        plucker_embedding = timefold_plucker(
+            plucker_raw, f_lat, temporal_stride=WAN_LATENT_TEMPORAL_STRIDE
+        )  # [24, F_latent, H, W]
 
         return {
             "target_video": target_video,                       # [C, T, H, W]
@@ -217,7 +219,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
             "temporal_coords": temporal_coords,                 # [F_latent] float (seconds)
             "condition_pixel_indices": pixel_idx_t,             # [MAX_CONDITION_FRAMES] long, -1 padded
             "condition_latent_indices": latent_idx_t,           # [MAX_CONDITION_FRAMES] long, -1 padded
-            "camera_embedding": camera_embedding,               # [F_latent, 12] float
+            "plucker_embedding": plucker_embedding,             # [24, F_latent, H, W] float
         }
 
     def __getitem__(self, index):

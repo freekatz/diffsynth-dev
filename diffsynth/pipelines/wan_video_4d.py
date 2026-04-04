@@ -10,14 +10,14 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
             input_params=(
                 "num_frames", "height", "width", "tiled", "tile_size", "tile_stride"
             ),
-            output_params=("condition_latents", "condition_mask", "temporal_coords", "camera_embedding"),
+            output_params=("condition_latents", "condition_mask", "temporal_coords", "plucker_embedding"),
             onload_model_names=("vae",)
         )
 
     def process(self, pipe: WanVideoPipeline, num_frames, height, width, tiled, tile_size, tile_stride, **kwargs):
         temporal_coords = getattr(pipe, "_temp_temporal_coords", None)
-        camera_embedding = getattr(pipe, "_temp_camera_embedding", None)
-        output = {"temporal_coords": temporal_coords, "camera_embedding": camera_embedding}
+        plucker_embedding = getattr(pipe, "_temp_plucker_embedding", None)
+        output = {"temporal_coords": temporal_coords, "plucker_embedding": plucker_embedding}
 
         # Mode A: pre-computed condition tensors
         condition_latents = getattr(pipe, "_temp_condition_latents", None)
@@ -90,7 +90,7 @@ class WanVideoUnit_4DPromptContextOverride(PipelineUnit):
 def model_fn_wan4d_video(
     dit, latents, timestep, context, y=None, clip_feature=None,
     condition_latents=None, condition_mask=None, temporal_coords=None,
-    camera_embedding=None,
+    plucker_embedding=None,
     use_unified_sequence_parallel=False, use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
     **kwargs
@@ -102,34 +102,12 @@ def model_fn_wan4d_video(
         else:
             condition_latents = y
 
-    B = latents.shape[0]
-    if condition_latents is not None and condition_latents.shape[0] != B:
-        condition_latents = condition_latents.expand(B, -1, -1, -1, -1)
-    if condition_mask is not None and condition_mask.shape[0] != B:
-        condition_mask = condition_mask.expand(B, -1, -1, -1, -1)
-
-    if temporal_coords is not None:
-        if not isinstance(temporal_coords, torch.Tensor):
-            temporal_coords = torch.tensor(temporal_coords, dtype=latents.dtype, device=latents.device)
-        else:
-            temporal_coords = temporal_coords.to(device=latents.device, dtype=latents.dtype)
-        if temporal_coords.ndim == 1:
-            temporal_coords = temporal_coords.unsqueeze(0).expand(B, -1)
-
-    if camera_embedding is not None:
-        if not isinstance(camera_embedding, torch.Tensor):
-            camera_embedding = torch.tensor(camera_embedding, dtype=latents.dtype, device=latents.device)
-        else:
-            camera_embedding = camera_embedding.to(device=latents.device, dtype=latents.dtype)
-        if camera_embedding.ndim == 2:
-            camera_embedding = camera_embedding.unsqueeze(0).expand(B, -1, -1)
-
     x = dit(
         x=latents,
         timestep=timestep,
         context=context,
         temporal_coords=temporal_coords,
-        camera_embedding=camera_embedding,
+        plucker_embedding=plucker_embedding,
         clip_feature=clip_feature,
         condition_latents=condition_latents,
         condition_mask=condition_mask,
@@ -189,7 +167,7 @@ class Wan4DPipeline(WanVideoPipeline):
         condition_latents: Optional[torch.Tensor] = None,
         condition_mask: Optional[torch.Tensor] = None,
         temporal_coords: Optional[List[float]] = None,
-        camera_embedding: Optional[torch.Tensor] = None,
+        plucker_embedding: Optional[torch.Tensor] = None,
         prompt_context: Optional[torch.Tensor] = None,
         **kwargs
     ):
@@ -199,6 +177,6 @@ class Wan4DPipeline(WanVideoPipeline):
         self._temp_condition_latents = condition_latents
         self._temp_condition_mask = condition_mask
         self._temp_temporal_coords = temporal_coords
-        self._temp_camera_embedding = camera_embedding
+        self._temp_plucker_embedding = plucker_embedding
         self._temp_prompt_context = prompt_context
         return super().__call__(*args, **kwargs)

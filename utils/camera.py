@@ -162,6 +162,130 @@ def load_camera_from_meta(
 
 
 # ---------------------------------------------------------------------------
+# Plücker ray embedding from c2w matrices
+# ---------------------------------------------------------------------------
+
+def compute_plucker_from_c2w(
+    c2w: np.ndarray,
+    H: int,
+    W: int,
+    fx: float = 0.5,
+    fy: float = 0.5,
+    cx: float = 0.5,
+    cy: float = 0.5,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Compute Plücker ray embeddings from camera-to-world matrices.
+
+    Delegates to ``ray_condition`` from wan_video_camera_controller, which
+    implements the same (rays_o × rays_d, rays_d) formula using PyTorch.
+
+    Args:
+        c2w: Camera-to-world matrices [F, 4, 4], already relative to the
+             first frame.
+        H: Spatial height of the target feature map (e.g. token height H//16).
+        W: Spatial width of the target feature map.
+        fx, fy: Normalised focal lengths (fraction of image width/height).
+                Default 0.5 ≈ 90° horizontal FoV.
+        cx, cy: Normalised principal point offset. Default 0.5 (image centre).
+        dtype: Output tensor dtype.
+
+    Returns:
+        Plücker embeddings [F, H, W, 6].
+            Channels: [moment_x, moment_y, moment_z, dir_x, dir_y, dir_z]
+    """
+    from diffsynth.models.wan_video_camera_controller import ray_condition
+
+    F = c2w.shape[0]
+    # Convert normalised intrinsics to pixel units at target resolution
+    K = torch.tensor(
+        [[fx * W, fy * H, cx * W, cy * H]],
+        dtype=torch.float32,
+    ).unsqueeze(1).expand(1, F, 4)  # [1, F, 4]
+
+    c2w_t = torch.as_tensor(c2w, dtype=torch.float32).unsqueeze(0)  # [1, F, 4, 4]
+
+    # ray_condition returns [B, F, H, W, 6]
+    plucker = ray_condition(K, c2w_t, H, W, device="cpu")[0]  # [F, H, W, 6]
+    return plucker.to(dtype=dtype)
+
+
+def compute_plucker_pixel_resolution(
+    c2w: np.ndarray,
+    H: int,
+    W: int,
+    fx: float = 0.5,
+    fy: float = 0.5,
+    cx: float = 0.5,
+    cy: float = 0.5,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Compute Plücker embeddings at pixel resolution.
+
+    Args:
+        c2w: Camera-to-world matrices [F, 4, 4], already relative to first frame.
+        H: Pixel height (full resolution).
+        W: Pixel width (full resolution).
+        fx, fy, cx, cy: Normalized intrinsics.
+        dtype: Output dtype.
+
+    Returns:
+        Plücker embeddings [F, H, W, 6] at full pixel resolution.
+    """
+    from diffsynth.models.wan_video_camera_controller import ray_condition
+
+    F = c2w.shape[0]
+    K = torch.tensor(
+        [[fx * W, fy * H, cx * W, cy * H]], dtype=torch.float32
+    ).unsqueeze(1).expand(1, F, 4)
+    c2w_t = torch.as_tensor(c2w, dtype=torch.float32).unsqueeze(0)
+    plucker = ray_condition(K, c2w_t, H, W, device="cpu")[0]  # [F, H, W, 6]
+    return plucker.to(dtype=dtype)
+
+
+def timefold_plucker(
+    plucker: torch.Tensor,
+    f_latent: int,
+    temporal_stride: int = 4,
+) -> torch.Tensor:
+    """Time-fold Plücker embeddings for SimpleAdapter input.
+
+    Converts pixel-temporal Plücker to SimpleAdapter's expected format:
+    [F_pixel, H, W, 6] → [24, F_latent, H, W]
+
+    The folding replicates the first frame 4x (to align with VAE causal conv),
+    then groups every 4 frames into 24 channels (6 Plücker × 4 temporal).
+
+    Args:
+        plucker: Raw Plücker [F_pixel, H, W, 6].
+        f_latent: Target latent temporal dimension.
+        temporal_stride: Temporal downsampling factor (default 4).
+
+    Returns:
+        Time-folded Plücker [24, F_latent, H, W].
+    """
+    # plucker: [F_pixel, H, W, 6] → [6, F_pixel, H, W]
+    plucker = plucker.permute(3, 0, 1, 2)
+
+    # Replicate first frame 4x, append rest: [6, F_pixel+3, H, W]
+    first_frame = plucker[:, 0:1].expand(-1, temporal_stride - 1, -1, -1)
+    plucker = torch.cat([plucker[:, 0:1], first_frame, plucker[:, 1:]], dim=1)
+
+    # Sample at stride and reshape: [6, F_pixel+3, H, W] → [24, F_latent, H, W]
+    f_total = plucker.shape[1]
+    # Ensure we have enough frames
+    while f_total < f_latent * temporal_stride:
+        plucker = torch.cat([plucker, plucker[:, -1:]], dim=1)
+        f_total = plucker.shape[1]
+
+    # Reshape: [6, F_total, H, W] → [6, F_latent, 4, H, W] → [24, F_latent, H, W]
+    c, _, h, w = plucker.shape
+    plucker = plucker[:, :f_latent * temporal_stride].view(c, f_latent, temporal_stride, h, w)
+    plucker = plucker.permute(0, 2, 1, 3, 4).reshape(c * temporal_stride, f_latent, h, w)
+    return plucker
+
+
+# ---------------------------------------------------------------------------
 # Preset camera trajectory generator
 # ---------------------------------------------------------------------------
 
@@ -177,6 +301,22 @@ _PRESET_AXES: dict[str, tuple[int, int]] = {
 }
 
 CAMERA_PRESETS = list(_PRESET_AXES.keys())
+
+
+def make_preset_c2w(
+    preset: str,
+    num_frames: int = 81,
+    speed: float = 0.02,
+) -> np.ndarray:
+    """Return raw c2w [num_frames, 4, 4] for a named preset trajectory (not normalised)."""
+    preset = preset.lower().strip()
+    if preset not in _PRESET_AXES:
+        raise ValueError(f"Unknown camera preset {preset!r}. Choose from: {', '.join(CAMERA_PRESETS)}")
+    axis, sign = _PRESET_AXES[preset]
+    c2w = np.tile(np.eye(4, dtype=np.float32)[np.newaxis], (num_frames, 1, 1))
+    for i in range(num_frames):
+        c2w[i, axis, 3] = sign * speed * i
+    return c2w
 
 
 def make_preset_camera(
