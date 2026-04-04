@@ -807,7 +807,7 @@ def run_one_task(
     clip_id: str,
     out_fps: float,
     fps: float = 24.0,
-    plucker_embedding: Optional[torch.Tensor] = None,
+    c2w: Optional[np.ndarray] = None,
     save_cam_attn: bool = False,
 ):
     try:
@@ -826,8 +826,11 @@ def run_one_task(
         condition_unit_indices=condition_unit_indices,
         fps=fps,
     )
-    temporal_coords = pixel_to_latent_temporal_coords(result.temporal_coords, args.num_frames)
-    F_latent = len(temporal_coords)
+    temporal_coords = torch.tensor(
+        pixel_to_latent_temporal_coords(result.temporal_coords, args.num_frames),
+        dtype=torch.float32,
+    ).unsqueeze(0)
+    F_latent = temporal_coords.shape[1]
     print(f"Trajectory: {result.trajectory_type} ({args.num_frames} frames @ {fps}fps)")
     print(f"Condition frames: {result.condition_frame_indices}")
 
@@ -839,6 +842,19 @@ def run_one_task(
         src_idx = round(p * fps)
         src_idx = max(0, min(src_idx, max_frame))
         target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
+
+    # Remap camera trajectory to match temporal trajectory
+    plucker_embedding: Optional[torch.Tensor] = None
+    if c2w is not None:
+        c2w_remapped = np.empty((args.num_frames, 4, 4), dtype=np.float32)
+        c2w_max = len(c2w) - 1
+        for i, p in enumerate(result.temporal_coords):
+            src_idx = round(p * fps)
+            src_idx = max(0, min(src_idx, c2w_max))
+            c2w_remapped[i] = c2w[src_idx]
+        plucker_embedding = _c2w_to_plucker(
+            c2w_remapped, args.height, args.width, args.num_frames, F_latent
+        ).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
 
     tile_size = (34, 34)
     tile_stride = (18, 16)
@@ -1060,11 +1076,7 @@ def main():
             auto_camera = str(_npy_candidates[0])
             print(f"[auto] Detected camera: {auto_camera}")
 
-    # F_latent: number of latent frames (VAE temporal stride 4, but trajectory dependent)
-    # Use a conservative estimate here; the model handles variable F at runtime.
-    F_latent_est = (args.num_frames - 1) // WAN_TEMPORAL_STRIDE + 1
-
-    plucker_embedding: Optional[torch.Tensor] = None
+    c2w: Optional[np.ndarray] = None
     _effective_camera = args.camera if args.camera is not None else auto_camera
     if args.camera is not None and args.camera_preset is not None:
         print("Warning: --camera and --camera_preset both specified; --camera takes precedence.")
@@ -1072,14 +1084,10 @@ def main():
         cam_path = _effective_camera
         print(f"Loading camera from {cam_path}")
         c2w = _load_c2w_from_path(cam_path, args.num_frames, args.cam_type)
-        if c2w is not None:
-            plucker_embedding = _c2w_to_plucker(
-                c2w, args.height, args.width, args.num_frames, F_latent_est
-            )
-            plucker_embedding = plucker_embedding.to(device=device, dtype=torch.bfloat16)
-            print(f"Plücker embedding shape: {plucker_embedding.shape}")
-        else:
+        if c2w is None:
             print("Warning: could not load c2w from camera file; using identity camera.")
+        else:
+            print(f"Loaded c2w shape: {c2w.shape}")
     elif args.camera_preset is not None:
         print(f"Using preset camera: {args.camera_preset}  speed={args.camera_speed}")
         c2w = make_preset_c2w(
@@ -1087,11 +1095,6 @@ def main():
             num_frames=args.num_frames,
             speed=args.camera_speed,
         )
-        plucker_embedding = _c2w_to_plucker(
-            c2w, args.height, args.width, args.num_frames, F_latent_est
-        )
-        plucker_embedding = plucker_embedding.to(device=device, dtype=torch.bfloat16)
-        print(f"Plücker embedding shape: {plucker_embedding.shape}")
     else:
         print("No --camera / --camera_preset: using identity camera (no camera motion control)")
 
@@ -1113,7 +1116,7 @@ def main():
             clip_id=clip_id,
             out_fps=out_fps,
             fps=args.fps,
-            plucker_embedding=plucker_embedding,
+            c2w=c2w,
             save_cam_attn=args.save_cam_attn,
         )
 

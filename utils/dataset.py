@@ -205,9 +205,17 @@ class Wan4DDataset(torch.utils.data.Dataset):
         else:
             c2w_rel = np.tile(np.eye(4, dtype=np.float32)[None], (self.num_frames, 1, 1))
 
+        # Remap camera trajectory to match temporal trajectory (same as video frames)
+        c2w_remapped = np.empty((self.num_frames, 4, 4), dtype=np.float32)
+        c2w_max = len(c2w_rel) - 1
+        for i, p in enumerate(result.temporal_coords):
+            src_idx = round(p * self.fps)
+            src_idx = max(0, min(src_idx, c2w_max))
+            c2w_remapped[i] = c2w_rel[src_idx]
+
         # Compute Plücker at pixel resolution, then time-fold
         plucker_raw = compute_plucker_pixel_resolution(
-            c2w_rel, self.height, self.width, dtype=torch.float32
+            c2w_remapped, self.height, self.width, dtype=torch.float32
         )  # [F_pixel, H, W, 6]
         plucker_embedding = timefold_plucker(
             plucker_raw, f_lat, temporal_stride=WAN_LATENT_TEMPORAL_STRIDE
