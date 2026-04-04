@@ -1,4 +1,4 @@
-"""Wan4D Dataset for training with new index.json format.
+"""Wan4D multi-view dataset for training with index.json format.
 
 This dataset class follows the structure defined in docs/dataset-structure.md.
 
@@ -8,9 +8,15 @@ Usage::
     ds = Wan4DDataset('./data', steps_per_epoch=500, height=480, width=832)
     batch = ds[0]
 
-The dataset loads raw source videos and remaps frames in pixel space according
-to a randomly generated temporal trajectory, returning pixel tensors for
-online VAE encoding in the training loop.
+Every clip directory contains ``camera_{i}.mp4`` files (≥2 views) and a
+``meta.json`` with per-camera extrinsics.  The dataset loads raw source
+videos and remaps frames in pixel space according to a randomly generated
+temporal trajectory.
+
+Returns per sample:
+- ``target_video``: ``[V, C, T, H, W]`` — per-view GT videos
+- ``condition_video``: ``[C, T, H, W]`` — anchor view sparse condition
+- ``plucker_embedding``: ``[V, 24, F, H, W]`` — per-view Plücker
 """
 
 import json
@@ -22,7 +28,10 @@ import numpy as np
 import torch
 from torchvision.transforms import v2
 
-from utils.camera import compute_plucker_pixel_resolution, timefold_plucker
+from utils.camera import (
+    compute_plucker_pixel_resolution,
+    timefold_plucker,
+)
 from utils.image import load_frames_using_imageio
 from utils.temporal_trajectory import (
     MAX_CONDITION_FRAMES,
@@ -33,15 +42,10 @@ from utils.temporal_trajectory import (
 
 
 class Wan4DDataset(torch.utils.data.Dataset):
-    """Dataset for Wan4D training with index.json format.
+    """Multi-view dataset for Wan4D training.
 
-    Each sample loads:
-    - Source video pixels from videos/{path}/video.mp4
-    - Caption embedding from caption_latents/{hash}.pt
-    - Target video derived by remapping source pixels via a random temporal trajectory
-    - Condition frame indices (arbitrary pixel positions) for online VAE encoding
-
-    No pre-cached video latent files are required.
+    Each clip has ≥2 ``camera_{i}.mp4`` files + ``meta.json``.
+    Returns V target videos, 1 shared condition video (anchor), V Plücker embeddings.
     """
 
     _GETITEM_MAX_TRIES = 20
@@ -56,6 +60,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
         width=832,
         seed=42,
         split: Optional[str] = None,
+        num_views: int = 2,
     ):
         """Initialize dataset.
 
@@ -68,6 +73,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
             width: Video width for loading and cropping (default 832).
             seed: Random seed for reproducibility.
             split: If set, keep only clips with this ``split`` field (e.g. ``train``).
+            num_views: Number of views per sample (1=single-view, 2=multi-view).
         """
         self.root = Path(dataset_root)
         index_file = Path(index_path) if index_path else self.root / "index.json"
@@ -91,6 +97,7 @@ class Wan4DDataset(torch.utils.data.Dataset):
         self.base_seed = seed
         self.seed = seed
         self.rng = random.Random(seed)
+        self.num_views = num_views
 
         # fps from index.json config (fallback to 24)
         self.fps = float(self.config.get("fps", 24.0))
@@ -122,9 +129,23 @@ class Wan4DDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.steps_per_epoch
 
-    def _load_sample(self, clip):
-        """Load one training sample with pixel-space frame remapping."""
-        video_path = self.videos_dir / clip["path"] / "video.mp4"
+    # ------------------------------------------------------------------
+    # Per-view loader
+    # ------------------------------------------------------------------
+
+    def _load_view(self, clip_dir, meta, cam_name, temporal_coords_seconds):
+        """Load one camera view: video + Plücker embedding, remapped by trajectory.
+
+        Args:
+            clip_dir: Path to the clip directory.
+            meta: Parsed meta.json dict.
+            cam_name: Camera name (e.g. ``"camera_0"``).
+            temporal_coords_seconds: List of absolute times (seconds) from trajectory.
+
+        Returns:
+            (target_video, plucker_embedding) tuple.
+        """
+        video_path = clip_dir / f"{cam_name}.mp4"
         source_video = load_frames_using_imageio(
             str(video_path),
             num_frames=self.num_frames,
@@ -135,8 +156,91 @@ class Wan4DDataset(torch.utils.data.Dataset):
         )
         if source_video is None:
             raise RuntimeError(
-                f"clip={clip['path']}: video has fewer than {self.num_frames} frames"
+                f"{video_path}: video has fewer than {self.num_frames} frames"
             )
+
+        # Remap video frames according to trajectory
+        target_video = torch.empty_like(source_video)
+        max_frame = self.num_frames - 1
+        for i, p in enumerate(temporal_coords_seconds):
+            src_idx = round(p * self.fps)
+            src_idx = max(0, min(src_idx, max_frame))
+            target_video[:, i] = source_video[:, src_idx]
+
+        # Load camera c2w from meta.json
+        c2w_raw = np.array(
+            meta["camera_extrinsics_c2w"][cam_name], dtype=np.float32
+        )
+
+        # Normalize: relative to first frame, scale-normalize
+        ref_inv = np.linalg.inv(c2w_raw[0])
+        c2w_rel = ref_inv @ c2w_raw
+        scene_scale = float(np.max(np.abs(c2w_rel[:, :3, 3])))
+        if scene_scale < 1e-2:
+            scene_scale = 1.0
+        c2w_rel[:, :3, 3] /= scene_scale
+
+        # Trim/pad to num_frames
+        if len(c2w_rel) < self.num_frames:
+            last = c2w_rel[-1:]
+            c2w_rel = np.concatenate(
+                [c2w_rel, np.tile(last, (self.num_frames - len(c2w_rel), 1, 1))],
+                axis=0,
+            )
+        else:
+            c2w_rel = c2w_rel[: self.num_frames]
+
+        # Remap camera to match temporal trajectory
+        c2w_remapped = np.empty((self.num_frames, 4, 4), dtype=np.float32)
+        c2w_max = len(c2w_rel) - 1
+        for i, p in enumerate(temporal_coords_seconds):
+            src_idx = round(p * self.fps)
+            src_idx = max(0, min(src_idx, c2w_max))
+            c2w_remapped[i] = c2w_rel[src_idx]
+
+        # Compute Plücker at pixel resolution, then time-fold
+        plucker_raw = compute_plucker_pixel_resolution(
+            c2w_remapped, self.height, self.width, dtype=torch.float32
+        )
+        plucker_emb = timefold_plucker(
+            plucker_raw, self._f_latent, temporal_stride=WAN_LATENT_TEMPORAL_STRIDE
+        )
+
+        return target_video, plucker_emb
+
+    # ------------------------------------------------------------------
+    # Sample loading (unified for single-view and multi-view)
+    # ------------------------------------------------------------------
+
+    def _load_sample(self, clip):
+        """Load one multi-view training sample.
+
+        Samples a shared trajectory, loads V camera views, and builds a
+        sparse condition video from the anchor (first selected) view.
+        """
+        clip_dir = self.videos_dir / clip["path"]
+        meta_path = clip_dir / "meta.json"
+
+        with open(str(meta_path), "r") as f:
+            meta = json.load(f)
+
+        cameras = meta["cameras"]
+        selected_cams = self.rng.sample(cameras, min(self.num_views, len(cameras)))
+
+        # --- Shared across views ---
+
+        result = sample_training_trajectory(
+            num_frames=self.num_frames, rng=self.rng, fps=self.fps,
+        )
+        latent_coords = pixel_to_latent_temporal_coords(
+            result.temporal_coords, self.num_frames,
+        )
+        temporal_coords = torch.tensor(latent_coords, dtype=torch.float32)
+
+        pad = MAX_CONDITION_FRAMES
+        latent_idx_t = torch.full((pad,), -1, dtype=torch.long)
+        for i, idx in enumerate(result.condition_latent_indices[:pad]):
+            latent_idx_t[i] = idx
 
         cap_hash = clip["caption_hash"]
         text_data = torch.load(
@@ -145,89 +249,32 @@ class Wan4DDataset(torch.utils.data.Dataset):
         )
         prompt_context = text_data["text_embeds"].detach()
 
-        result = sample_training_trajectory(num_frames=self.num_frames, rng=self.rng, fps=self.fps)
+        # --- Per-view ---
 
-        target_video = torch.empty_like(source_video)
-        max_frame = self.num_frames - 1
-        for i, p in enumerate(result.temporal_coords):
-            # p is absolute time in seconds; p * fps gives the source pixel frame index.
-            # E.g. p=1.0s at fps=24 → src_idx=24 (i.e. the 25th frame).
-            src_idx = round(p * self.fps)
-            src_idx = max(0, min(src_idx, max_frame))
-            target_video[:, i] = source_video[:, src_idx]
+        targets = []
+        pluckers = []
+        for cam_name in selected_cams:
+            target_video, plucker_emb = self._load_view(
+                clip_dir, meta, cam_name, result.temporal_coords,
+            )
+            targets.append(target_video)
+            pluckers.append(plucker_emb)
 
-        latent_coords = pixel_to_latent_temporal_coords(result.temporal_coords, self.num_frames)
-        temporal_coords = torch.tensor(latent_coords, dtype=torch.float32)
+        # --- Condition: sparse anchor view (only condition frame pixels) ---
 
-        pad = MAX_CONDITION_FRAMES
-        pixel_indices = result.condition_frame_indices
-        latent_indices = result.condition_latent_indices
-
-        pixel_idx_t = torch.full((pad,), -1, dtype=torch.long)
-        for i, idx in enumerate(pixel_indices[:pad]):
-            pixel_idx_t[i] = idx
-
-        # latent_indices may be shorter than pixel_indices (multiple pixels → same latent)
-        latent_idx_t = torch.full((pad,), -1, dtype=torch.long)
-        for i, idx in enumerate(latent_indices[:pad]):
-            latent_idx_t[i] = idx
-
-        # --- Camera embedding: pixel-resolution Plücker time-folded for SimpleAdapter ---
-        clip_path_str = clip["path"]
-        meta_path = self.videos_dir / clip_path_str / "meta.json"
-        npy_path = self.root / "src_cam" / (Path(clip_path_str).stem + "_extrinsics.npy")
-        f_lat = self._f_latent
-
-        c2w_raw = None
-        if meta_path.is_file():
-            with open(str(meta_path), "r") as _f:
-                _meta = json.load(_f)
-            c2w_raw = np.array(_meta["camera"]["extrinsics_c2w"], dtype=np.float32)
-        elif npy_path.is_file():
-            c2w_raw = np.linalg.inv(np.load(str(npy_path))).astype(np.float32)
-
-        if c2w_raw is not None:
-            # Normalize: relative to first frame, scale-normalize
-            ref_inv = np.linalg.inv(c2w_raw[0])
-            c2w_rel = ref_inv @ c2w_raw
-            scene_scale = float(np.max(np.abs(c2w_rel[:, :3, 3])))
-            if scene_scale < 1e-2:
-                scene_scale = 1.0
-            c2w_rel[:, :3, 3] /= scene_scale
-            # Trim/pad to num_frames
-            if len(c2w_rel) < self.num_frames:
-                last = c2w_rel[-1:]
-                c2w_rel = np.concatenate(
-                    [c2w_rel, np.tile(last, (self.num_frames - len(c2w_rel), 1, 1))], axis=0
-                )
-            else:
-                c2w_rel = c2w_rel[:self.num_frames]
-        else:
-            c2w_rel = np.tile(np.eye(4, dtype=np.float32)[None], (self.num_frames, 1, 1))
-
-        # Remap camera trajectory to match temporal trajectory (same as video frames)
-        c2w_remapped = np.empty((self.num_frames, 4, 4), dtype=np.float32)
-        c2w_max = len(c2w_rel) - 1
-        for i, p in enumerate(result.temporal_coords):
-            src_idx = round(p * self.fps)
-            src_idx = max(0, min(src_idx, c2w_max))
-            c2w_remapped[i] = c2w_rel[src_idx]
-
-        # Compute Plücker at pixel resolution, then time-fold
-        plucker_raw = compute_plucker_pixel_resolution(
-            c2w_remapped, self.height, self.width, dtype=torch.float32
-        )  # [F_pixel, H, W, 6]
-        plucker_embedding = timefold_plucker(
-            plucker_raw, f_lat, temporal_stride=WAN_LATENT_TEMPORAL_STRIDE
-        )  # [24, F_latent, H, W]
+        anchor_video = targets[0]
+        condition_video = torch.zeros_like(anchor_video)
+        for idx in result.condition_frame_indices[:MAX_CONDITION_FRAMES]:
+            condition_video[:, idx] = anchor_video[:, idx]
 
         return {
-            "target_video": target_video,                       # [C, T, H, W]
-            "prompt_context": prompt_context,                   # text embedding
-            "temporal_coords": temporal_coords,                 # [F_latent] float (seconds)
-            "condition_pixel_indices": pixel_idx_t,             # [MAX_CONDITION_FRAMES] long, -1 padded
-            "condition_latent_indices": latent_idx_t,           # [MAX_CONDITION_FRAMES] long, -1 padded
-            "plucker_embedding": plucker_embedding,             # [24, F_latent, H, W] float
+            "target_video": torch.stack(targets, dim=0),       # [V, C, T, H, W]
+            "condition_video": condition_video,                 # [C, T, H, W]
+            "prompt_context": prompt_context,
+            "temporal_coords": temporal_coords,
+            "condition_latent_indices": latent_idx_t,
+            "plucker_embedding": torch.stack(pluckers, dim=0), # [V, 24, F, H, W]
+            "num_views": len(selected_cams),
         }
 
     def __getitem__(self, index):

@@ -358,3 +358,56 @@ def make_preset_camera(
         c2w[i, axis, 3] = sign * speed * i
 
     return _c2w_to_embedding(c2w, sample_rate, scene_scale_threshold, dtype)
+
+
+# ---------------------------------------------------------------------------
+# Multi-view camera extrinsics helpers
+# ---------------------------------------------------------------------------
+
+def list_available_cameras(json_path: str) -> list[str]:
+    """Return sorted list of camera IDs from a SynCamMaster-format extrinsics JSON.
+
+    Reads ``frame0`` keys like ``"cam01"``, ``"cam02"``, etc.
+    """
+    with open(json_path, "r") as f:
+        data = json.load(f)
+    first_frame = data.get("frame0", {})
+    return sorted(first_frame.keys())
+
+
+def parse_camera_extrinsics_json(
+    json_path: str,
+    cam_id: str,
+    num_frames: int = 81,
+) -> np.ndarray:
+    """Load per-frame c2w from a SynCamMaster-format camera_extrinsics.json.
+
+    The JSON has ``frame0..frameN`` keys, each containing per-camera extrinsic
+    matrices as bracket-delimited strings (column-major 4x4).  This function
+    parses them and returns c2w matrices in row-major format.
+
+    Args:
+        json_path: Path to ``camera_extrinsics.json``.
+        cam_id: Camera identifier, e.g. ``"cam01"``.
+        num_frames: Number of frames to extract (0-indexed).
+
+    Returns:
+        ``[num_frames, 4, 4]`` c2w float32 array.
+    """
+    with open(json_path, "r") as f:
+        data = json.load(f)
+
+    c2w_list = []
+    for i in range(num_frames):
+        key = f"frame{i}"
+        if key not in data or cam_id not in data[key]:
+            if c2w_list:
+                c2w_list.append(c2w_list[-1].copy())
+            else:
+                c2w_list.append(np.eye(4, dtype=np.float32))
+            continue
+        mat = parse_matrix(data[key][cam_id])  # [4, 4] column-major
+        c2w = mat.T.astype(np.float32)  # transpose to row-major c2w
+        c2w_list.append(c2w)
+
+    return np.stack(c2w_list, axis=0)

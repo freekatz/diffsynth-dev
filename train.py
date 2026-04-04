@@ -63,6 +63,7 @@ _TRAINABLE_SUBSTR = (
     "patch_embedding",
     "camera_adapter",          # camera motion via SimpleAdapter
     "self_attn",
+    "mvs_blocks",              # multi-view synchronization
 )
 
 
@@ -126,7 +127,7 @@ class Wan4DTrainModule(pl.LightningModule):
         num_frames=NUM_FRAMES,
         height=480,
         width=832,
-        loss_mask_condition=True,
+        loss_mask_condition=False,
         vae_tiled=False,
         vae_tile_size=(34, 34),
         vae_tile_stride=(18, 16),
@@ -168,78 +169,64 @@ class Wan4DTrainModule(pl.LightningModule):
 
     def _batch_to_model_device(self, batch):
         dt = self.pipe.torch_dtype
+        num_views = int(batch.get("num_views", torch.tensor(2)).item())
+
+        # target: [B, V, C, T, H, W] → [B*V, C, T, H, W]
+        target_video = batch["target_video"].to(self.device, dtype=dt).flatten(0, 1)
+
+        # condition: [B, C, T, H, W] (anchor only, shared across views)
+        condition_video = batch["condition_video"].to(self.device, dtype=dt)
+
+        # shared → repeat for all views
         context = batch["prompt_context"].to(self.device, dtype=dt)
         if context.ndim == 4 and context.shape[1] == 1:
             context = context.squeeze(1)
+        context = context.repeat_interleave(num_views, dim=0)
 
         temporal_coords = batch.get("temporal_coords")
         if temporal_coords is not None:
             temporal_coords = temporal_coords.to(self.device, dtype=dt)
+            temporal_coords = temporal_coords.repeat_interleave(num_views, dim=0)
 
+        # plucker: [B, V, 24, F, H, W] → [B*V, 24, F, H, W]
         plucker_embedding = batch.get("plucker_embedding")
         if plucker_embedding is not None:
-            plucker_embedding = plucker_embedding.to(self.device, dtype=dt)
+            plucker_embedding = plucker_embedding.to(self.device, dtype=dt).flatten(0, 1)
 
-        # Condition frame indices from dataset (padded with -1)
-        cond_pixel_indices = batch["condition_pixel_indices"]   # [B, MAX_COND_FRAMES] long
-        cond_latent_indices = batch["condition_latent_indices"]  # [B, MAX_COND_FRAMES] long
+        vae_kw = dict(
+            device=self.device,
+            tiled=bool(self.hparams.vae_tiled),
+            tile_size=tuple(self.hparams.vae_tile_size),
+            tile_stride=tuple(self.hparams.vae_tile_stride),
+        )
 
-        target_video = batch["target_video"].to(self.device, dtype=dt)  # [B, C, T, H, W]
-        vae_tiled = bool(self.hparams.vae_tiled)
-        vae_tile_size = tuple(self.hparams.vae_tile_size)
-        vae_tile_stride = tuple(self.hparams.vae_tile_stride)
-
-        B, C, T, H, W = target_video.shape
+        B_orig = condition_video.shape[0]
+        _, C, T, H, W = target_video.shape
         F_latent = (T - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
         H_l, W_l = H // 8, W // 8
 
         with torch.no_grad():
-            target_latent = self.pipe.vae.encode(
-                target_video,
-                device=self.device,
-                tiled=vae_tiled,
-                tile_size=vae_tile_size,
-                tile_stride=vae_tile_stride,
-            )
+            # target: encode all views
+            target_latent = self.pipe.vae.encode(target_video, **vae_kw)
 
-            cond_video = torch.zeros_like(target_video)
-            pixel_mask = torch.zeros(B, T, H_l, W_l, dtype=dt, device=self.device)
+            # condition: encode once (B_orig), model will repeat internally
+            condition_latent = self.pipe.vae.encode(condition_video, **vae_kw)
 
-            for b in range(B):
-                for k in range(cond_pixel_indices.shape[1]):
-                    idx = cond_pixel_indices[b, k].item()
-                    if idx < 0:
-                        break
-                    cond_video[b, :, idx] = target_video[b, :, idx]
-                    pixel_mask[b, idx] = 1.0
-
-            condition_latent = self.pipe.vae.encode(
-                cond_video,
-                device=self.device,
-                tiled=vae_tiled,
-                tile_size=vae_tile_size,
-                tile_stride=vae_tile_stride,
-            )
-
+            # condition_mask: derive from non-zero pixels in condition_video
+            pixel_mask = (condition_video.abs().sum(dim=1) > 0).float()  # [B_orig, T, H, W]
+            pixel_mask = F.adaptive_avg_pool2d(
+                pixel_mask.view(B_orig * T, 1, H, W), (H_l, W_l),
+            ).view(B_orig, T, H_l, W_l)
+            pixel_mask = (pixel_mask > 0.5).to(dt)
             mask_folded = torch.cat([
                 pixel_mask[:, 0:1].expand(-1, 4, -1, -1),
                 pixel_mask[:, 1:],
             ], dim=1)
-            condition_mask = mask_folded.view(B, F_latent, 4, H_l, W_l).permute(0, 2, 1, 3, 4).contiguous()
+            condition_mask = mask_folded.view(B_orig, F_latent, 4, H_l, W_l).permute(0, 2, 1, 3, 4).contiguous()
 
-            loss_mask = torch.ones(B, 1, F_latent, 1, 1, dtype=torch.float32, device=self.device)
-            if bool(self.hparams.loss_mask_condition):
-                for b in range(B):
-                    for k in range(cond_latent_indices.shape[1]):
-                        li = cond_latent_indices[b, k].item()
-                        if li < 0:
-                            break
-                        if 0 <= li < F_latent:
-                            loss_mask[b, 0, li, 0, 0] = 0.0
+        return target_latent, condition_latent, condition_mask, context, temporal_coords, plucker_embedding, num_views
 
-        return target_latent, condition_latent, condition_mask, context, temporal_coords, plucker_embedding, loss_mask
-
-    def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, loss_mask):
+    def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, num_views=2):
         noise = torch.randn_like(target_latents)
         timestep_id = torch.randint(
             0, self.pipe.scheduler.num_train_timesteps, (1,), device="cpu"
@@ -261,11 +248,9 @@ class Wan4DTrainModule(pl.LightningModule):
             condition_mask=condition_mask,
             use_gradient_checkpointing=self.hparams.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.hparams.use_gradient_checkpointing_offload,
+            num_views=num_views,
         )
-        per_element = F.mse_loss(pred.float(), target.float(), reduction="none")
-        masked = per_element * loss_mask.to(per_element.device, per_element.dtype)
-        valid_elements = loss_mask.sum() * pred.shape[1] * pred.shape[3] * pred.shape[4]
-        loss = masked.sum() / valid_elements.clamp(min=1.0)
+        loss = F.mse_loss(pred.float(), target.float())
         w = self.pipe.scheduler.training_weight(
             t_scalar.to(self.pipe.scheduler.timesteps.device)
         )
@@ -276,8 +261,8 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss * w
 
     def training_step(self, batch, batch_idx):
-        target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, loss_mask = self._batch_to_model_device(batch)
-        loss = self._diffusion_loss(target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, loss_mask)
+        target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, num_views = self._batch_to_model_device(batch)
+        loss = self._diffusion_loss(target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding, num_views)
 
         every = int(self.hparams.log_metrics_every)
         if self.global_step % every == 0:
@@ -416,6 +401,8 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         help="Zero-out loss at condition latent frame positions (default: True).",
     )
+    p.add_argument("--num_views", type=int, default=2,
+                   help="Number of camera views per sample.")
     p.add_argument("--dataloader_num_workers", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=WAN21_T2V_13B_LR)
     p.add_argument("--weight_decay", type=float, default=WAN21_T2V_13B_WEIGHT_DECAY)
@@ -517,15 +504,17 @@ def main():
         width=args.width,
         seed=args.seed,
         split=args.split,
+        num_views=args.num_views,
     )
     if _is_rank_zero():
         log.info(
-            "dataset_root=%s index=%s clips=%d steps_per_epoch=%d split=%s",
+            "dataset_root=%s index=%s clips=%d steps_per_epoch=%d split=%s num_views=%d",
             dataset_root,
             index_path,
             len(ds.clips),
             ds.steps_per_epoch,
             args.split,
+            args.num_views,
         )
 
     dl = torch.utils.data.DataLoader(

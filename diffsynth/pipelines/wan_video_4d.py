@@ -10,14 +10,15 @@ class WanVideoUnit_4DConditionPreparation(PipelineUnit):
             input_params=(
                 "num_frames", "height", "width", "tiled", "tile_size", "tile_stride"
             ),
-            output_params=("condition_latents", "condition_mask", "temporal_coords", "plucker_embedding"),
+            output_params=("condition_latents", "condition_mask", "temporal_coords", "plucker_embedding", "num_views"),
             onload_model_names=("vae",)
         )
 
     def process(self, pipe: WanVideoPipeline, num_frames, height, width, tiled, tile_size, tile_stride, **kwargs):
         temporal_coords = getattr(pipe, "_temp_temporal_coords", None)
         plucker_embedding = getattr(pipe, "_temp_plucker_embedding", None)
-        output = {"temporal_coords": temporal_coords, "plucker_embedding": plucker_embedding}
+        num_views = getattr(pipe, "_temp_num_views", 1)
+        output = {"temporal_coords": temporal_coords, "plucker_embedding": plucker_embedding, "num_views": num_views}
 
         # Mode A: pre-computed condition tensors
         condition_latents = getattr(pipe, "_temp_condition_latents", None)
@@ -90,7 +91,7 @@ class WanVideoUnit_4DPromptContextOverride(PipelineUnit):
 def model_fn_wan4d_video(
     dit, latents, timestep, context, y=None, clip_feature=None,
     condition_latents=None, condition_mask=None, temporal_coords=None,
-    plucker_embedding=None,
+    plucker_embedding=None, num_views=1,
     use_unified_sequence_parallel=False, use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
     **kwargs
@@ -113,6 +114,7 @@ def model_fn_wan4d_video(
         condition_mask=condition_mask,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        num_views=num_views,
     )
 
     return x
@@ -169,6 +171,7 @@ class Wan4DPipeline(WanVideoPipeline):
         temporal_coords: Optional[List[float]] = None,
         plucker_embedding: Optional[torch.Tensor] = None,
         prompt_context: Optional[torch.Tensor] = None,
+        num_views: int = 1,
         **kwargs
     ):
         self._temp_reference_frames = reference_frames
@@ -179,4 +182,5 @@ class Wan4DPipeline(WanVideoPipeline):
         self._temp_temporal_coords = temporal_coords
         self._temp_plucker_embedding = plucker_embedding
         self._temp_prompt_context = prompt_context
+        self._temp_num_views = num_views
         return super().__call__(*args, **kwargs)

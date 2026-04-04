@@ -3,12 +3,48 @@ import torch
 import torch.nn as nn
 from typing import Optional
 from einops import rearrange
-from diffsynth.models.wan_video_dit import WanModel, sinusoidal_embedding_1d
+from diffsynth.models.wan_video_dit import WanModel, SelfAttention, sinusoidal_embedding_1d, modulate
 from diffsynth.models.wan_video_camera_controller import SimpleAdapter
 from diffsynth.core.gradient import gradient_checkpoint_forward
 
 
 TEMPORAL_ROPE_FPS = 24.0
+
+
+class MVSBlock(nn.Module):
+    """Multi-View Synchronization: cross-view attention per frame.
+
+    Rearranges tokens from (B*V, F*H*W, D) to (B*F, V*H*W, D) so that
+    attention operates across views within each frame.  The projector is
+    zero-initialized so the block starts as a no-op.
+    """
+
+    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.modulation = nn.Parameter(torch.randn(1, 3, dim) / dim ** 0.5)
+        self.attn = SelfAttention(dim, num_heads, eps)
+        self.projector = nn.Linear(dim, dim)
+        # Zero-init projector so MVS output is zero at start
+        nn.init.zeros_(self.projector.weight)
+        nn.init.zeros_(self.projector.bias)
+
+    def forward(self, x, t_mod, freqs_mvs, v, f, h, w):
+        # AdaLN modulation (3 params: shift, scale, gate)
+        shift, scale, gate = (
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod[:, :3, :]
+        ).chunk(3, dim=1)
+        input_x = modulate(self.norm(x), shift, scale)
+
+        # Rearrange: (B*V, F*H*W, D) → (B*F, V*H*W, D)
+        input_x = rearrange(input_x, '(b v) (f h w) d -> (b f) (v h w) d', v=v, f=f, h=h, w=w)
+
+        # Cross-view attention
+        attn_out = self.projector(self.attn(input_x, freqs_mvs))
+
+        # Rearrange back: (B*F, V*H*W, D) → (B*V, F*H*W, D) + gated residual
+        attn_out = rearrange(attn_out, '(b f) (v h w) d -> (b v) (f h w) d', v=v, f=f, h=h, w=w)
+        return x + gate * attn_out
 
 
 class Wan4DModel(WanModel):
@@ -32,6 +68,12 @@ class Wan4DModel(WanModel):
         # Zero-init for stable fine-tuning
         nn.init.zeros_(self.camera_adapter.conv.weight)
         nn.init.zeros_(self.camera_adapter.conv.bias)
+
+        # MVS: one cross-view attention block per transformer layer
+        num_heads = self.blocks[0].self_attn.num_heads
+        self.mvs_blocks = nn.ModuleList([
+            MVSBlock(self.dim, num_heads) for _ in range(len(self.blocks))
+        ])
 
 
     @classmethod
@@ -78,6 +120,12 @@ class Wan4DModel(WanModel):
             if k in own_sd and own_sd[k].shape == v.shape:
                 own_sd[k] = v
         instance.load_state_dict(own_sd, strict=False)
+
+        # Initialize MVS blocks: clone self_attn weights and modulation
+        for mvs_block, dit_block in zip(instance.mvs_blocks, instance.blocks):
+            mvs_block.attn.load_state_dict(dit_block.self_attn.state_dict())
+            mvs_block.modulation.data.copy_(dit_block.modulation.data[:, :3, :])
+
         return instance
 
     def forward(
@@ -95,6 +143,7 @@ class Wan4DModel(WanModel):
         **kwargs,
     ):
         b = x.shape[0]
+        num_views = kwargs.get("num_views", 1)
 
         # Timestep embedding
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
@@ -105,7 +154,12 @@ class Wan4DModel(WanModel):
         if self.has_image_input and clip_feature is not None:
             context = torch.cat([self.img_emb(clip_feature), context], dim=1)
 
-        # Concat: [noisy(16), mask(4), cond(16)] → [B, 36, F, H, W]
+        # Repeat condition for multi-view (passed as [B, ...], x is [B*V, ...])
+        if num_views > 1 and condition_latents is not None and condition_latents.shape[0] < b:
+            condition_latents = condition_latents.repeat_interleave(num_views, dim=0)
+            condition_mask = condition_mask.repeat_interleave(num_views, dim=0)
+
+        # Concat: [noisy(16), mask(4), cond(16)] → [B*V, 36, F, H, W]
         x = torch.cat([x, condition_mask, condition_latents], dim=1)
 
         # Patch embedding
@@ -135,12 +189,26 @@ class Wan4DModel(WanModel):
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
-        # Transformer blocks
-        for block in self.blocks:
+        # MVS: compute freqs_mvs for cross-view attention (view axis replaces temporal axis)
+        if num_views > 1:
+            freqs_mvs = torch.cat([
+                self.freqs[0][:num_views].view(num_views, 1, 1, -1).expand(num_views, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(num_views, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(num_views, h, w, -1),
+            ], dim=-1).reshape(num_views * h * w, 1, -1).to(x.device)
+
+        # Transformer blocks + MVS
+        for i, block in enumerate(self.blocks):
             if self.training:
                 x = gradient_checkpoint_forward(block, use_gradient_checkpointing, use_gradient_checkpointing_offload, x, context, t_mod, freqs)
             else:
                 x = block(x, context, t_mod, freqs)
+            # Cross-view attention (only when multiple views)
+            if num_views > 1:
+                if self.training:
+                    x = gradient_checkpoint_forward(self.mvs_blocks[i], use_gradient_checkpointing, use_gradient_checkpointing_offload, x, t_mod, freqs_mvs, num_views, f, h, w)
+                else:
+                    x = self.mvs_blocks[i](x, t_mod, freqs_mvs, num_views, f, h, w)
 
         # Output
         x = self.head(x, t)

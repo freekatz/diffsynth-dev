@@ -739,6 +739,26 @@ Examples:
         help="Translation speed per pixel frame for --camera_preset (default: 0.02).",
     )
     p.add_argument(
+        "--camera2",
+        type=str,
+        default=None,
+        help="Second camera file for V=2 multi-view inference. Same format as --camera.",
+    )
+    p.add_argument(
+        "--camera_preset2",
+        type=str,
+        default=None,
+        choices=CAMERA_PRESETS,
+        metavar="PRESET",
+        help="Preset camera for second view. Choices: " + ", ".join(CAMERA_PRESETS),
+    )
+    p.add_argument(
+        "--camera_speed2",
+        type=float,
+        default=0.02,
+        help="Translation speed for --camera_preset2 (default: 0.02).",
+    )
+    p.add_argument(
         "--save_cam_attn",
         action="store_true",
         help=(
@@ -825,6 +845,7 @@ def run_one_task(
     out_fps: float,
     fps: float = 24.0,
     c2w: Optional[np.ndarray] = None,
+    c2w2: Optional[np.ndarray] = None,
     save_cam_attn: bool = False,
 ):
     try:
@@ -885,6 +906,7 @@ def run_one_task(
 
     # Remap camera trajectory to match temporal trajectory
     plucker_embedding: Optional[torch.Tensor] = None
+    num_views = 1
     if c2w is not None:
         c2w_remapped = np.empty((actual_num_frames, 4, 4), dtype=np.float32)
         c2w_max = len(c2w) - 1
@@ -896,6 +918,20 @@ def run_one_task(
             c2w_remapped, args.height, args.width, actual_num_frames, F_latent
         ).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
 
+        # Second camera → V=2 multi-view
+        if c2w2 is not None:
+            num_views = 2
+            c2w2_remapped = np.empty((actual_num_frames, 4, 4), dtype=np.float32)
+            c2w2_max = len(c2w2) - 1
+            for i, p in enumerate(result.temporal_coords):
+                src_idx = round(p * fps)
+                src_idx = max(0, min(src_idx, c2w2_max))
+                c2w2_remapped[i] = c2w2[src_idx]
+            plucker2 = _c2w_to_plucker(
+                c2w2_remapped, args.height, args.width, actual_num_frames, F_latent
+            ).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+            plucker_embedding = torch.cat([plucker_embedding, plucker2], dim=0)  # [2, 24, F, H, W]
+
     tile_size = (34, 34)
     tile_stride = (18, 16)
 
@@ -904,6 +940,12 @@ def run_one_task(
         device=device, dtype=torch.bfloat16,
         tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
     )
+
+    # V=2: repeat condition tensors and temporal coords for both views
+    if num_views > 1:
+        cond_latents = cond_latents.repeat(num_views, 1, 1, 1, 1)
+        cond_mask = cond_mask.repeat(num_views, 1, 1, 1, 1)
+        temporal_coords = temporal_coords.repeat(num_views, 1)
 
     # --- Set up camera attention hook if requested ---
     cam_attn_hook = None
@@ -926,6 +968,7 @@ def run_one_task(
         condition_mask=cond_mask,
         temporal_coords=temporal_coords,
         plucker_embedding=plucker_embedding,
+        num_views=num_views,
         cfg_scale=args.cfg_scale,
         seed=args.seed,
         num_inference_steps=args.num_inference_steps,
@@ -955,6 +998,21 @@ def run_one_task(
     else:
         out_path = os.path.join(RESULTS_DIR, auto_name)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+
+    # V=2: split frames into per-view lists and save separately
+    if num_views > 1 and len(frames) > 0:
+        frames_per_view = len(frames) // num_views
+        for v in range(num_views):
+            view_frames = frames[v * frames_per_view : (v + 1) * frames_per_view]
+            view_path = out_path.replace(".mp4", f"_view{v+1}.mp4")
+            print(f"Writing {view_path} (view {v+1}, {len(view_frames)} frames @ {out_fps} fps)")
+            with imageio.get_writer(view_path, fps=out_fps, codec="libx264") as writer:
+                for i in range(len(view_frames)):
+                    pred = to_hwc_numpy(view_frames[i])
+                    if pred.dtype != np.uint8:
+                        pred = np.clip(pred, 0, 255).astype(np.uint8)
+                    writer.append_data(pred)
+        return
 
     n_write = len(frames)
 
@@ -1146,6 +1204,24 @@ def main():
     else:
         print("No --camera / --camera_preset: using identity camera (no camera motion control)")
 
+    # --- Second camera for V=2 multi-view ---
+    c2w2: Optional[np.ndarray] = None
+    if args.camera2 is not None:
+        print(f"Loading second camera from {args.camera2}")
+        c2w2 = _load_c2w_from_path(args.camera2, args.num_frames, args.cam_type)
+        if c2w2 is None:
+            print("Warning: could not load c2w2; V=2 disabled.")
+    elif args.camera_preset2 is not None:
+        print(f"Using preset camera2: {args.camera_preset2}  speed={args.camera_speed2}")
+        c2w2 = make_preset_c2w(
+            preset=args.camera_preset2,
+            num_frames=args.num_frames,
+            speed=args.camera_speed2,
+        )
+    if c2w2 is not None and c2w is None:
+        print("Warning: --camera2 requires --camera (first view). Ignoring --camera2.")
+        c2w2 = None
+
     tasks = _parse_tasks(args)
     print(f"Tasks: {len(tasks)}")
     for idx, (units_str, condition_units_str, backward) in enumerate(tasks):
@@ -1165,6 +1241,7 @@ def main():
             out_fps=out_fps,
             fps=args.fps,
             c2w=c2w,
+            c2w2=c2w2,
             save_cam_attn=args.save_cam_attn,
         )
 
