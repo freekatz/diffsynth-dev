@@ -829,6 +829,7 @@ def run_one_task(
     temporal_coords = torch.tensor(
         pixel_to_latent_temporal_coords(result.temporal_coords, args.num_frames),
         dtype=torch.float32,
+        device=device,
     ).unsqueeze(0)
     F_latent = temporal_coords.shape[1]
     print(f"Trajectory: {result.trajectory_type} ({args.num_frames} frames @ {fps}fps)")
