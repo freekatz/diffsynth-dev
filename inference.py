@@ -651,7 +651,7 @@ Examples:
         "--clip",
         type=str,
         default=None,
-        help="Dataset clip directory path. Expects video.mp4 and optional caption.txt.",
+        help="Dataset clip directory path. Expects camera_{i}.mp4 + meta.json (multi-view) or video.mp4 (legacy).",
     )
     src.add_argument(
         "--source_video",
@@ -834,8 +834,8 @@ def _parse_tasks(args) -> list[tuple[str, str, bool]]:
 def run_one_task(
     pipe,
     args,
-    source_frames_tensor: torch.Tensor,
-    source_video_path,
+    source_frames_views: list[torch.Tensor],
+    c2w_views: list[np.ndarray],
     caption_text: str,
     units_str: str,
     condition_units_str: str,
@@ -844,10 +844,16 @@ def run_one_task(
     clip_id: str,
     out_fps: float,
     fps: float = 24.0,
-    c2w: Optional[np.ndarray] = None,
-    c2w2: Optional[np.ndarray] = None,
     save_cam_attn: bool = False,
 ):
+    """Run inference for one or more views.
+
+    Args:
+        source_frames_views: List of ``[C, T, H, W]`` source video tensors (one per view).
+        c2w_views: List of ``[F, 4, 4]`` c2w arrays (one per view, or empty for no camera).
+    """
+    num_views = len(source_frames_views)
+
     try:
         condition_unit_indices = [
             int(v.strip()) for v in condition_units_str.split(",") if v.strip()
@@ -857,7 +863,6 @@ def run_one_task(
             f"condition_units invalid ({exc}). Expected comma-separated integers."
         ) from exc
 
-    # Check if unit total exceeds source frames (pred_only mode)
     unit_total = _compute_unit_total(units_str)
     pred_only = False
     actual_num_frames = args.num_frames
@@ -883,71 +888,59 @@ def run_one_task(
     print(f"Trajectory: {result.trajectory_type} ({actual_num_frames} frames @ {fps}fps)")
     print(f"Condition frames: {result.condition_frame_indices}")
 
-    # Build target frames tensor (for condition encoding and GT comparison)
-    # In pred_only mode, we still need some frames for condition, so clamp to available
-    max_src_frame = source_frames_tensor.shape[1] - 1
-    if pred_only:
-        # Allocate tensor for actual_num_frames, clamping source indices
-        target_frames_tensor = torch.empty(
-            source_frames_tensor.shape[0], actual_num_frames,
-            source_frames_tensor.shape[2], source_frames_tensor.shape[3],
-            dtype=source_frames_tensor.dtype, device=source_frames_tensor.device
-        )
+    # --- Remap all views' source frames by the shared trajectory ---
+    target_frames_views: list[torch.Tensor] = []
+    for src_tensor in source_frames_views:
+        max_src_frame = src_tensor.shape[1] - 1
+        if pred_only:
+            tgt = torch.empty(
+                src_tensor.shape[0], actual_num_frames,
+                src_tensor.shape[2], src_tensor.shape[3],
+                dtype=src_tensor.dtype, device=src_tensor.device,
+            )
+        else:
+            tgt = torch.empty_like(src_tensor)
         for i, p in enumerate(result.temporal_coords):
-            src_idx = round(p * fps)
-            src_idx = max(0, min(src_idx, max_src_frame))  # Clamp to available
-            target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
-    else:
-        target_frames_tensor = torch.empty_like(source_frames_tensor)
-        for i, p in enumerate(result.temporal_coords):
-            src_idx = round(p * fps)
-            src_idx = max(0, min(src_idx, max_src_frame))
-            target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
+            src_idx = max(0, min(round(p * fps), max_src_frame))
+            tgt[:, i] = src_tensor[:, src_idx]
+        target_frames_views.append(tgt)
 
-    # Remap camera trajectory to match temporal trajectory
-    plucker_embedding: Optional[torch.Tensor] = None
-    num_views = 1
-    if c2w is not None:
+    # --- Plücker per view ---
+    plucker_list: list[torch.Tensor] = []
+    for c2w in c2w_views:
         c2w_remapped = np.empty((actual_num_frames, 4, 4), dtype=np.float32)
         c2w_max = len(c2w) - 1
         for i, p in enumerate(result.temporal_coords):
-            src_idx = round(p * fps)
-            src_idx = max(0, min(src_idx, c2w_max))
+            src_idx = max(0, min(round(p * fps), c2w_max))
             c2w_remapped[i] = c2w[src_idx]
-        plucker_embedding = _c2w_to_plucker(
-            c2w_remapped, args.height, args.width, actual_num_frames, F_latent
-        ).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+        plk = _c2w_to_plucker(
+            c2w_remapped, args.height, args.width, actual_num_frames, F_latent,
+        )
+        plucker_list.append(plk)
 
-        # Second camera → V=2 multi-view
-        if c2w2 is not None:
-            num_views = 2
-            c2w2_remapped = np.empty((actual_num_frames, 4, 4), dtype=np.float32)
-            c2w2_max = len(c2w2) - 1
-            for i, p in enumerate(result.temporal_coords):
-                src_idx = round(p * fps)
-                src_idx = max(0, min(src_idx, c2w2_max))
-                c2w2_remapped[i] = c2w2[src_idx]
-            plucker2 = _c2w_to_plucker(
-                c2w2_remapped, args.height, args.width, actual_num_frames, F_latent
-            ).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
-            plucker_embedding = torch.cat([plucker_embedding, plucker2], dim=0)  # [2, 24, F, H, W]
+    if plucker_list:
+        plucker_embedding = torch.stack(plucker_list, dim=0).to(device=device, dtype=torch.bfloat16)
+    else:
+        plucker_embedding = None
 
     tile_size = (34, 34)
     tile_stride = (18, 16)
 
+    # --- Condition: anchor view only (asymmetric) ---
+    anchor_frames = target_frames_views[0]
     cond_latents, cond_mask = build_condition_from_frames(
-        pipe, result.condition_frame_indices, target_frames_tensor, F_latent,
+        pipe, result.condition_frame_indices, anchor_frames, F_latent,
         device=device, dtype=torch.bfloat16,
         tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
     )
 
-    # V=2: repeat condition tensors and temporal coords for both views
+    # Repeat shared tensors for all views
     if num_views > 1:
         cond_latents = cond_latents.repeat(num_views, 1, 1, 1, 1)
         cond_mask = cond_mask.repeat(num_views, 1, 1, 1, 1)
         temporal_coords = temporal_coords.repeat(num_views, 1)
 
-    # --- Set up camera attention hook if requested ---
+    # --- Camera attention hook ---
     cam_attn_hook = None
     hook_handle = None
     H_tok = args.height // 16
@@ -958,7 +951,6 @@ def run_one_task(
             hook_handle = pipe.dit.camera_cross_attn.register_forward_hook(cam_attn_hook)
             print("Camera attention capture enabled.")
         else:
-            print("Warning: --save_cam_attn but no camera_cross_attn module found.")
             cam_attn_hook = None
 
     frames = pipe(
@@ -978,19 +970,8 @@ def run_one_task(
         tiled=args.tiled,
     )
 
-    # --- Remove hook and prepare heatmap frames ---
-    cam_attn_frames: Optional[np.ndarray] = None
     if hook_handle is not None:
         hook_handle.remove()
-    if cam_attn_hook is not None and cam_attn_hook._cam_signals:
-        try:
-            signal_maps = cam_attn_hook.get_signal_maps(F_latent, H_tok, W_tok)
-            cam_attn_frames = prepare_cam_attn_frames(
-                signal_maps, num_pixel_frames=actual_num_frames,
-                height=args.height, width=args.width,
-            )
-        except Exception as e:
-            print(f"Warning: failed to prepare cam-attn heatmap: {e}")
 
     auto_name = _auto_filename(units_str, condition_units_str, clip_id, backward)
     if args.output is not None:
@@ -999,25 +980,35 @@ def run_one_task(
         out_path = os.path.join(RESULTS_DIR, auto_name)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
-    # V=2: split frames into per-view lists and save separately
-    if num_views > 1 and len(frames) > 0:
+    # --- Output ---
+    if num_views > 1 and len(frames) > 0 and not pred_only:
+        # 2x2 grid: left=GT, right=Pred, one row per view
         frames_per_view = len(frames) // num_views
-        for v in range(num_views):
-            view_frames = frames[v * frames_per_view : (v + 1) * frames_per_view]
-            view_path = out_path.replace(".mp4", f"_view{v+1}.mp4")
-            print(f"Writing {view_path} (view {v+1}, {len(view_frames)} frames @ {out_fps} fps)")
-            with imageio.get_writer(view_path, fps=out_fps, codec="libx264") as writer:
-                for i in range(len(view_frames)):
-                    pred = to_hwc_numpy(view_frames[i])
-                    if pred.dtype != np.uint8:
-                        pred = np.clip(pred, 0, 255).astype(np.uint8)
-                    writer.append_data(pred)
+        n_write = min(frames_per_view, target_frames_views[0].shape[1])
+
+        # Prepare GT numpy per view
+        gt_views = []
+        for tgt in target_frames_views:
+            vis = ((tgt.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
+            gt_views.append(vis.clamp(0, 255).byte().numpy())
+
+        print(f"Writing 2x2 grid: {out_path} ({n_write} frames @ {out_fps} fps)")
+        with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
+            for i in range(n_write):
+                rows = []
+                for v in range(num_views):
+                    gt_frame = gt_views[v][i]
+                    pred_frame = to_hwc_numpy(frames[v * frames_per_view + i])
+                    if pred_frame.dtype != np.uint8:
+                        pred_frame = np.clip(pred_frame, 0, 255).astype(np.uint8)
+                    rows.append(np.concatenate([gt_frame, pred_frame], axis=1))
+                grid = np.concatenate(rows, axis=0)
+                writer.append_data(grid)
         return
 
+    # Single-view or pred_only fallback
     n_write = len(frames)
-
-    if pred_only:
-        # Save prediction only (no GT comparison)
+    if pred_only or num_views == 1 and not target_frames_views:
         print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps) [prediction only]")
         with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
             for i in range(n_write):
@@ -1026,36 +1017,17 @@ def run_one_task(
                     pred = np.clip(pred, 0, 255).astype(np.uint8)
                 writer.append_data(pred)
     else:
-        # Standard mode: GT | Pred side-by-side (or 2x2 with cam_attn)
-        target_vis = ((target_frames_tensor.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
+        # Single-view GT | Pred side-by-side
+        target_vis = ((target_frames_views[0].detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
         target_vis = target_vis.clamp(0, 255).byte().numpy()
         n_write = min(len(frames), target_vis.shape[0])
-
-        composite_2x2 = cam_attn_frames is not None and len(cam_attn_frames) >= n_write
-        if composite_2x2:
-            print(f"Writing 2x2 composite: {out_path} ({n_write} frames @ {out_fps} fps)")
-        else:
-            print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps)")
+        print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps)")
         with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
             for i in range(n_write):
                 pred = to_hwc_numpy(frames[i])
                 if pred.dtype != np.uint8:
                     pred = np.clip(pred, 0, 255).astype(np.uint8)
-                target = target_vis[i]
-                if target.shape != pred.shape:
-                    raise RuntimeError(
-                        f"target/pred shape mismatch at frame {i}: {target.shape} vs {pred.shape}"
-                    )
-                if composite_2x2:
-                    # 2x2 layout: GT | Pred / CamAttn | Overlay
-                    heatmap = cam_attn_frames[i]
-                    overlay = blend_heatmap_on_image(heatmap, pred, alpha_blend=0.4)
-                    top_row = np.concatenate([target, pred], axis=1)
-                    bottom_row = np.concatenate([heatmap, overlay], axis=1)
-                    composite = np.concatenate([top_row, bottom_row], axis=0)
-                    writer.append_data(composite)
-                else:
-                    writer.append_data(np.concatenate([target, pred], axis=1))
+                writer.append_data(np.concatenate([target_vis[i], pred], axis=1))
 
 
 def to_hwc_numpy(frame) -> np.ndarray:
@@ -1125,102 +1097,113 @@ def main():
 
     import torchvision.transforms.functional as TF
 
+    # --- Load source data (multi-view from --clip, or single-view fallback) ---
+    source_frames_views: list[torch.Tensor] = []  # per-view [C, T, H, W]
+    c2w_views: list[np.ndarray] = []               # per-view [F, 4, 4]
     source_video_path: Optional[Path] = None
+    caption_txt_path: Optional[Path] = None
+
     if args.clip is not None:
         clip_dir = Path(args.clip)
-        source_video_path = clip_dir / "video.mp4"
+        meta_path = clip_dir / "meta.json"
         caption_txt_path = clip_dir / "caption.txt"
-        if not source_video_path.is_file():
-            raise SystemExit(f"--clip expects `{source_video_path}` to exist.")
-        print(f"Loading clip video: {source_video_path}")
-        source_frames_pil = load_source_video(
-            source_video_path, args.num_frames, args.height, args.width
-        )
+
+        if meta_path.is_file():
+            # --- New dataset format: camera_{i}.mp4 + meta.json ---
+            with open(meta_path) as f:
+                meta = json.load(f)
+            cameras = meta["cameras"]
+            print(f"Loading multi-view clip: {clip_dir} ({len(cameras)} cameras: {cameras})")
+
+            for cam_name in cameras:
+                vid_path = clip_dir / f"{cam_name}.mp4"
+                if not vid_path.is_file():
+                    raise SystemExit(f"Camera video not found: {vid_path}")
+                frames_pil = load_source_video(vid_path, args.num_frames, args.height, args.width)
+                tensors = [TF.to_tensor(img) * 2.0 - 1.0 for img in frames_pil]
+                source_frames_views.append(torch.stack(tensors, dim=1))  # [C, T, H, W]
+
+                # Load c2w from meta.json
+                c2w_raw = np.array(
+                    meta["camera_extrinsics_c2w"][cam_name], dtype=np.float32
+                )
+                # Normalize to first frame
+                ref_inv = np.linalg.inv(c2w_raw[0])
+                c2w_rel = ref_inv @ c2w_raw
+                scene_scale = float(np.max(np.abs(c2w_rel[:, :3, 3])))
+                if scene_scale < 1e-2:
+                    scene_scale = 1.0
+                c2w_rel[:, :3, 3] /= scene_scale
+                c2w_views.append(c2w_rel)
+
+            source_video_path = clip_dir / f"{cameras[0]}.mp4"
+        else:
+            # --- Legacy single-video format: video.mp4 ---
+            source_video_path = clip_dir / "video.mp4"
+            if not source_video_path.is_file():
+                raise SystemExit(f"--clip expects `{source_video_path}` or `meta.json` to exist.")
+            print(f"Loading clip video (legacy): {source_video_path}")
+            frames_pil = load_source_video(source_video_path, args.num_frames, args.height, args.width)
+            tensors = [TF.to_tensor(img) * 2.0 - 1.0 for img in frames_pil]
+            source_frames_views.append(torch.stack(tensors, dim=1))
+
     elif args.source_video is not None:
         source_path = Path(args.source_video)
         print(f"Loading source video: {source_path}")
-        source_frames_pil = load_source_video(
-            source_path, args.num_frames, args.height, args.width
-        )
+        frames_pil = load_source_video(source_path, args.num_frames, args.height, args.width)
+        tensors = [TF.to_tensor(img) * 2.0 - 1.0 for img in frames_pil]
+        source_frames_views.append(torch.stack(tensors, dim=1))
         caption_txt_path = source_path.parent / "caption.txt"
         source_video_path = source_path
     else:
         print(f"Loading {len(args.source_images)} source images")
-        source_frames_pil = load_source_images(args.source_images, args.height, args.width)
+        frames_pil = load_source_images(args.source_images, args.height, args.width)
+        tensors = [TF.to_tensor(img) * 2.0 - 1.0 for img in frames_pil]
+        source_frames_views.append(torch.stack(tensors, dim=1))
         caption_txt_path = Path(args.source_images[0]).parent / "caption.txt"
 
+    # --- Camera fallback for non-clip modes ---
+    if not c2w_views:
+        c2w: Optional[np.ndarray] = None
+        if args.camera is not None:
+            c2w = _load_c2w_from_path(args.camera, args.num_frames, args.cam_type)
+            if c2w is not None:
+                print(f"Loaded camera: {args.camera} shape={c2w.shape}")
+        elif args.camera_preset is not None:
+            c2w = make_preset_c2w(
+                preset=args.camera_preset,
+                num_frames=args.num_frames,
+                speed=args.camera_speed,
+            )
+            print(f"Using preset camera: {args.camera_preset}")
+        if c2w is not None:
+            c2w_views.append(c2w)
+            # Second camera for V=2
+            if args.camera2 is not None:
+                c2w2 = _load_c2w_from_path(args.camera2, args.num_frames, args.cam_type)
+                if c2w2 is not None:
+                    c2w_views.append(c2w2)
+            elif args.camera_preset2 is not None:
+                c2w_views.append(make_preset_c2w(
+                    preset=args.camera_preset2,
+                    num_frames=args.num_frames,
+                    speed=args.camera_speed2,
+                ))
+
+    # --- Caption ---
     caption_text = args.caption
     if caption_text is None:
-        if caption_txt_path.is_file():
+        if caption_txt_path is not None and caption_txt_path.is_file():
             caption_text = caption_txt_path.read_text(encoding="utf-8").strip()
             print(f"Using caption from {caption_txt_path}: {caption_text[:60]}...")
         else:
             caption_text = ""
             print("No caption found; using empty prompt.")
 
-    frame_tensors = []
-    for img in source_frames_pil:
-        t = TF.to_tensor(img)
-        t = t * 2.0 - 1.0
-        frame_tensors.append(t)
-    source_frames_tensor = torch.stack(frame_tensors, dim=1)
-
     clip_id = _derive_clip_id(args.clip, args.source_video, args.source_images)
     out_fps = read_video_fps(source_video_path) if source_video_path is not None else DEFAULT_OUTPUT_FPS
 
-    # --- Load camera (optional) → Plücker embedding ---
-    # Auto-detect camera from clip directory when --camera / --camera_preset are not given.
-    auto_camera: Optional[str] = None
-    if args.camera is None and args.camera_preset is None and args.clip is not None:
-        _clip_dir = Path(args.clip)
-        _meta = _clip_dir / "meta.json"
-        _npy_candidates = list(_clip_dir.glob("src_cam/*_extrinsics.npy"))
-        if _meta.is_file():
-            auto_camera = str(_meta)
-            print(f"[auto] Detected camera: {auto_camera}")
-        elif _npy_candidates:
-            auto_camera = str(_npy_candidates[0])
-            print(f"[auto] Detected camera: {auto_camera}")
-
-    c2w: Optional[np.ndarray] = None
-    _effective_camera = args.camera if args.camera is not None else auto_camera
-    if args.camera is not None and args.camera_preset is not None:
-        print("Warning: --camera and --camera_preset both specified; --camera takes precedence.")
-    if _effective_camera is not None:
-        cam_path = _effective_camera
-        print(f"Loading camera from {cam_path}")
-        c2w = _load_c2w_from_path(cam_path, args.num_frames, args.cam_type)
-        if c2w is None:
-            print("Warning: could not load c2w from camera file; using identity camera.")
-        else:
-            print(f"Loaded c2w shape: {c2w.shape}")
-    elif args.camera_preset is not None:
-        print(f"Using preset camera: {args.camera_preset}  speed={args.camera_speed}")
-        c2w = make_preset_c2w(
-            preset=args.camera_preset,
-            num_frames=args.num_frames,
-            speed=args.camera_speed,
-        )
-    else:
-        print("No --camera / --camera_preset: using identity camera (no camera motion control)")
-
-    # --- Second camera for V=2 multi-view ---
-    c2w2: Optional[np.ndarray] = None
-    if args.camera2 is not None:
-        print(f"Loading second camera from {args.camera2}")
-        c2w2 = _load_c2w_from_path(args.camera2, args.num_frames, args.cam_type)
-        if c2w2 is None:
-            print("Warning: could not load c2w2; V=2 disabled.")
-    elif args.camera_preset2 is not None:
-        print(f"Using preset camera2: {args.camera_preset2}  speed={args.camera_speed2}")
-        c2w2 = make_preset_c2w(
-            preset=args.camera_preset2,
-            num_frames=args.num_frames,
-            speed=args.camera_speed2,
-        )
-    if c2w2 is not None and c2w is None:
-        print("Warning: --camera2 requires --camera (first view). Ignoring --camera2.")
-        c2w2 = None
+    print(f"Views: {len(source_frames_views)}, Cameras: {len(c2w_views)}")
 
     tasks = _parse_tasks(args)
     print(f"Tasks: {len(tasks)}")
@@ -1230,8 +1213,8 @@ def main():
         run_one_task(
             pipe=pipe,
             args=args,
-            source_frames_tensor=source_frames_tensor,
-            source_video_path=source_video_path,
+            source_frames_views=source_frames_views,
+            c2w_views=c2w_views,
             caption_text=caption_text,
             units_str=units_str,
             condition_units_str=condition_units_str,
@@ -1240,8 +1223,6 @@ def main():
             clip_id=clip_id,
             out_fps=out_fps,
             fps=args.fps,
-            c2w=c2w,
-            c2w2=c2w2,
             save_cam_attn=args.save_cam_attn,
         )
 
