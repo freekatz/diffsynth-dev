@@ -136,7 +136,7 @@ class Wan4DTrainModule(pl.LightningModule):
         num_views = int(batch.get("num_views", torch.tensor(2)).item())
 
         target_video = batch["target_video"].to(self.device, dtype=dt).flatten(0, 1)
-        condition_video = batch["condition_video"].to(self.device, dtype=dt)
+        condition_video = batch["condition_video"].to(self.device, dtype=dt).flatten(0, 1)
 
         context = batch["prompt_context"].to(self.device, dtype=dt)
         if context.ndim == 4 and context.shape[1] == 1:
@@ -155,7 +155,7 @@ class Wan4DTrainModule(pl.LightningModule):
             tile_stride=tuple(self.hparams.vae_tile_stride),
         )
 
-        B_orig = condition_video.shape[0]
+        B_orig = condition_video.shape[0]  # B*V after flatten
         _, C, T, H, W = target_video.shape
         F_latent = (T - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
         H_l, W_l = H // 8, W // 8

@@ -151,10 +151,6 @@ class Wan4DModel(WanModel):
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
 
-        if condition_latents.shape[0] < b:
-            condition_latents = condition_latents.repeat_interleave(num_views, dim=0)
-            condition_mask = condition_mask.repeat_interleave(num_views, dim=0)
-
         x = torch.cat([x, condition_mask, condition_latents], dim=1)
         x = self.patch_embedding(x)
         f, h, w = x.shape[2:]

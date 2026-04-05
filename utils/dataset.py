@@ -164,14 +164,16 @@ class Wan4DDataset(torch.utils.data.Dataset):
             targets.append(target_video)
             pluckers.append(plucker_emb)
 
-        anchor_video = targets[0]
-        condition_video = torch.zeros_like(anchor_video)
-        for idx in result.condition_frame_indices[:MAX_CONDITION_FRAMES]:
-            condition_video[:, idx] = anchor_video[:, idx]
+        condition_videos = []
+        for target in targets:
+            cond = torch.zeros_like(target)
+            for idx in result.condition_frame_indices[:MAX_CONDITION_FRAMES]:
+                cond[:, idx] = target[:, idx]
+            condition_videos.append(cond)
 
         return {
             "target_video": torch.stack(targets, dim=0),
-            "condition_video": condition_video,
+            "condition_video": torch.stack(condition_videos, dim=0),
             "prompt_context": prompt_context,
             "temporal_coords": temporal_coords,
             "condition_latent_indices": latent_idx_t,

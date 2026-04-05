@@ -346,13 +346,16 @@ def run_one_task(pipe, args, source_frames_views, c2w_views, caption_text,
 
     plucker_embedding = torch.stack(plucker_list, dim=0).to(device=device, dtype=torch.bfloat16)
 
-    anchor_frames = target_frames_views[0]
-    cond_latents, cond_mask = build_condition_from_frames(
-        pipe, result.condition_frame_indices, anchor_frames, F_latent,
-        device=device, dtype=torch.bfloat16, tiled=args.tiled,
-    )
-    cond_latents = cond_latents.repeat(num_views, 1, 1, 1, 1)
-    cond_mask = cond_mask.repeat(num_views, 1, 1, 1, 1)
+    cond_latents_list, cond_mask_list = [], []
+    for tgt in target_frames_views:
+        cl, cm = build_condition_from_frames(
+            pipe, result.condition_frame_indices, tgt, F_latent,
+            device=device, dtype=torch.bfloat16, tiled=args.tiled,
+        )
+        cond_latents_list.append(cl)
+        cond_mask_list.append(cm)
+    cond_latents = torch.cat(cond_latents_list, dim=0)
+    cond_mask = torch.cat(cond_mask_list, dim=0)
     temporal_coords = temporal_coords.repeat(num_views, 1)
 
     frames = pipe(
