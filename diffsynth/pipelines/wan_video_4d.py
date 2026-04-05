@@ -39,7 +39,7 @@ class WanVideoUnit_4DPromptContextOverride(PipelineUnit):
 def model_fn_wan4d_video(
     dit, latents, timestep, context, y=None, clip_feature=None,
     condition_latents=None, condition_mask=None, temporal_coords=None,
-    plucker_embedding=None, num_views=1,
+    plucker_embedding=None, num_views=2,
     use_unified_sequence_parallel=False, use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
     **kwargs
@@ -98,7 +98,7 @@ class Wan4DPipeline(WanVideoPipeline):
         temporal_coords: torch.Tensor = None,
         plucker_embedding: torch.Tensor = None,
         prompt_context: torch.Tensor = None,
-        num_views: int = 1,
+        num_views: int = 2,
         **kwargs
     ):
         self._temp_condition_latents = condition_latents

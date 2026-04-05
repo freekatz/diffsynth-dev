@@ -269,7 +269,6 @@ def parse_args():
     p.add_argument("--fps", type=float, default=24.0)
     p.add_argument("--camera_preset", type=str, default=None, choices=CAMERA_PRESETS)
     p.add_argument("--camera_speed", type=float, default=0.02)
-    p.add_argument("--save_cam_attn", action="store_true")
     p.add_argument("--output", type=str, default=None)
     p.add_argument("--tasks", type=str, nargs="+", required=True, metavar="UNITS|INDEXS")
 
@@ -308,7 +307,7 @@ def _parse_tasks(args):
 
 def run_one_task(pipe, args, source_frames_views, c2w_views, caption_text,
                  units_str, condition_units_str, backward, device, clip_id, out_fps,
-                 fps=24.0, save_cam_attn=False):
+                 fps=24.0):
     num_views = len(source_frames_views)
     condition_unit_indices = [int(v.strip()) for v in condition_units_str.split(",") if v.strip()]
 
@@ -345,25 +344,16 @@ def run_one_task(pipe, args, source_frames_views, c2w_views, caption_text,
             c2w_remapped[i] = c2w[src_idx]
         plucker_list.append(_c2w_to_plucker(c2w_remapped, args.height, args.width, actual_num_frames, F_latent))
 
-    plucker_embedding = torch.stack(plucker_list, dim=0).to(device=device, dtype=torch.bfloat16) if plucker_list else None
+    plucker_embedding = torch.stack(plucker_list, dim=0).to(device=device, dtype=torch.bfloat16)
 
     anchor_frames = target_frames_views[0]
     cond_latents, cond_mask = build_condition_from_frames(
         pipe, result.condition_frame_indices, anchor_frames, F_latent,
         device=device, dtype=torch.bfloat16, tiled=args.tiled,
     )
-
-    if num_views > 1:
-        cond_latents = cond_latents.repeat(num_views, 1, 1, 1, 1)
-        cond_mask = cond_mask.repeat(num_views, 1, 1, 1, 1)
-        temporal_coords = temporal_coords.repeat(num_views, 1)
-
-    cam_attn_hook = None
-    hook_handle = None
-    if save_cam_attn and plucker_embedding is not None:
-        cam_attn_hook = CameraAttnCaptureHook()
-        if hasattr(pipe.dit, "camera_cross_attn") and pipe.dit.camera_cross_attn is not None:
-            hook_handle = pipe.dit.camera_cross_attn.register_forward_hook(cam_attn_hook)
+    cond_latents = cond_latents.repeat(num_views, 1, 1, 1, 1)
+    cond_mask = cond_mask.repeat(num_views, 1, 1, 1, 1)
+    temporal_coords = temporal_coords.repeat(num_views, 1)
 
     frames = pipe(
         prompt=caption_text,
@@ -382,43 +372,28 @@ def run_one_task(pipe, args, source_frames_views, c2w_views, caption_text,
         tiled=args.tiled,
     )
 
-    if hook_handle is not None:
-        hook_handle.remove()
-
     auto_name = _auto_filename(units_str, condition_units_str, clip_id, backward)
     out_path = os.path.join(RESULTS_DIR, args.output, auto_name) if args.output else os.path.join(RESULTS_DIR, auto_name)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
-    if num_views > 1 and len(frames) > 0:
-        frames_per_view = len(frames) // num_views
-        n_write = min(frames_per_view, target_frames_views[0].shape[1])
-        gt_views = []
-        for tgt in target_frames_views:
-            vis = ((tgt.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
-            gt_views.append(vis.clamp(0, 255).byte().numpy())
+    frames_per_view = len(frames) // num_views
+    n_write = min(frames_per_view, target_frames_views[0].shape[1])
+    gt_views = []
+    for tgt in target_frames_views:
+        vis = ((tgt.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
+        gt_views.append(vis.clamp(0, 255).byte().numpy())
 
-        print(f"Writing 2x2 grid: {out_path} ({n_write} frames @ {out_fps} fps)")
-        with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
-            for i in range(n_write):
-                rows = []
-                for v in range(num_views):
-                    gt_frame = gt_views[v][i]
-                    pred_frame = to_hwc_numpy(frames[v * frames_per_view + i])
-                    if pred_frame.dtype != np.uint8:
-                        pred_frame = np.clip(pred_frame, 0, 255).astype(np.uint8)
-                    rows.append(np.concatenate([gt_frame, pred_frame], axis=1))
-                writer.append_data(np.concatenate(rows, axis=0))
-    else:
-        target_vis = ((target_frames_views[0].detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
-        target_vis = target_vis.clamp(0, 255).byte().numpy()
-        n_write = min(len(frames), target_vis.shape[0])
-        print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps)")
-        with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
-            for i in range(n_write):
-                pred = to_hwc_numpy(frames[i])
-                if pred.dtype != np.uint8:
-                    pred = np.clip(pred, 0, 255).astype(np.uint8)
-                writer.append_data(np.concatenate([target_vis[i], pred], axis=1))
+    print(f"Writing grid: {out_path} ({n_write} frames @ {out_fps} fps)")
+    with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
+        for i in range(n_write):
+            rows = []
+            for v in range(num_views):
+                gt_frame = gt_views[v][i]
+                pred_frame = to_hwc_numpy(frames[v * frames_per_view + i])
+                if pred_frame.dtype != np.uint8:
+                    pred_frame = np.clip(pred_frame, 0, 255).astype(np.uint8)
+                rows.append(np.concatenate([gt_frame, pred_frame], axis=1))
+            writer.append_data(np.concatenate(rows, axis=0))
 
 
 def to_hwc_numpy(frame) -> np.ndarray:
@@ -527,7 +502,7 @@ def main():
             caption_text=caption_text, units_str=units_str,
             condition_units_str=condition_units_str, backward=backward,
             device=device, clip_id=clip_id, out_fps=out_fps,
-            fps=args.fps, save_cam_attn=args.save_cam_attn,
+            fps=args.fps,
         )
 
     print("\nDone.")

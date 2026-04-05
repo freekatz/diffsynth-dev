@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from einops import rearrange
-from diffsynth.models.wan_video_dit import WanModel, SelfAttention, sinusoidal_embedding_1d, modulate
+from diffsynth.models.wan_video_dit import WanModel, DiTBlock, SelfAttention, sinusoidal_embedding_1d, modulate
 from diffsynth.models.wan_video_camera_controller import SimpleAdapter
 from diffsynth.core.gradient import gradient_checkpoint_forward
 
@@ -10,27 +10,41 @@ from diffsynth.core.gradient import gradient_checkpoint_forward
 TEMPORAL_ROPE_FPS = 24.0
 
 
-class MVSBlock(nn.Module):
-    """Multi-View Synchronization: cross-view attention per frame."""
+class Wan4DDiTBlock(DiTBlock):
+    """DiTBlock with Multi-View Synchronization inserted between self-attn and cross-attn."""
 
-    def __init__(self, dim: int, num_heads: int, eps: float = 1e-6):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.modulation = nn.Parameter(torch.randn(1, 3, dim) / dim ** 0.5)
-        self.attn = SelfAttention(dim, num_heads, eps)
-        self.projector = nn.Linear(dim, dim)
-        nn.init.zeros_(self.projector.weight)
-        nn.init.zeros_(self.projector.bias)
+    def __init__(self, has_image_input: bool, dim: int, num_heads: int, ffn_dim: int, eps: float = 1e-6):
+        super().__init__(has_image_input, dim, num_heads, ffn_dim, eps)
+        self.mvs_norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.mvs_modulation = nn.Parameter(torch.randn(1, 3, dim) / dim ** 0.5)
+        self.mvs_attn = SelfAttention(dim, num_heads, eps)
+        self.mvs_projector = nn.Linear(dim, dim)
+        nn.init.zeros_(self.mvs_projector.weight)
+        nn.init.zeros_(self.mvs_projector.bias)
 
-    def forward(self, x, t_mod, freqs_mvs, v, f, h, w):
-        shift, scale, gate = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod[:, :3, :]
+    def forward(self, x, context, t_mod, freqs, freqs_mvs, v, f, h, w):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=1)
+
+        # self-attn
+        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
+
+        # MVS: cross-view synchronization
+        shift_mvs, scale_mvs, gate_mvs = (
+            self.mvs_modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod[:, :3, :]
         ).chunk(3, dim=1)
-        input_x = modulate(self.norm(x), shift, scale)
+        input_x = modulate(self.mvs_norm(x), shift_mvs, scale_mvs)
         input_x = rearrange(input_x, '(b v) (f h w) d -> (b f) (v h w) d', v=v, f=f, h=h, w=w)
-        attn_out = self.projector(self.attn(input_x, freqs_mvs))
+        attn_out = self.mvs_projector(self.mvs_attn(input_x, freqs_mvs))
         attn_out = rearrange(attn_out, '(b f) (v h w) d -> (b v) (f h w) d', v=v, f=f, h=h, w=w)
-        return x + gate * attn_out
+        x = x + gate_mvs * attn_out
+
+        # cross-attn + FFN
+        x = x + self.cross_attn(self.norm3(x), context)
+        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        return x
 
 
 class Wan4DModel(WanModel):
@@ -45,6 +59,10 @@ class Wan4DModel(WanModel):
             10000.0 ** (torch.arange(0, dim_t, 2)[: dim_t // 2].double() / dim_t)
         )
         self.register_buffer("temporal_freqs_base", temporal_freqs_base, persistent=False)
+        view_freqs_base = 1.0 / (
+            100.0 ** (torch.arange(0, dim_t, 2)[: dim_t // 2].double() / dim_t)
+        )
+        self.register_buffer("view_freqs_base", view_freqs_base, persistent=False)
         self.camera_adapter = SimpleAdapter(
             in_dim=24,
             out_dim=self.dim,
@@ -54,9 +72,13 @@ class Wan4DModel(WanModel):
         nn.init.zeros_(self.camera_adapter.conv.weight)
         nn.init.zeros_(self.camera_adapter.conv.bias)
 
-        num_heads = self.blocks[0].self_attn.num_heads
-        self.mvs_blocks = nn.ModuleList([
-            MVSBlock(self.dim, num_heads) for _ in range(len(self.blocks))
+        # Replace DiTBlocks with Wan4DDiTBlocks that include MVS inside
+        old_block = self.blocks[0]
+        num_heads = old_block.self_attn.num_heads
+        ffn_dim = old_block.ffn[0].out_features
+        self.blocks = nn.ModuleList([
+            Wan4DDiTBlock(self.has_image_input, self.dim, num_heads, ffn_dim)
+            for _ in range(len(self.blocks))
         ])
 
     @classmethod
@@ -101,9 +123,9 @@ class Wan4DModel(WanModel):
                 own_sd[k] = v
         instance.load_state_dict(own_sd, strict=False)
 
-        for mvs_block, dit_block in zip(instance.mvs_blocks, instance.blocks):
-            mvs_block.attn.load_state_dict(dit_block.self_attn.state_dict())
-            mvs_block.modulation.data.copy_(dit_block.modulation.data[:, :3, :])
+        for block in instance.blocks:
+            block.mvs_attn.load_state_dict(block.self_attn.state_dict())
+            block.mvs_modulation.data.copy_(block.modulation.data[:, :3, :])
 
         return instance
 
@@ -122,13 +144,14 @@ class Wan4DModel(WanModel):
         **kwargs,
     ):
         b = x.shape[0]
-        num_views = kwargs.get("num_views", 1)
+        num_views = kwargs.get("num_views", 2)
+        assert num_views >= 2, "Requires at least 2 views for multi-view synchronization."
 
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
         context = self.text_embedding(context)
 
-        if num_views > 1 and condition_latents is not None and condition_latents.shape[0] < b:
+        if condition_latents.shape[0] < b:
             condition_latents = condition_latents.repeat_interleave(num_views, dim=0)
             condition_mask = condition_mask.repeat_interleave(num_views, dim=0)
 
@@ -151,23 +174,21 @@ class Wan4DModel(WanModel):
             self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
-        if num_views > 1:
-            freqs_mvs = torch.cat([
-                self.freqs[0][:num_views].view(num_views, 1, 1, -1).expand(num_views, h, w, -1),
-                self.freqs[1][:h].view(1, h, 1, -1).expand(num_views, h, w, -1),
-                self.freqs[2][:w].view(1, 1, w, -1).expand(num_views, h, w, -1),
-            ], dim=-1).reshape(num_views * h * w, 1, -1).to(x.device)
+        v_pos = torch.arange(num_views, dtype=torch.float64, device=x.device)
+        v_angles = torch.outer(v_pos, self.view_freqs_base.to(x.device))
+        v_freqs_cis = torch.polar(torch.ones_like(v_angles), v_angles)
 
-        for i, block in enumerate(self.blocks):
+        freqs_mvs = torch.cat([
+            v_freqs_cis.view(num_views, 1, 1, -1).expand(num_views, h, w, -1),
+            self.freqs[1][:h].view(1, h, 1, -1).expand(num_views, h, w, -1),
+            self.freqs[2][:w].view(1, 1, w, -1).expand(num_views, h, w, -1),
+        ], dim=-1).reshape(num_views * h * w, 1, -1).to(x.device)
+
+        for block in self.blocks:
             if self.training:
-                x = gradient_checkpoint_forward(block, use_gradient_checkpointing, use_gradient_checkpointing_offload, x, context, t_mod, freqs)
+                x = gradient_checkpoint_forward(block, use_gradient_checkpointing, use_gradient_checkpointing_offload, x, context, t_mod, freqs, freqs_mvs, num_views, f, h, w)
             else:
-                x = block(x, context, t_mod, freqs)
-            if num_views > 1:
-                if self.training:
-                    x = gradient_checkpoint_forward(self.mvs_blocks[i], use_gradient_checkpointing, use_gradient_checkpointing_offload, x, t_mod, freqs_mvs, num_views, f, h, w)
-                else:
-                    x = self.mvs_blocks[i](x, t_mod, freqs_mvs, num_views, f, h, w)
+                x = block(x, context, t_mod, freqs, freqs_mvs, num_views, f, h, w)
 
         x = self.head(x, t)
         return self.unpatchify(x, (f, h, w))
