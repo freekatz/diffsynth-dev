@@ -1,10 +1,37 @@
 #!/usr/bin/env python3
 """Wan4D inference using trained model weights.
 
+Unit types:  F = forward  |  R = reverse  |  Z = freeze (static)
+
 Examples::
 
-    python inference.py --clip_dir ./data/videos/.../clip_0 --wan_model_dir ./models \\
-        --ckpt ./training/proj/exp/checkpoints/step500_model.ckpt
+    # Forward playback (default) — condition on unit 0 (frame 0)
+    python inference.py --source_video ./data/videos/src/vid/clip_0/video.mp4 \\
+        --wan_model_dir ./models --ckpt ./training/proj/exp/checkpoints/step500_model.ckpt
+
+    # Reverse playback
+    python inference.py --source_video ./data/.../video.mp4 \\
+        --wan_model_dir ./models --ckpt ./step500_model.ckpt \\
+        --units F --backward
+
+    # Pingpong: forward then reverse, condition on both ends
+    python inference.py --source_video ./data/.../video.mp4 \\
+        --units "F:41,R:40" --condition_units "0,1"
+
+    # 3-segment: forward + freeze + forward, condition on unit 0 only
+    python inference.py --source_video ./data/.../video.mp4 \\
+        --units "F:30,Z:20,F:31" --condition_units "0"
+
+    # Complex 8-segment (forward / freeze / reverse interleaved),
+    # condition on units 0, 3 and 6 as reference frames:
+    python inference.py --source_video ./data/.../video.mp4 \\
+        --units "F:15,Z:5,R:10,F:15,Z:5,R:10,F:15,Z:6" \\
+        --condition_units "0,3,6"
+
+    # Very complex: 5 units with mid-point anchors, conditioned on 0 and 2
+    python inference.py --source_video ./data/.../video.mp4 \\
+        --units "F:20,Z:8,F:20,Z:8,F:25" \\
+        --condition_units "0,2,4"
 
 Use the pure model weight file (*_model.ckpt) saved by training for inference.
 """
@@ -12,138 +39,35 @@ Use the pure model weight file (*_model.ckpt) saved by training for inference.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
-import re
-import shutil
-from datetime import datetime
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, cast
+from typing import Optional, List
 
 import imageio
 import numpy as np
 import torch
-from torchvision.transforms import v2
-from PIL import Image, ImageDraw, ImageFont
+import torch.nn.functional as F
+import torchvision
+from PIL import Image
 
+from diffsynth.core import ModelConfig
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
-from utils.camera import get_target_camera_from_source, load_camera_from_json
-from utils.image import load_frames_using_imageio
-from utils.time_pattern import VALID_TIME_PATTERNS, TimePatternType, get_time_pattern
+from utils.camera import (
+    compute_plucker_pixel_resolution,
+    timefold_plucker,
+    make_preset_c2w,
+    CAMERA_PRESETS,
+    parse_cam_type,
+)
+from utils.temporal_trajectory import (
+    build_inference_trajectory,
+    pixel_to_latent_temporal_coords,
+)
 
-
-def to_hwc_numpy(frame: torch.Tensor | Image.Image | np.ndarray) -> np.ndarray:
-    """Tensor (CHW), PIL, or array -> HWC numpy for imageio."""
-    if isinstance(frame, torch.Tensor):
-        arr = frame.detach().cpu().numpy()
-    elif isinstance(frame, Image.Image):
-        arr = np.array(frame)
-    else:
-        arr = np.asarray(frame)
-    if arr.ndim == 3 and arr.shape[0] == 3:
-        arr = np.transpose(arr, (1, 2, 0))
-    return arr
-
-
-def read_video_fps(video_path: Path, default: float = 30.0) -> float:
-    try:
-        r = imageio.get_reader(str(video_path))
-        meta = r.get_meta_data()
-        r.close()
-        fps = meta.get("fps", default)
-        return float(fps) if fps else default
-    except Exception:
-        return default
-
-
-def parse_time_patterns(pattern_arg: str) -> list[TimePatternType]:
-    """Validate and split comma-separated time patterns."""
-    patterns: list[TimePatternType] = []
-    for p in pattern_arg.split(","):
-        p = p.strip()
-        if p not in VALID_TIME_PATTERNS:
-            raise ValueError(f"Invalid pattern '{p}'. Valid: {sorted(VALID_TIME_PATTERNS)}")
-        patterns.append(cast(TimePatternType, p))
-    return patterns
-
-
-def copy_input_video_to_output_dir(clip_path: Path, output_subdir: str) -> Optional[str]:
-    """Copy clip video.mp4 to output_subdir as forward_gt.mp4 if missing."""
-    src_video = clip_path / "video.mp4"
-    if not src_video.is_file():
-        return None
-
-    target_path = os.path.join(output_subdir, "forward_gt.mp4")
-    if os.path.exists(target_path):
-        return target_path
-
-    shutil.copy2(str(src_video), target_path)
-    return target_path
-
-
-def build_output_subdir(dataset_root: Path, clip_path: Path) -> str:
-    """results/{source}-{video}-{clip} from clip path under dataset_root/videos."""
-    videos_dir = dataset_root / "videos"
-    rel_path = clip_path.relative_to(videos_dir)
-    parts = list(rel_path.parts)
-
-    if len(parts) >= 3:
-        source, video_id, clip_id = parts[0], parts[1], parts[2]
-    elif len(parts) == 2:
-        source, video_id, clip_id = parts[0], parts[1], "clip"
-    else:
-        source, video_id, clip_id = "unknown", "unknown", "clip"
-
-    subdir_name = f"{source}-{video_id}-{clip_id}"
-    return os.path.join(RESULTS_DIR, subdir_name)
-
-
-def draw_pattern_label(frame: np.ndarray, pattern: str, is_target: bool) -> np.ndarray:
-    """Overlay pattern name and TARGET/PREDICTED on frame (HWC or CHW after caller prep)."""
-    if frame.ndim == 2:
-        frame = np.stack([frame, frame, frame], axis=-1)
-    elif frame.ndim == 3 and frame.shape[2] == 1:
-        frame = np.concatenate([frame, frame, frame], axis=2)
-    elif frame.ndim == 3 and frame.shape[2] == 4:
-        frame = frame[:, :, :3]
-
-    if frame.max() <= 1.0 + 1e-6:
-        frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
-    elif frame.dtype != np.uint8:
-        frame = frame.astype(np.uint8)
-
-    img = Image.fromarray(frame)
-    draw = ImageDraw.Draw(img)
-
-    font_size = max(20, min(frame.shape[0] // 20, 30))
-    try:
-        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", font_size)
-    except (OSError, IOError):
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-        except (OSError, IOError):
-            font = ImageFont.load_default()
-
-    label = f"[{pattern}] {'TARGET' if is_target else 'PREDICTED'}"
-
-    bbox = draw.textbbox((0, 0), label, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-
-    padding = 8
-    bg_x, bg_y = padding, padding
-    bg_w, bg_h = text_width + 2 * padding, text_height + 2 * padding
-
-    bg = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    bg_draw = ImageDraw.Draw(bg)
-    bg_draw.rectangle([bg_x, bg_y, bg_x + bg_w, bg_y + bg_h], fill=(0, 0, 0, 128))
-    img = Image.alpha_composite(img.convert("RGBA"), bg)
-    draw = ImageDraw.Draw(img)
-
-    draw.text((bg_x + padding, bg_y + padding), label, font=font, fill=(255, 255, 255, 255))
-
-    return np.array(img.convert("RGB"))
 
 DEFAULT_NEGATIVE_PROMPT = (
     "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，"
@@ -151,26 +75,378 @@ DEFAULT_NEGATIVE_PROMPT = (
     "手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
 )
 RESULTS_DIR = "results"
+# Default output video FPS when no source video metadata is available.
+DEFAULT_OUTPUT_FPS = 16.0
+
+WAN_TEMPORAL_STRIDE = 4
 
 
-def video_path_hash(video_rel_path: str) -> str:
-    """16-char SHA256 prefix for latent cache key."""
-    return hashlib.sha256(video_rel_path.encode()).hexdigest()[:16]
+def _compute_unit_total(units_str: str) -> int:
+    """Compute total frames from units string like 'F:40,Z:8,R:11,F:22'.
+
+    Returns -1 if units uses shorthand without explicit lengths.
+    """
+    units_str = units_str.strip()
+    if units_str.startswith("["):
+        return -1  # JSON explicit coords, length determined externally
+    total = 0
+    for part in units_str.split(","):
+        part = part.strip()
+        if ":" in part:
+            _, length_str = part.split(":", 1)
+            total += int(length_str.strip())
+        else:
+            return -1  # Single letter (F/R/Z) means full length, unknown here
+    return total
 
 
-def caption_content_hash(caption: str) -> str:
-    """16-char SHA256 prefix for caption latent cache key."""
-    return hashlib.sha256(caption.encode()).hexdigest()[:16]
+def _load_c2w_from_path(cam_path: str, num_frames: int, cam_type_arg=None) -> tuple:
+    """Load c2w [F, 4, 4] and intrinsics from .npy, meta.json, or ReCam JSON.
+
+    Returns:
+        (c2w, intrinsics_norm) where intrinsics_norm is (fx, fy, cx, cy) normalised
+        or None when not available.
+    """
+    try:
+        if cam_path.endswith(".npy"):
+            return np.linalg.inv(np.load(cam_path)).astype(np.float32), None
+        import json as _json
+        with open(cam_path) as f:
+            data = _json.load(f)
+        if "camera" in data and "extrinsics_c2w" in data["camera"]:
+            c2w = np.array(data["camera"]["extrinsics_c2w"], dtype=np.float32)
+            intr = None
+            if "intrinsics" in data["camera"]:
+                K = np.array(data["camera"]["intrinsics"], dtype=np.float32)
+                res = data.get("resolution")
+                if res is not None:
+                    H, W = res
+                    intr = (float(K[0, 0, 0]) / W, float(K[0, 1, 1]) / H,
+                            float(K[0, 0, 2]) / W, float(K[0, 1, 2]) / H)
+            return c2w, intr
+        else:
+            return None, None
+    except Exception as e:
+        print(f"Warning: failed to load c2w from {cam_path}: {e}")
+        return None, None
 
 
-def load_checkpoint(ckpt_path: str, device: str = "cpu") -> dict:
-    """Load checkpoint dict; supports Lightning state_dict and strips pipe.dit./dit. prefixes."""
-    obj = torch.load(ckpt_path, map_location=device, weights_only=False)
+def _c2w_to_plucker(
+    c2w: np.ndarray,
+    height: int,
+    width: int,
+    num_frames: int,
+    F_latent: int,
+    intrinsics_norm: tuple = None,
+    dtype=torch.float32,
+) -> torch.Tensor:
+    """Compute Plücker embeddings at pixel resolution, time-folded.
 
-    if isinstance(obj, dict) and "state_dict" in obj:
-        sd = obj["state_dict"]
+    Args:
+        c2w: c2w [F_pixel, 4, 4], already relative to first frame.
+        height: Pixel height.
+        width: Pixel width.
+        num_frames: Number of pixel frames.
+        F_latent: Number of latent frames.
+        intrinsics_norm: (fx, fy, cx, cy) normalised, or None for default 0.5.
+        dtype: Output dtype.
+
+    Returns:
+        [24, F_latent, H, W] time-folded Plücker for SimpleAdapter.
+    """
+    fx, fy, cx, cy = intrinsics_norm if intrinsics_norm is not None else (0.5, 0.5, 0.5, 0.5)
+
+    # Pad/trim to num_frames
+    if len(c2w) < num_frames:
+        last = c2w[-1:]
+        c2w = np.concatenate(
+            [c2w, np.tile(last, (num_frames - len(c2w), 1, 1))], axis=0
+        )
     else:
-        sd = obj
+        c2w = c2w[:num_frames]
+
+    plucker_raw = compute_plucker_pixel_resolution(
+        c2w, height, width, fx=fx, fy=fy, cx=cx, cy=cy, dtype=torch.float32
+    )  # [F_pixel, H, W, 6]
+    plucker_folded = timefold_plucker(
+        plucker_raw, F_latent, temporal_stride=WAN_TEMPORAL_STRIDE
+    )  # [24, F_latent, H, W]
+    return plucker_folded.to(dtype=dtype)
+
+
+# ---------------------------------------------------------------------------
+# Camera attention visualization
+# ---------------------------------------------------------------------------
+
+def _apply_colormap_viridis(values: np.ndarray) -> np.ndarray:
+    """Apply Viridis-like colormap: low=purple, mid=teal, high=yellow.
+
+    Args:
+        values: [H, W] array in [0, 1].
+
+    Returns:
+        [H, W, 3] uint8 RGB image.
+    """
+    # Simplified 4-stop Viridis: purple → blue → teal → yellow
+    # 0.0 → (68, 1, 84)
+    # 0.33 → (59, 82, 139)
+    # 0.66 → (33, 145, 140)
+    # 1.0 → (253, 231, 37)
+    t = values
+    r = np.where(t < 0.33, 68 + (59 - 68) * (t / 0.33),
+          np.where(t < 0.66, 59 + (33 - 59) * ((t - 0.33) / 0.33),
+                   33 + (253 - 33) * ((t - 0.66) / 0.34)))
+    g = np.where(t < 0.33, 1 + (82 - 1) * (t / 0.33),
+          np.where(t < 0.66, 82 + (145 - 82) * ((t - 0.33) / 0.33),
+                   145 + (231 - 145) * ((t - 0.66) / 0.34)))
+    b = np.where(t < 0.33, 84 + (139 - 84) * (t / 0.33),
+          np.where(t < 0.66, 139 + (140 - 139) * ((t - 0.33) / 0.33),
+                   140 + (37 - 140) * ((t - 0.66) / 0.34)))
+    return np.stack([r, g, b], axis=-1).clip(0, 255).astype(np.uint8)
+
+
+class CameraAttnCaptureHook:
+    """Forward hook to capture camera cross-attention signal strength.
+
+    Uses the L2 norm of the cross-attention output (residual) as a lightweight
+    proxy for "camera signal strength" per token — avoids computing the full
+    N×N attention matrix which would OOM on high-resolution videos.
+
+    Usage::
+        hook = CameraAttnCaptureHook()
+        handle = pipe.dit.camera_cross_attn.register_forward_hook(hook)
+        # run inference...
+        handle.remove()
+        signal_maps = hook.get_signal_maps(F_latent, H_token, W_token)
+    """
+
+    def __init__(self):
+        self._cam_signals: List[torch.Tensor] = []
+
+    def __call__(self, module, inputs, output):
+        """Hook callback: capture the norm of camera adapter output."""
+        # output is the camera condition from SimpleAdapter [B, dim, F, H, W]
+        # This hook may need adjustment for the new architecture
+        with torch.no_grad():
+            signal = output[-1].norm(dim=-1)  # [N]
+            self._cam_signals.append(signal.cpu())
+
+    def clear(self):
+        self._cam_signals.clear()
+
+    def get_signal_maps(self, f: int, h: int, w: int) -> List[np.ndarray]:
+        """Reshape captured signals to [F, H, W] arrays.
+
+        Higher value = stronger camera signal contribution at that token.
+
+        Returns:
+            List of [F, H, W] numpy arrays, one per denoising step.
+        """
+        expected_n = f * h * w
+        maps = []
+        for i, s in enumerate(self._cam_signals):
+            actual_n = s.numel()
+            if actual_n != expected_n:
+                raise ValueError(
+                    f"Signal shape mismatch at step {i}: expected {expected_n} tokens "
+                    f"(F={f}, H={h}, W={w}), got {actual_n}."
+                )
+            arr = s.float().numpy().reshape(f, h, w)
+            maps.append(arr)
+        return maps
+
+
+def render_cam_attn_video(
+    entropy_maps: List[np.ndarray],
+    out_path: str,
+    height: int,
+    width: int,
+    fps: float,
+    use_last_n_steps: int = 5,
+):
+    """Render camera attention entropy heatmap video.
+
+    Args:
+        entropy_maps: List of [F, H, W] entropy arrays (one per denoising step).
+        out_path: Output video path.
+        height, width: Target pixel resolution.
+        fps: Output video FPS.
+        use_last_n_steps: Average the last N denoising steps.
+    """
+    if not entropy_maps:
+        print("Warning: No entropy maps captured, skipping heatmap video.")
+        return
+
+    n = min(use_last_n_steps, len(entropy_maps))
+    avg_entropy = np.mean(entropy_maps[-n:], axis=0)  # [F, H, W]
+
+    # Normalize to [0, 1]
+    e_min, e_max = avg_entropy.min(), avg_entropy.max()
+    e_mean, e_std = avg_entropy.mean(), avg_entropy.std()
+    print(f"Cam-attn entropy: min={e_min:.3f}, max={e_max:.3f}, mean={e_mean:.3f}, std={e_std:.3f}")
+    if e_max - e_min < 1e-6:
+        print("Warning: Entropy values have no variance; heatmap will be uniform.")
+        avg_entropy = np.ones_like(avg_entropy) * 0.5
+    else:
+        avg_entropy = (avg_entropy - e_min) / (e_max - e_min)
+
+    f_lat, h_lat, w_lat = avg_entropy.shape
+    print(f"Rendering cam-attn heatmap: latent shape ({f_lat}, {h_lat}, {w_lat}) -> ({height}, {width})")
+
+    # Upsample to pixel resolution
+    entropy_tensor = torch.from_numpy(avg_entropy).unsqueeze(1).float()  # [F, 1, H, W]
+    entropy_up = F.interpolate(entropy_tensor, size=(height, width), mode="bilinear", align_corners=False)
+    entropy_up = entropy_up.squeeze(1).numpy()  # [F, H, W]
+
+    with imageio.get_writer(out_path, fps=fps, codec="libx264") as writer:
+        for i in range(entropy_up.shape[0]):
+            frame = _apply_colormap_viridis(entropy_up[i])
+            writer.append_data(frame)
+
+    print(f"Camera attention heatmap saved: {out_path}")
+
+
+def prepare_cam_attn_frames(
+    signal_maps: List[np.ndarray],
+    num_pixel_frames: int,
+    height: int,
+    width: int,
+    use_last_n_steps: int = 5,
+) -> Optional[np.ndarray]:
+    """Prepare camera signal heatmap frames for 2x2 video composition.
+
+    Args:
+        signal_maps: List of [F_lat, H_token, W_token] signal strength arrays.
+        num_pixel_frames: Target number of pixel frames.
+        height, width: Target pixel resolution.
+        use_last_n_steps: Average the last N denoising steps.
+
+    Returns:
+        [num_pixel_frames, H, W, 3] uint8 RGB array of heatmap frames,
+        or None if signal_maps is empty.
+    """
+    if not signal_maps:
+        return None
+
+    n = min(use_last_n_steps, len(signal_maps))
+    avg_signal = np.mean(signal_maps[-n:], axis=0)  # [F_lat, H_token, W_token]
+
+    # Normalize
+    s_min, s_max = avg_signal.min(), avg_signal.max()
+    s_mean, s_std = avg_signal.mean(), avg_signal.std()
+    print(f"Cam-attn signal: min={s_min:.3f}, max={s_max:.3f}, mean={s_mean:.3f}, std={s_std:.3f}")
+    if s_std < 0.01:
+        print(
+            "Warning: Signal values have very low variance (std < 0.01). "
+            "This usually means camera_cross_attn was not trained."
+        )
+    if s_max - s_min < 1e-6:
+        avg_signal = np.ones_like(avg_signal) * 0.5
+    else:
+        avg_signal = (avg_signal - s_min) / (s_max - s_min)
+
+    f_lat, h_token, w_token = avg_signal.shape
+
+    # Upsample spatially: [F_lat, 1, H_token, W_token] -> [F_lat, 1, H, W]
+    signal_tensor = torch.from_numpy(avg_signal).unsqueeze(1).float()
+    signal_spatial = F.interpolate(signal_tensor, size=(height, width), mode="bilinear", align_corners=False)
+    # Upsample temporally using trilinear: [1, 1, F_lat, H, W] -> [1, 1, num_pixel_frames, H, W]
+    signal_5d = signal_spatial.unsqueeze(0).permute(0, 2, 1, 3, 4)  # [1, 1, F_lat, H, W]
+    signal_upsampled = F.interpolate(signal_5d, size=(num_pixel_frames, height, width), mode="trilinear", align_corners=False)
+    signal_final = signal_upsampled[0, 0].numpy()  # [num_pixel_frames, H, W]
+
+    # Apply colormap to each frame
+    heatmap_frames = np.stack([_apply_colormap_viridis(signal_final[i]) for i in range(num_pixel_frames)], axis=0)
+    return heatmap_frames  # [num_pixel_frames, H, W, 3] uint8
+
+
+def blend_heatmap_on_image(heatmap: np.ndarray, image: np.ndarray, alpha_blend: float = 0.5) -> np.ndarray:
+    """Blend heatmap on top of an image.
+
+    Args:
+        heatmap: [H, W, 3] uint8 RGB heatmap.
+        image: [H, W, 3] uint8 RGB image.
+        alpha_blend: Blend weight for heatmap (0 = image only, 1 = heatmap only).
+
+    Returns:
+        [H, W, 3] uint8 blended image.
+    """
+    blended = (1 - alpha_blend) * image.astype(np.float32) + alpha_blend * heatmap.astype(np.float32)
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Model path helpers
+# ---------------------------------------------------------------------------
+
+def resolve_dit_path(wan_model_dir: str) -> str:
+    """Resolve DiT weights under a Wan2.1-style folder."""
+    wan_model_dir = os.path.expanduser(wan_model_dir)
+    patterns = [
+        "diffusion_pytorch_model.safetensors",
+        "diffusion_pytorch_model*.safetensors",
+        "wan_video_dit*.safetensors",
+        "model*.safetensors",
+        "dit*.safetensors",
+    ]
+    for pattern in patterns:
+        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            raise ValueError(f"multiple DiT files for `{pattern}` under `{wan_model_dir}`: {matched}")
+    raise FileNotFoundError(f"no DiT checkpoint under `{wan_model_dir}`")
+
+
+def resolve_vae_path(wan_model_dir: str) -> Optional[str]:
+    wan_model_dir = os.path.expanduser(wan_model_dir)
+    patterns = [
+        "Wan2.1_VAE.pth",
+        "Wan2.1_VAE.safetensors",
+        "Wan2.2_VAE.pth",
+        "Wan2.2_VAE.safetensors",
+        "wan_video_vae*.pth",
+        "wan_video_vae*.safetensors",
+    ]
+    for pattern in patterns:
+        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
+        if matched:
+            return matched[0]
+    return None
+
+
+def resolve_text_encoder_path(wan_model_dir: str) -> Optional[str]:
+    wan_model_dir = os.path.expanduser(wan_model_dir)
+    patterns = [
+        "models_t5_umt5-xxl-enc-bf16.pth",
+        "models_t5_umt5-xxl-enc-bf16.safetensors",
+        "models_t5*.pth",
+        "models_t5*.safetensors",
+    ]
+    for pattern in patterns:
+        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
+        if matched:
+            return matched[0]
+    return None
+
+
+def resolve_tokenizer_path(wan_model_dir: str) -> Optional[str]:
+    wan_model_dir = os.path.expanduser(wan_model_dir)
+    for rel in ("google/umt5-xxl", "google\\umt5-xxl", "umt5-xxl"):
+        p = os.path.join(wan_model_dir, *rel.replace("\\", "/").split("/"))
+        if os.path.isdir(p):
+            return p
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def load_checkpoint(ckpt_path: str, device: str = "cuda") -> dict:
+    """Load checkpoint dict; strips pipe.dit./dit. prefixes."""
+    obj = torch.load(ckpt_path, map_location=device, weights_only=False)
+    sd = obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
 
     def strip_prefix(k):
         if k.startswith("pipe.dit."):
@@ -182,8 +458,15 @@ def load_checkpoint(ckpt_path: str, device: str = "cpu") -> dict:
     return {strip_prefix(k): v for k, v in sd.items()}
 
 
+def caption_content_hash(caption: str) -> str:
+    return hashlib.sha256(caption.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
+
 def resolve_inference_device(device: str, gpu_id: Optional[int]) -> str:
-    """Return device string; cuda + gpu_id -> cuda:N."""
     if gpu_id is None:
         return device
     d = device.strip().lower()
@@ -194,132 +477,220 @@ def resolve_inference_device(device: str, gpu_id: Optional[int]) -> str:
     raise SystemExit(f"--gpu_id requires --device cuda or cuda:* (got --device {device!r})")
 
 
-def resolve_clip_path(
-    clip_dir: Optional[str],
-    dataset_root: Optional[str],
-    clip_relpath: Optional[str],
-) -> tuple[Path, Path]:
-    """Resolve (clip_path, dataset_root). Use --clip_dir or --dataset_root + --clip_relpath."""
-    if clip_dir:
-        clip_path = Path(clip_dir).resolve()
-        parts = clip_path.parts
-        if "videos" in parts:
-            idx = parts.index("videos")
-            inferred_root = Path(*parts[:idx]) if idx > 0 else Path(".")
-        else:
-            inferred_root = clip_path.parent
-        return clip_path, inferred_root
-
-    if dataset_root and clip_relpath:
-        clip_path = Path(dataset_root) / "videos" / clip_relpath
-        return clip_path.resolve(), Path(dataset_root).resolve()
-
-    raise ValueError("Provide --clip_dir or both --dataset_root and --clip_relpath")
+def read_video_fps(video_path: Path, default: float = DEFAULT_OUTPUT_FPS) -> float:
+    try:
+        r = imageio.get_reader(str(video_path))
+        meta = r.get_meta_data()
+        r.close()
+        fps = meta.get("fps", default)
+        return float(fps) if fps else default
+    except Exception:
+        return default
 
 
-def derive_target_video_path(clip_path: Path, dataset_root: Path, pattern: str) -> Path:
-    """target_videos/<relpath_under_videos>/{pattern}_video.mp4"""
-    rel_path = clip_path.relative_to(dataset_root / "videos")
-    return dataset_root / "target_videos" / rel_path / f"{pattern}_video.mp4"
+# ---------------------------------------------------------------------------
+# Source video / image loading helpers
+# ---------------------------------------------------------------------------
+
+def load_source_video(video_path: Path, num_frames: int, height: int, width: int) -> list[Image.Image]:
+    """Load ``num_frames`` frames from *video_path*, resized / cropped to (height, width)."""
+    from torchvision.transforms import v2
+
+    transform = v2.Compose([
+        v2.Resize(size=(height, width), antialias=True),
+        v2.CenterCrop(size=(height, width)),
+    ])
+
+    vframes, _, _ = torchvision.io.read_video(str(video_path), pts_unit="sec", output_format="TCHW")
+    total = int(vframes.shape[0])
+    if total == 0:
+        raise ValueError(f"No frames decoded from {video_path}")
+
+    # Sample / pad to exactly num_frames
+    indices = [round(i * (total - 1) / max(num_frames - 1, 1)) for i in range(num_frames)]
+    frames: list[Image.Image] = []
+    for idx in indices:
+        idx = max(0, min(idx, total - 1))
+        t = transform(vframes[idx])  # CHW uint8
+        frames.append(Image.fromarray(t.permute(1, 2, 0).numpy()))
+    return frames
 
 
-def parse_preset_cam_indices(arg: Optional[str]) -> list[int]:
-    """Parse --preset_cam as '3' or '1,2,3' (1-10). Empty / None -> []."""
-    if arg is None or not str(arg).strip():
-        return []
-    out: list[int] = []
-    for part in re.split(r"[\s,]+", str(arg).strip()):
-        if not part:
-            continue
-        try:
-            v = int(part, 10)
-        except ValueError as e:
-            raise ValueError(f"Invalid --preset_cam token {part!r} (expected integers 1-10)") from e
-        if not (1 <= v <= 10):
-            raise ValueError(f"--preset_cam indices must be 1-10, got {v}")
-        out.append(v)
-    return out
+def load_source_images(image_paths: list[str], height: int, width: int) -> list[Image.Image]:
+    """Load sparse reference images from *image_paths*, resized to (height, width)."""
+    frames: list[Image.Image] = []
+    for p in image_paths:
+        img = Image.open(p).convert("RGB")
+        img = img.resize((width, height), Image.LANCZOS)
+        frames.append(img)
+    return frames
 
 
-def resolve_run_output_path(
-    output_opt: Optional[str],
-    default_subdir: str,
-    run_tag: str,
-    ts: str,
-    multiple_runs: bool,
-) -> str:
-    """Output path: run_tag e.g. ``reverse`` or ``reverse_preset_03``. Multiple runs -> --output must be a directory if set."""
-    name = f"{run_tag}_{ts}.mp4"
-    if not output_opt:
-        return os.path.join(default_subdir, name)
+# ---------------------------------------------------------------------------
+# Latent helpers
+# ---------------------------------------------------------------------------
 
-    p = Path(output_opt).expanduser()
-    if not p.is_absolute():
-        p = Path.cwd() / p
-    p = p.resolve()
+def encode_video_pixels(
+    pipe: Wan4DPipeline,
+    video: torch.Tensor,
+    device: str,
+    dtype: torch.dtype,
+    tiled: bool = False,
+    tile_size: tuple = (34, 34),
+    tile_stride: tuple = (18, 16),
+) -> torch.Tensor:
+    """VAE-encode a pixel-space video tensor.
 
-    if multiple_runs:
-        if p.is_file() or p.suffix.lower() == ".mp4":
-            raise SystemExit(
-                "With multiple --pattern or --preset_cam values, --output must be a directory, not an .mp4 file."
-            )
-        p.mkdir(parents=True, exist_ok=True)
-        return str(p / name)
+    Args:
+        pipe: Pipeline with VAE loaded.
+        video: ``[C, T, H, W]`` float in [-1, 1].
+        device, dtype: Target device and dtype.
 
-    if p.suffix.lower() == ".mp4":
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return str(p)
+    Returns:
+        ``[16, F_latent, H_l, W_l]`` latent tensor.
+    """
+    if pipe.vae is None:
+        raise RuntimeError("VAE not loaded; cannot encode video.")
+    video_batch = video.unsqueeze(0).to(device=device, dtype=dtype)  # [1, C, T, H, W]
+    with torch.no_grad():
+        latent = pipe.vae.encode(
+            video_batch, device=device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride
+        )  # [1, 16, F_latent, H_l, W_l]
+    return latent.squeeze(0)  # [16, F_latent, H_l, W_l]
 
-    p.mkdir(parents=True, exist_ok=True)
-    return str(p / name)
 
+def encode_condition_frame(
+    pipe: Wan4DPipeline,
+    frame: torch.Tensor,
+    device: str,
+    dtype: torch.dtype,
+    tiled: bool = False,
+    tile_size: tuple = (34, 34),
+    tile_stride: tuple = (18, 16),
+) -> torch.Tensor:
+    """Encode a single condition frame via the Video VAE (chunk 0 path).
+
+    Args:
+        frame: ``[C, H, W]`` float in [-1, 1].
+
+    Returns:
+        ``[16, H_l, W_l]`` latent tensor for the single frame.
+    """
+    if pipe.vae is None:
+        raise RuntimeError("VAE not loaded; cannot encode condition frame.")
+    frame_batch = frame.unsqueeze(0).unsqueeze(2).to(device=device, dtype=dtype)
+    with torch.no_grad():
+        z = pipe.vae.single_encode(frame_batch, device)
+    return z[0, :, 0]
+
+
+def build_condition_from_frames(
+    pipe: Wan4DPipeline,
+    condition_frame_indices: list[int],
+    target_frames_tensor: torch.Tensor,
+    F_latent: int,
+    device: str,
+    dtype: torch.dtype,
+    tiled: bool = False,
+    tile_size: tuple = (34, 34),
+    tile_stride: tuple = (18, 16),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build condition latents and 4ch mask from arbitrary condition frame indices.
+
+    Args:
+        condition_frame_indices: Pixel-space frame indices to use as conditions.
+        target_frames_tensor: ``[C, T, H, W]`` target video (remapped) in [-1, 1].
+        F_latent: Number of latent frames.
+
+    Returns:
+        condition_latents: ``[1, 16, F_latent, H_l, W_l]``.
+        condition_mask:    ``[1, 4, F_latent, H_l, W_l]``.
+    """
+    if pipe.vae is None:
+        raise RuntimeError("VAE not loaded; cannot build condition.")
+
+    C, T, H, W = target_frames_tensor.shape
+    H_l, W_l = H // 8, W // 8
+
+    cond_video = torch.zeros(1, C, T, H, W, dtype=dtype, device=device)
+    pixel_mask = torch.zeros(1, T, H_l, W_l, dtype=dtype, device=device)
+
+    for frame_idx in condition_frame_indices:
+        if 0 <= frame_idx < T:
+            cond_video[0, :, frame_idx] = target_frames_tensor[:, frame_idx].to(device=device, dtype=dtype)
+            pixel_mask[0, frame_idx] = 1.0
+
+    condition_latents = pipe.vae.single_encode(cond_video, device)
+    condition_latents = condition_latents.to(dtype=dtype, device=device)
+
+    mask_folded = torch.cat([
+        pixel_mask[:, 0:1].expand(-1, 4, -1, -1),
+        pixel_mask[:, 1:],
+    ], dim=1)
+    condition_mask = mask_folded.view(1, F_latent, 4, H_l, W_l).permute(0, 2, 1, 3, 4).contiguous()
+
+    return condition_latents, condition_mask
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Wan4D inference")
+    p = argparse.ArgumentParser(
+        description="Wan4D inference — source video + temporal trajectory control",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Unit types: F=forward  R=reverse  Z=freeze
+Task format: "UNITS|INDEXS"  (INDEXS = comma-separated 0-based unit indices for condition frames)
 
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument(
-        "--clip_dir",
-        type=str,
-        default=None,
-        help="Path to clip directory (e.g., .../videos/source/vid/clip_0)",
+Examples:
+  # Single task
+  python inference.py --clip ./clip --wan_model_dir ./models --ckpt step500_model.ckpt \\
+      --tasks "F:81|0"
+
+  # Batch: multiple tasks, model loaded once
+  python inference.py --clip ./clip --wan_model_dir ./models --ckpt step500_model.ckpt \\
+      --tasks "F:40,Z:8,R:11,F:22|1,3" "F:41,R:40|0,1" "F:30,Z:20,F:31|0"
+""",
     )
-    g.add_argument(
-        "--dataset_root",
+
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "--clip",
         type=str,
         default=None,
-        help="Dataset root directory (requires --clip_relpath)",
+        help="Dataset clip directory path. Expects video.mp4 and optional caption.txt.",
     )
-    p.add_argument(
-        "--clip_relpath",
+    src.add_argument(
+        "--source_video",
         type=str,
         default=None,
-        help="Relative path under videos/, e.g., source/vid/clip_0",
+        help="Path to source video file (.mp4 etc.).",
+    )
+    src.add_argument(
+        "--source_images",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Paths to sparse source images (used as the source instead of a video).",
     )
 
     p.add_argument("--wan_model_dir", type=str, required=True, help="Path to Wan model directory")
-    p.add_argument("--ckpt", type=str, default=None, help="Pure model weight file from training (step{N}_model.ckpt)")
-
     p.add_argument(
-        "--pattern",
-        type=str,
-        default="forward",
-        help="Time pattern(s), comma-separated, e.g. forward,reverse,pingpong",
-    )
-    p.add_argument(
-        "--preset_cam",
+        "--ckpt",
         type=str,
         default=None,
-        help="JSON preset cameras: one index or comma-separated batch (e.g. 1,2,3). "
-        "Requires a single --pattern (no commas) for target time embedding; output names include both.",
-    )
-    p.add_argument(
-        "--camera_json",
-        type=str,
-        default=None,
-        help="Camera JSON (default: {dataset_root}/cameras/camera_extrinsics.json)",
+        help="Pure model weight file from training (step{N}_model.ckpt). "
+             "If omitted, uses base Wan2.1 weights.",
     )
 
+    p.add_argument(
+        "--caption",
+        type=str,
+        default=None,
+        help="Text caption / prompt. If omitted, a caption.txt next to the source video is tried.",
+    )
     p.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cfg_scale", type=float, default=5.0)
@@ -329,8 +700,6 @@ def parse_args():
     p.add_argument("--num_frames", type=int, default=81)
     p.add_argument("--tiled", default=True, action=argparse.BooleanOptionalAction)
 
-    p.add_argument("--no_latent_cache", action="store_true", help="Ignore caption_latents/ and latents/ caches")
-
     p.add_argument("--device", type=str, default="cuda", help="Device (cuda, cpu, mps)")
     p.add_argument(
         "--gpu_id",
@@ -339,250 +708,483 @@ def parse_args():
         metavar="N",
         help="CUDA device index. Ignored for cpu/mps.",
     )
-
+    p.add_argument(
+        "--fps",
+        type=float,
+        default=24.0,
+        help="Video frames per second used to compute absolute time coordinates (default: 24).",
+    )
+    p.add_argument(
+        "--camera",
+        type=str,
+        default=None,
+        help=(
+            "Optional camera file (.npy extrinsics or meta.json). "
+            "If omitted, identity camera is used (no camera motion control)."
+        ),
+    )
+    p.add_argument(
+        "--cam_type",
+        type=str,
+        default="0",
+        help="Camera index when --camera is a JSON file (e.g. 'cam00' or '0', default 0).",
+    )
+    p.add_argument(
+        "--camera_preset",
+        type=str,
+        default=None,
+        choices=CAMERA_PRESETS,
+        metavar="PRESET",
+        help=(
+            "Preset camera trajectory. Choices: "
+            + ", ".join(CAMERA_PRESETS)
+            + ". Ignored when --camera is given."
+        ),
+    )
+    p.add_argument(
+        "--camera_speed",
+        type=float,
+        default=0.02,
+        help="Translation speed per pixel frame for --camera_preset (default: 0.02).",
+    )
+    p.add_argument(
+        "--save_cam_attn",
+        action="store_true",
+        help=(
+            "Save camera cross-attention entropy heatmap video. "
+            "Output: <video>_cam_attn.mp4 showing per-token attention distribution."
+        ),
+    )
     p.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Override output: single run -> .mp4 path or directory; multiple --pattern or --preset_cam -> directory only.",
+        help="Output subdirectory under results/. "
+             "The filename is auto-generated from units, condition_units and clip id. "
+             "e.g. --output myexp -> results/myexp/<auto>.mp4. "
+             "If omitted, saved directly under results/.",
+    )
+    p.add_argument(
+        "--tasks",
+        type=str,
+        nargs="+",
+        required=True,
+        metavar="UNITS|INDEXS",
+        help="One or more tasks in 'UNITS|INDEXS' format. "
+             "UNITS: e.g. 'F:40,Z:8,R:11,F:22'  (F=forward R=reverse Z=freeze). "
+             "INDEXS: comma-separated 0-based unit indices for condition frames.",
     )
 
     return p.parse_args()
 
 
+def _sanitize_units(units_str: str) -> str:
+    """Convert 'F:40,Z:8,R:11,F:22' -> 'F40-Z8-R11-F22'."""
+    return units_str.replace(",", "_").replace(":", "").replace(" ", "")
+
+
+def _derive_clip_id(clip: Optional[str], source_video: Optional[str], source_images: Optional[list]) -> str:
+    """Derive a short clip id from the source path."""
+    if clip is not None:
+        p = Path(clip)
+        parts = p.parts
+        if len(parts) >= 2:
+            return f"{parts[-2]}-{parts[-1]}"
+        return p.name
+    if source_video is not None:
+        return Path(source_video).stem
+    if source_images:
+        return Path(source_images[0]).stem
+    return "unknown"
+
+
+def _auto_filename(units_str: str, condition_units_str: str, clip_id: str, backward: bool = False) -> str:
+    units_part = _sanitize_units(units_str)
+    cond_part = "c" + condition_units_str.replace(",", "-").replace(" ", "")
+    bwd_part = "_bwd" if backward else ""
+    return f"{units_part}_{cond_part}{bwd_part}_{clip_id}.mp4"
+
+
+def _parse_tasks(args) -> list[tuple[str, str, bool]]:
+    tasks = []
+    for spec in args.tasks:
+        parts = spec.split("|")
+        if len(parts) < 2:
+            raise SystemExit(
+                f"--tasks: invalid spec {spec!r}. Expected 'UNITS|INDEXS' or 'UNITS|INDEXS|b'."
+            )
+        units_str = parts[0].strip()
+        cond_str = parts[1].strip()
+        backward = len(parts) >= 3 and parts[2].strip().lower() in ("b", "backward", "1", "true")
+        tasks.append((units_str, cond_str, backward))
+    return tasks
+
+
+def run_one_task(
+    pipe,
+    args,
+    source_frames_tensor: torch.Tensor,
+    source_video_path,
+    caption_text: str,
+    units_str: str,
+    condition_units_str: str,
+    backward: bool,
+    device: str,
+    clip_id: str,
+    out_fps: float,
+    fps: float = 24.0,
+    c2w: Optional[np.ndarray] = None,
+    intrinsics_norm: tuple = None,
+    save_cam_attn: bool = False,
+):
+    try:
+        condition_unit_indices = [
+            int(v.strip()) for v in condition_units_str.split(",") if v.strip()
+        ]
+    except ValueError as exc:
+        raise SystemExit(
+            f"condition_units invalid ({exc}). Expected comma-separated integers."
+        ) from exc
+
+    # Check if unit total exceeds source frames (pred_only mode)
+    unit_total = _compute_unit_total(units_str)
+    pred_only = False
+    actual_num_frames = args.num_frames
+    if unit_total > 0 and unit_total > args.num_frames:
+        print(f"Warning: unit total ({unit_total}) > num_frames ({args.num_frames}), "
+              "saving prediction only (no GT comparison)")
+        actual_num_frames = unit_total
+        pred_only = True
+
+    result = build_inference_trajectory(
+        num_frames=actual_num_frames,
+        units=units_str,
+        backward=backward,
+        condition_unit_indices=condition_unit_indices,
+        fps=fps,
+    )
+    temporal_coords = torch.tensor(
+        pixel_to_latent_temporal_coords(result.temporal_coords, actual_num_frames),
+        dtype=torch.float32,
+        device=device,
+    ).unsqueeze(0)
+    F_latent = temporal_coords.shape[1]
+    print(f"Trajectory: {result.trajectory_type} ({actual_num_frames} frames @ {fps}fps)")
+    print(f"Condition frames: {result.condition_frame_indices}")
+
+    # Build target frames tensor (for condition encoding and GT comparison)
+    # In pred_only mode, we still need some frames for condition, so clamp to available
+    max_src_frame = source_frames_tensor.shape[1] - 1
+    if pred_only:
+        # Allocate tensor for actual_num_frames, clamping source indices
+        target_frames_tensor = torch.empty(
+            source_frames_tensor.shape[0], actual_num_frames,
+            source_frames_tensor.shape[2], source_frames_tensor.shape[3],
+            dtype=source_frames_tensor.dtype, device=source_frames_tensor.device
+        )
+        for i, p in enumerate(result.temporal_coords):
+            src_idx = round(p * fps)
+            src_idx = max(0, min(src_idx, max_src_frame))  # Clamp to available
+            target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
+    else:
+        target_frames_tensor = torch.empty_like(source_frames_tensor)
+        for i, p in enumerate(result.temporal_coords):
+            src_idx = round(p * fps)
+            src_idx = max(0, min(src_idx, max_src_frame))
+            target_frames_tensor[:, i] = source_frames_tensor[:, src_idx]
+
+    # Remap camera trajectory to match temporal trajectory
+    plucker_embedding: Optional[torch.Tensor] = None
+    if c2w is not None:
+        c2w_remapped = np.empty((actual_num_frames, 4, 4), dtype=np.float32)
+        c2w_max = len(c2w) - 1
+        for i, p in enumerate(result.temporal_coords):
+            src_idx = round(p * fps)
+            src_idx = max(0, min(src_idx, c2w_max))
+            c2w_remapped[i] = c2w[src_idx]
+        plucker_embedding = _c2w_to_plucker(
+            c2w_remapped, args.height, args.width, actual_num_frames, F_latent,
+            intrinsics_norm=intrinsics_norm,
+        ).unsqueeze(0).to(device=device, dtype=torch.bfloat16)
+
+    tile_size = (34, 34)
+    tile_stride = (18, 16)
+
+    cond_latents, cond_mask = build_condition_from_frames(
+        pipe, result.condition_frame_indices, target_frames_tensor, F_latent,
+        device=device, dtype=torch.bfloat16,
+        tiled=args.tiled, tile_size=tile_size, tile_stride=tile_stride,
+    )
+
+    # --- Set up camera attention hook if requested ---
+    cam_attn_hook = None
+    hook_handle = None
+    H_tok = args.height // 16
+    W_tok = args.width // 16
+    if save_cam_attn and plucker_embedding is not None:
+        cam_attn_hook = CameraAttnCaptureHook()
+        if hasattr(pipe.dit, "camera_cross_attn") and pipe.dit.camera_cross_attn is not None:
+            hook_handle = pipe.dit.camera_cross_attn.register_forward_hook(cam_attn_hook)
+            print("Camera attention capture enabled.")
+        else:
+            print("Warning: --save_cam_attn but no camera_cross_attn module found.")
+            cam_attn_hook = None
+
+    frames = pipe(
+        prompt=caption_text,
+        negative_prompt=args.negative_prompt,
+        condition_latents=cond_latents,
+        condition_mask=cond_mask,
+        temporal_coords=temporal_coords,
+        plucker_embedding=plucker_embedding,
+        cfg_scale=args.cfg_scale,
+        seed=args.seed,
+        num_inference_steps=args.num_inference_steps,
+        height=args.height,
+        width=args.width,
+        num_frames=actual_num_frames,
+        tiled=args.tiled,
+    )
+
+    # --- Remove hook and prepare heatmap frames ---
+    cam_attn_frames: Optional[np.ndarray] = None
+    if hook_handle is not None:
+        hook_handle.remove()
+    if cam_attn_hook is not None and cam_attn_hook._cam_signals:
+        try:
+            signal_maps = cam_attn_hook.get_signal_maps(F_latent, H_tok, W_tok)
+            cam_attn_frames = prepare_cam_attn_frames(
+                signal_maps, num_pixel_frames=actual_num_frames,
+                height=args.height, width=args.width,
+            )
+        except Exception as e:
+            print(f"Warning: failed to prepare cam-attn heatmap: {e}")
+
+    auto_name = _auto_filename(units_str, condition_units_str, clip_id, backward)
+    if args.output is not None:
+        out_path = os.path.join(RESULTS_DIR, args.output, auto_name)
+    else:
+        out_path = os.path.join(RESULTS_DIR, auto_name)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+
+    n_write = len(frames)
+
+    if pred_only:
+        # Save prediction only (no GT comparison)
+        print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps) [prediction only]")
+        with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
+            for i in range(n_write):
+                pred = to_hwc_numpy(frames[i])
+                if pred.dtype != np.uint8:
+                    pred = np.clip(pred, 0, 255).astype(np.uint8)
+                writer.append_data(pred)
+    else:
+        # Standard mode: GT | Pred side-by-side (or 2x2 with cam_attn)
+        target_vis = ((target_frames_tensor.detach().cpu().permute(1, 2, 3, 0) + 1.0) * 127.5)
+        target_vis = target_vis.clamp(0, 255).byte().numpy()
+        n_write = min(len(frames), target_vis.shape[0])
+
+        composite_2x2 = cam_attn_frames is not None and len(cam_attn_frames) >= n_write
+        if composite_2x2:
+            print(f"Writing 2x2 composite: {out_path} ({n_write} frames @ {out_fps} fps)")
+        else:
+            print(f"Writing {out_path} ({n_write} frames @ {out_fps} fps)")
+        with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
+            for i in range(n_write):
+                pred = to_hwc_numpy(frames[i])
+                if pred.dtype != np.uint8:
+                    pred = np.clip(pred, 0, 255).astype(np.uint8)
+                target = target_vis[i]
+                if target.shape != pred.shape:
+                    raise RuntimeError(
+                        f"target/pred shape mismatch at frame {i}: {target.shape} vs {pred.shape}"
+                    )
+                if composite_2x2:
+                    # 2x2 layout: GT | Pred / CamAttn | Overlay
+                    heatmap = cam_attn_frames[i]
+                    overlay = blend_heatmap_on_image(heatmap, pred, alpha_blend=0.4)
+                    top_row = np.concatenate([target, pred], axis=1)
+                    bottom_row = np.concatenate([heatmap, overlay], axis=1)
+                    composite = np.concatenate([top_row, bottom_row], axis=0)
+                    writer.append_data(composite)
+                else:
+                    writer.append_data(np.concatenate([target, pred], axis=1))
+
+
+def to_hwc_numpy(frame) -> np.ndarray:
+    if isinstance(frame, torch.Tensor):
+        arr = frame.detach().cpu().numpy()
+    elif isinstance(frame, Image.Image):
+        arr = np.array(frame)
+    else:
+        arr = np.asarray(frame)
+    if arr.ndim == 3 and arr.shape[0] == 3:
+        arr = np.transpose(arr, (1, 2, 0))
+    return arr
+
+
 def main():
     args = parse_args()
-
     device = resolve_inference_device(args.device, args.gpu_id)
 
-    try:
-        preset_indices = parse_preset_cam_indices(args.preset_cam)
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
+    dit_path = resolve_dit_path(args.wan_model_dir)
+    model_configs = [ModelConfig(path=dit_path)]
 
-    preset_tgt_pattern: Optional[TimePatternType] = None
-    if preset_indices:
-        pnorm = args.pattern.replace(" ", "")
-        if "," in pnorm:
-            raise SystemExit(
-                "With --preset_cam, use a single --pattern (no commas). "
-                "Batch multiple cameras via --preset_cam 1,2,3 — not multiple patterns."
-            )
-        preset_tgt_pattern = parse_time_patterns(pnorm)[0]
-        runs = [("preset", idx) for idx in preset_indices]
-    else:
-        runs = [("pattern", p) for p in parse_time_patterns(args.pattern)]
-
-    multiple_runs = len(runs) > 1
-
-    clip_path, dataset_root = resolve_clip_path(args.clip_dir, args.dataset_root, args.clip_relpath)
-
-    videos_root = dataset_root / "videos"
-    if not clip_path.is_relative_to(videos_root):
-        raise ValueError(
-            f"Clip directory must lie under the dataset videos folder:\n"
-            f"  clip_path: {clip_path}\n"
-            f"  expected under: {videos_root.resolve()}\n"
-            f"(Fix --clip_dir / --dataset_root so the clip lives under .../videos/...)"
+    vae_path = resolve_vae_path(args.wan_model_dir)
+    if vae_path is None:
+        raise FileNotFoundError(
+            f"No Wan VAE weights under `{args.wan_model_dir}`. "
+            "Place Wan2.1_VAE.pth (or similar) next to the DiT checkpoint."
         )
+    model_configs.append(ModelConfig(path=vae_path))
 
-    for path, label in (
-        (clip_path / "video.mp4", "video.mp4"),
-        (clip_path / "meta.json", "meta.json"),
-        (clip_path / "caption.txt", "caption.txt"),
-    ):
-        if not path.is_file():
-            raise FileNotFoundError(f"Missing {label}: {path}")
-
-    caption_text = (clip_path / "caption.txt").read_text(encoding="utf-8").strip()
-    if not caption_text:
-        raise ValueError(f"Empty caption: {clip_path / 'caption.txt'}")
-
-    meta = json.loads((clip_path / "meta.json").read_text(encoding="utf-8"))
-    src_c2w = np.array(meta["camera"]["extrinsics_c2w"], dtype=np.float32)
-
-    src_time = torch.tensor(get_time_pattern("forward", args.num_frames), dtype=torch.float32).unsqueeze(0)
-
-    prompt_context: Optional[torch.Tensor] = None
-    source_latents: Optional[torch.Tensor] = None
-    source_video: Optional[torch.Tensor] = None
-
-    if not args.no_latent_cache:
-        rel_video = (
-            f"videos/{clip_path.relative_to(dataset_root)}/video.mp4"
-            if clip_path.is_relative_to(dataset_root)
-            else str(clip_path / "video.mp4")
+    t5_path = resolve_text_encoder_path(args.wan_model_dir)
+    if t5_path is None:
+        raise FileNotFoundError(
+            f"No T5/UMT5 text encoder under `{args.wan_model_dir}`. "
+            "Expected e.g. `models_t5_umt5-xxl-enc-bf16.pth`."
         )
-        cap_latent_file = dataset_root / "caption_latents" / f"{caption_content_hash(caption_text)}.pt"
-        if cap_latent_file.is_file():
-            td = torch.load(cap_latent_file, weights_only=True, map_location="cpu")
-            prompt_context = td["text_embeds"].detach()
-            print(f"Using caption latent: {cap_latent_file}")
-        else:
-            print(f"No caption latent at {cap_latent_file}")
+    model_configs.append(ModelConfig(path=t5_path))
 
-        src_latent_file = dataset_root / "latents" / f"{video_path_hash(rel_video)}.pt"
-        if src_latent_file.is_file():
-            pack = torch.load(src_latent_file, weights_only=True, map_location="cpu")
-            source_latents = pack["latents"].detach().unsqueeze(0).to(torch.bfloat16)
-            print(f"Using source VAE latent: {src_latent_file}")
-        else:
-            print(f"No source latent at {src_latent_file}")
-    else:
-        print("--no_latent_cache: ignoring latent caches")
-
-    latent_t = (args.num_frames - 1) // 4 + 1
-    if source_latents is not None:
-        _, t, _, _ = source_latents.shape[1:]
-        if t != latent_t:
-            raise ValueError(f"Source latent T={t}, expected {latent_t} for num_frames={args.num_frames}")
-
-    if source_latents is None:
-        frame_process = v2.Compose(
-            [
-                v2.CenterCrop(size=(args.height, args.width)),
-                v2.ToTensor(),
-                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
+    tok_path = resolve_tokenizer_path(args.wan_model_dir)
+    tokenizer_config = (
+        ModelConfig(path=tok_path)
+        if tok_path is not None
+        else ModelConfig(
+            model_id="Wan-AI/Wan2.1-T2V-1.3B",
+            origin_file_pattern="google/umt5-xxl/",
         )
-        video = load_frames_using_imageio(
-            str(clip_path / "video.mp4"),
-            num_frames=args.num_frames,
-            frame_process=frame_process,
-            target_h=args.height,
-            target_w=args.width,
-            permute_to_cthw=True,
-        )
-        if video is None:
-            raise ValueError(f"Cannot load {args.num_frames} frames from {clip_path / 'video.mp4'}")
-        source_video = video.unsqueeze(0).to(torch.bfloat16)
+    )
 
-    pipe = Wan4DPipeline.from_wan_model_dir(
-        pretrained_model_dir=args.wan_model_dir,
-        wan4d_ckpt_path=None,
+    pipe = Wan4DPipeline.from_pretrained(
+        model_configs=model_configs,
+        tokenizer_config=tokenizer_config,
         torch_dtype=torch.bfloat16,
         device=device,
     )
 
     if args.ckpt:
         sd = load_checkpoint(args.ckpt, device=device)
-        pipe.dit.load_state_dict(sd, strict=False)
+        missing, unexpected = pipe.dit.load_state_dict(sd, strict=False)
         pipe.dit.to(device=device, dtype=torch.bfloat16)
         print(f"Loaded DiT from {args.ckpt}")
+        cam_keys = [k for k in sd.keys() if "camera_cross_attn" in k]
+        if cam_keys:
+            print(f"  camera_cross_attn keys: {len(cam_keys)} loaded")
+        else:
+            print("  WARNING: No camera_cross_attn keys in checkpoint (using zero-init).")
     else:
         print("No --ckpt: using base Wan2.1 model only")
 
-    output_subdir = build_output_subdir(dataset_root, clip_path)
-    os.makedirs(output_subdir, exist_ok=True)
+    import torchvision.transforms.functional as TF
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_fps = read_video_fps(clip_path / "video.mp4")
-
-    prompt_str = caption_text if prompt_context is None else ""
-
-    camera_json: Optional[Path] = None
-
-    for run_idx, (run_kind, value) in enumerate(runs):
-        if run_kind == "preset":
-            pt = preset_tgt_pattern
-            assert pt is not None
-            run_tag = f"{pt}_preset_{int(value):02d}"
-            label = f"{pt} @ preset cam {value}"
-        else:
-            pattern = cast(TimePatternType, value)
-            run_tag = pattern
-            label = pattern
-
-        print(f"\n{'='*50}")
-        print(f"Processing run {run_idx + 1}/{len(runs)}: {label}")
-        print(f"{'='*50}")
-
-        if run_kind == "preset":
-            if camera_json is None:
-                camera_json = Path(args.camera_json) if args.camera_json else dataset_root / "cameras" / "camera_extrinsics.json"
-                if not camera_json.is_file():
-                    raise FileNotFoundError(f"Camera JSON not found: {camera_json}")
-            tgt_camera = load_camera_from_json(
-                str(camera_json), cam_idx=int(value), num_frames=args.num_frames, dtype=torch.bfloat16
-            ).unsqueeze(0)
-            tgt_time = torch.tensor(get_time_pattern(pt, args.num_frames), dtype=torch.float32).unsqueeze(0)
-        else:
-            tgt_camera = get_target_camera_from_source(
-                src_c2w, pattern, num_frames=args.num_frames, dtype=torch.bfloat16
-            ).unsqueeze(0)
-            tgt_time = torch.tensor(get_time_pattern(pattern, args.num_frames), dtype=torch.float32).unsqueeze(0)
-
-        frames = pipe(
-            prompt=prompt_str,
-            negative_prompt=args.negative_prompt,
-            source_video=source_video,
-            source_latents=source_latents,
-            target_camera=tgt_camera,
-            src_time_embedding=src_time,
-            tgt_time_embedding=tgt_time,
-            prompt_context=prompt_context,
-            cfg_scale=args.cfg_scale,
-            seed=args.seed,
-            num_inference_steps=args.num_inference_steps,
-            height=args.height,
-            width=args.width,
-            num_frames=args.num_frames,
-            tiled=args.tiled,
+    source_video_path: Optional[Path] = None
+    if args.clip is not None:
+        clip_dir = Path(args.clip)
+        source_video_path = clip_dir / "video.mp4"
+        caption_txt_path = clip_dir / "caption.txt"
+        if not source_video_path.is_file():
+            raise SystemExit(f"--clip expects `{source_video_path}` to exist.")
+        print(f"Loading clip video: {source_video_path}")
+        source_frames_pil = load_source_video(
+            source_video_path, args.num_frames, args.height, args.width
         )
+    elif args.source_video is not None:
+        source_path = Path(args.source_video)
+        print(f"Loading source video: {source_path}")
+        source_frames_pil = load_source_video(
+            source_path, args.num_frames, args.height, args.width
+        )
+        caption_txt_path = source_path.parent / "caption.txt"
+        source_video_path = source_path
+    else:
+        print(f"Loading {len(args.source_images)} source images")
+        source_frames_pil = load_source_images(args.source_images, args.height, args.width)
+        caption_txt_path = Path(args.source_images[0]).parent / "caption.txt"
 
-        target_frames: Optional[torch.Tensor] = None
-        tgt_pattern_for_video = str(value) if run_kind == "pattern" else preset_tgt_pattern
-        assert tgt_pattern_for_video is not None
-        try:
-            target_video_path = derive_target_video_path(clip_path, dataset_root, tgt_pattern_for_video)
-            if target_video_path.is_file():
-                target_frame_process = v2.Compose(
-                    [
-                        v2.CenterCrop(size=(args.height, args.width)),
-                        v2.ToTensor(),
-                    ]
-                )
-                target_frames = load_frames_using_imageio(
-                    str(target_video_path),
-                    num_frames=args.num_frames,
-                    frame_process=target_frame_process,
-                    target_h=args.height,
-                    target_w=args.width,
-                    permute_to_cthw=False,
-                )
-                print(f"Loaded target video: {target_video_path}")
-            else:
-                print(f"Target video not found: {target_video_path}")
-        except Exception as e:
-            print(f"Could not load target video: {e}")
-
-        out_path = resolve_run_output_path(args.output, output_subdir, run_tag, ts, multiple_runs)
-
-        if run_kind == "pattern" and str(value) == "forward":
-            copy_input_video_to_output_dir(clip_path, output_subdir)
-        elif run_kind == "preset" and run_idx == 0:
-            copy_input_video_to_output_dir(clip_path, output_subdir)
-
-        print(f"Writing {out_path}")
-
-        if target_frames is not None:
-            nt, nf = len(target_frames), len(frames)
-            n_pair = min(nt, nf)
-            if nt != nf:
-                print(f"Warning: target frames ({nt}) != prediction frames ({nf}); writing {n_pair} side-by-side frames.")
-
-            with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
-                for target_frame, pred_frame in zip(target_frames[:n_pair], frames[:n_pair]):
-                    target_arr = to_hwc_numpy(target_frame)
-                    pred_arr = to_hwc_numpy(pred_frame)
-                    target_labeled = draw_pattern_label(target_arr, run_tag, is_target=True)
-                    pred_labeled = draw_pattern_label(pred_arr, run_tag, is_target=False)
-                    combined = np.concatenate([target_labeled, pred_labeled], axis=1)
-                    writer.append_data(combined)
+    caption_text = args.caption
+    if caption_text is None:
+        if caption_txt_path.is_file():
+            caption_text = caption_txt_path.read_text(encoding="utf-8").strip()
+            print(f"Using caption from {caption_txt_path}: {caption_text[:60]}...")
         else:
-            with imageio.get_writer(out_path, fps=out_fps, codec="libx264") as writer:
-                for frame in frames:
-                    writer.append_data(to_hwc_numpy(frame))
+            caption_text = ""
+            print("No caption found; using empty prompt.")
+
+    frame_tensors = []
+    for img in source_frames_pil:
+        t = TF.to_tensor(img)
+        t = t * 2.0 - 1.0
+        frame_tensors.append(t)
+    source_frames_tensor = torch.stack(frame_tensors, dim=1)
+
+    clip_id = _derive_clip_id(args.clip, args.source_video, args.source_images)
+    out_fps = read_video_fps(source_video_path) if source_video_path is not None else DEFAULT_OUTPUT_FPS
+
+    # --- Load camera (optional) → Plücker embedding ---
+    # Auto-detect camera from clip directory when --camera / --camera_preset are not given.
+    auto_camera: Optional[str] = None
+    if args.camera is None and args.camera_preset is None and args.clip is not None:
+        _clip_dir = Path(args.clip)
+        _meta = _clip_dir / "meta.json"
+        _npy_candidates = list(_clip_dir.glob("src_cam/*_extrinsics.npy"))
+        if _meta.is_file():
+            auto_camera = str(_meta)
+            print(f"[auto] Detected camera: {auto_camera}")
+        elif _npy_candidates:
+            auto_camera = str(_npy_candidates[0])
+            print(f"[auto] Detected camera: {auto_camera}")
+
+    c2w: Optional[np.ndarray] = None
+    _effective_camera = args.camera if args.camera is not None else auto_camera
+    if args.camera is not None and args.camera_preset is not None:
+        print("Warning: --camera and --camera_preset both specified; --camera takes precedence.")
+    if _effective_camera is not None:
+        cam_path = _effective_camera
+        print(f"Loading camera from {cam_path}")
+        c2w, intrinsics_norm = _load_c2w_from_path(cam_path, args.num_frames, args.cam_type)
+        if c2w is None:
+            print("Warning: could not load c2w from camera file; using identity camera.")
+        else:
+            print(f"Loaded c2w shape: {c2w.shape}")
+            if intrinsics_norm is not None:
+                print(f"Intrinsics (norm): fx={intrinsics_norm[0]:.4f} fy={intrinsics_norm[1]:.4f} "
+                      f"cx={intrinsics_norm[2]:.4f} cy={intrinsics_norm[3]:.4f}")
+    else:
+        intrinsics_norm = None
+    if args.camera_preset is not None and c2w is None:
+        print(f"Using preset camera: {args.camera_preset}  speed={args.camera_speed}")
+        intrinsics_norm = None
+        c2w = make_preset_c2w(
+            preset=args.camera_preset,
+            num_frames=args.num_frames,
+            speed=args.camera_speed,
+        )
+    if c2w is None:
+        print("No --camera / --camera_preset: using identity camera (no camera motion control)")
+
+    tasks = _parse_tasks(args)
+    print(f"Tasks: {len(tasks)}")
+    for idx, (units_str, condition_units_str, backward) in enumerate(tasks):
+        bwd_label = " [backward]" if backward else ""
+        print(f"\n[{idx + 1}/{len(tasks)}] units={units_str}  condition_units={condition_units_str}{bwd_label}")
+        run_one_task(
+            pipe=pipe,
+            args=args,
+            source_frames_tensor=source_frames_tensor,
+            source_video_path=source_video_path,
+            caption_text=caption_text,
+            units_str=units_str,
+            condition_units_str=condition_units_str,
+            backward=backward,
+            device=device,
+            clip_id=clip_id,
+            out_fps=out_fps,
+            fps=args.fps,
+            c2w=c2w,
+            intrinsics_norm=intrinsics_norm,
+            save_cam_attn=args.save_cam_attn,
+        )
 
     print("\nDone.")
 

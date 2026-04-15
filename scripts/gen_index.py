@@ -1,24 +1,21 @@
-"""Generate index.json by scanning existing dataset directory.
-
-Scans videos/ and target_videos/ directories and generates index.json
-following the structure defined in docs/dataset-structure.md.
+"""Generate index.json by scanning an existing dataset directory or sampling from an existing index.
 
 Usage::
 
     # Scan from directory
-    python datasets/gen_index.py --dataset_root ./data
+    python scripts/gen_index.py --dataset_root ./data
 
     # Specify output path
-    python datasets/gen_index.py --dataset_root ./data --output ./data/index.json
+    python scripts/gen_index.py --dataset_root ./data --output ./data/index.json
 
     # Filter by source
-    python datasets/gen_index.py --dataset_root ./data --source omniworld_hoi4d
+    python scripts/gen_index.py --dataset_root ./data --source omniworld_hoi4d
 
     # Sample from existing index
-    python datasets/gen_index.py --input_index ./data/index.json --sample 1000 --output ./data/index_1k.json
+    python scripts/gen_index.py --input_index ./data/index.json --sample 1000 --output ./data/index_1k.json
 
     # Sample with seed for reproducibility
-    python datasets/gen_index.py --input_index ./data/index.json --sample 500 --seed 42 --output ./data/index_500.json
+    python scripts/gen_index.py --input_index ./data/index.json --sample 500 --seed 42 --output ./data/index_500.json
 """
 
 import argparse
@@ -31,21 +28,28 @@ from typing import Dict, List, Optional
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from utils.time_pattern import VALID_TIME_PATTERNS
 
 
 # ---------------------------------------------------------------------------
 # Hash utilities
 # ---------------------------------------------------------------------------
 
-def video_path_hash(video_rel_path: str) -> str:
-    """Hash video relative path for latent filename."""
-    return hashlib.sha256(video_rel_path.encode()).hexdigest()[:16]
-
 
 def caption_content_hash(caption: str) -> str:
     """Hash caption content for deduplicated storage."""
     return hashlib.sha256(caption.encode()).hexdigest()[:16]
+
+
+def _compute_stats(clips: List[dict]) -> Dict[str, Dict[str, int]]:
+    sources: Dict[str, Dict[str, int]] = {}
+    vids_by_src: Dict[str, set] = {}
+    for c in clips:
+        s = c.get("source", "unknown")
+        vids_by_src.setdefault(s, set()).add(c.get("video_id", ""))
+        sources.setdefault(s, {"videos": 0, "clips": 0})["clips"] += 1
+    for s in sources:
+        sources[s]["videos"] = len(vids_by_src[s])
+    return sources
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +104,7 @@ def scan_videos_dir(videos_dir: Path) -> List[dict]:
                     except json.JSONDecodeError:
                         pass
 
-                # Compute source latent hash
                 clip_path = f"{source}/{video_id}/{clip_id}"
-                src_rel_path = f"videos/{clip_path}/video.mp4"
-                src_hash = video_path_hash(src_rel_path)
 
                 clips.append({
                     "path": clip_path,
@@ -114,54 +115,9 @@ def scan_videos_dir(videos_dir: Path) -> List[dict]:
                     "is_padded": is_padded,
                     "split": "train",  # default
                     "caption_hash": cap_hash,
-                    "source_latent_hash": src_hash,
-                    "target_latent_hashes": {},
                 })
 
     return clips
-
-
-def scan_target_videos(target_videos_dir: Path, clips: List[dict]) -> None:
-    """Scan target_videos/ and update clips with target latent hashes."""
-    if not target_videos_dir.exists():
-        return
-
-    # Build path -> clip mapping
-    path_to_clip = {c["path"]: c for c in clips}
-
-    # Target patterns (skip forward)
-    target_patterns = [p for p in VALID_TIME_PATTERNS if p != "forward"]
-
-    # Iterate: target_videos/{source}/{video_id}/{clip_id}/{pattern}_video.mp4
-    for source_dir in sorted(target_videos_dir.iterdir()):
-        if not source_dir.is_dir():
-            continue
-        source = source_dir.name
-
-        for video_dir in sorted(source_dir.iterdir()):
-            if not video_dir.is_dir():
-                continue
-            video_id = video_dir.name
-
-            for clip_dir in sorted(video_dir.iterdir()):
-                if not clip_dir.is_dir():
-                    continue
-                clip_id = clip_dir.name
-
-                clip_path = f"{source}/{video_id}/{clip_id}"
-                if clip_path not in path_to_clip:
-                    continue
-
-                clip = path_to_clip[clip_path]
-                target_hashes = {}
-
-                for pattern in target_patterns:
-                    video_path = clip_dir / f"{pattern}_video.mp4"
-                    if video_path.exists():
-                        tgt_rel_path = f"target_videos/{clip_path}/{pattern}_video.mp4"
-                        target_hashes[pattern] = video_path_hash(tgt_rel_path)
-
-                clip["target_latent_hashes"] = target_hashes
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +133,6 @@ def generate_index(
 ) -> dict:
     """Generate index.json structure."""
     videos_dir = dataset_root / "videos"
-    target_videos_dir = dataset_root / "target_videos"
 
     # Scan videos
     clips = scan_videos_dir(videos_dir)
@@ -186,18 +141,7 @@ def generate_index(
     if source_filter:
         clips = [c for c in clips if c["source"] == source_filter]
 
-    # Scan target videos
-    scan_target_videos(target_videos_dir, clips)
-
-    # Compute statistics
-    sources: Dict[str, Dict[str, int]] = {}
-    vids_by_src: Dict[str, set] = {}
-    for c in clips:
-        s = c["source"]
-        vids_by_src.setdefault(s, set()).add(c["video_id"])
-        sources.setdefault(s, {"videos": 0, "clips": 0})["clips"] += 1
-    for s in sources:
-        sources[s]["videos"] = len(vids_by_src.get(s, set()))
+    sources = _compute_stats(clips)
 
     if resolution is None:
         resolution = [480, 832]
@@ -213,7 +157,6 @@ def generate_index(
             "pad_mode": "reverse",
             "latents_dir": "latents",
             "caption_latents_dir": "caption_latents",
-            "time_patterns": list(VALID_TIME_PATTERNS),
         },
         "statistics": {
             "num_videos": len({c["video_id"] for c in clips}),
@@ -249,15 +192,7 @@ def sample_from_index(
     if sample_size < len(clips):
         clips = random.sample(clips, sample_size)
 
-    # Compute statistics
-    sources: Dict[str, Dict[str, int]] = {}
-    vids_by_src: Dict[str, set] = {}
-    for c in clips:
-        s = c.get("source", "unknown")
-        vids_by_src.setdefault(s, set()).add(c.get("video_id", ""))
-        sources.setdefault(s, {"videos": 0, "clips": 0})["clips"] += 1
-    for s in sources:
-        sources[s]["videos"] = len(vids_by_src.get(s, set()))
+    sources = _compute_stats(clips)
 
     index = {
         "version": "2.0",
@@ -289,7 +224,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset_root",
         type=str,
         default=None,
-        help="Root of the dataset (contains videos/ and target_videos/)",
+        help="Root of the dataset (contains videos/)",
     )
 
     # Mode 2: Sample from existing index

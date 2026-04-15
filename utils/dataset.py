@@ -5,48 +5,44 @@ This dataset class follows the structure defined in docs/dataset-structure.md.
 Usage::
 
     from utils.dataset import Wan4DDataset
-    ds = Wan4DDataset('./data', steps_per_epoch=500)
+    ds = Wan4DDataset('./data', steps_per_epoch=500, height=480, width=832)
     batch = ds[0]
 
-Tensor shape/dtype validation (default on) checks latent C/T/dtype and text shape (OOM-prone
-mistakes). Spatial (H,W) is not checked against index—latents from ``process.py`` are trusted.
-Set ``validate_tensors=False`` to skip all checks.
+The dataset loads raw source videos and remaps frames in pixel space according
+to a randomly generated temporal trajectory, returning pixel tensors for
+online VAE encoding in the training loop.
 """
 
 import json
 import random
 from pathlib import Path
-from typing import List, Optional, cast
+from typing import Optional
 
 import numpy as np
 import torch
+from torchvision.transforms import v2
 
-from utils.camera import get_target_camera_from_source
-from utils.time_pattern import get_time_pattern, TimePatternType
-
-# Wan2.1 VAE: pixel / latent spatial ratio (see diffsynth/models/wan_video_vae.py).
-WAN_VAE_SPATIAL_STRIDE = 8
-WAN_LATENT_CHANNELS = 16
-# UMT5-XXL text encoder output (docs/dataset-structure.md).
-UMT5_TEXT_SEQ_LEN = 512
-UMT5_TEXT_DIM = 4096
+from utils.camera import compute_plucker_pixel_resolution, timefold_plucker
+from utils.image import load_frames_using_imageio
+from utils.temporal_trajectory import (
+    MAX_CONDITION_FRAMES,
+    WAN_LATENT_TEMPORAL_STRIDE,
+    pixel_to_latent_temporal_coords,
+    sample_training_trajectory,
+)
 
 
 class Wan4DDataset(torch.utils.data.Dataset):
     """Dataset for Wan4D training with index.json format.
 
     Each sample loads:
-    - Source and target video latents from latents/{hash}.pt
+    - Source video pixels from videos/{path}/video.mp4
     - Caption embedding from caption_latents/{hash}.pt
-    - Camera parameters from videos/{path}/meta.json
-    - Time embeddings based on randomly selected pattern
-    """
+    - Target video derived by remapping source pixels via a random temporal trajectory
+    - Condition frame indices (arbitrary pixel positions) for online VAE encoding
 
-    TIME_PATTERNS: List[TimePatternType] = [
-        "forward", "reverse", "pingpong", "bounce_late", "bounce_early",
-        "slowmo_first_half", "slowmo_second_half", "ramp_then_freeze",
-        "freeze_start", "freeze_early", "freeze_mid", "freeze_late", "freeze_end",
-    ]
+    No pre-cached video latent files are required.
+    """
 
     _GETITEM_MAX_TRIES = 20
 
@@ -56,20 +52,22 @@ class Wan4DDataset(torch.utils.data.Dataset):
         index_path=None,
         steps_per_epoch=500,
         num_frames=81,
+        height=480,
+        width=832,
         seed=42,
         split: Optional[str] = None,
-        validate_tensors: bool = True,
     ):
         """Initialize dataset.
 
         Args:
-            dataset_root: Root directory containing videos/, latents/, etc.
+            dataset_root: Root directory containing videos/, caption_latents/, etc.
             index_path: Path to index.json (default: {dataset_root}/index.json).
             steps_per_epoch: Number of samples per epoch (random sampling).
             num_frames: Number of frames per video (default 81).
+            height: Video height for loading and cropping (default 480).
+            width: Video width for loading and cropping (default 832).
             seed: Random seed for reproducibility.
             split: If set, keep only clips with this ``split`` field (e.g. ``train``).
-            validate_tensors: If True, check C/T/dtype/text; does not compare (H,W) to index.
         """
         self.root = Path(dataset_root)
         index_file = Path(index_path) if index_path else self.root / "index.json"
@@ -84,14 +82,18 @@ class Wan4DDataset(torch.utils.data.Dataset):
             )
         self.clips = clips
         self.config = index["config"]
-        self.latents_dir = self.root / self.config["latents_dir"]
+        self.videos_dir = self.root / "videos"
         self.caption_latents_dir = self.root / self.config["caption_latents_dir"]
         self.steps_per_epoch = steps_per_epoch
         self.num_frames = num_frames
-        self.validate_tensors = validate_tensors
+        self.height = height
+        self.width = width
         self.base_seed = seed
         self.seed = seed
         self.rng = random.Random(seed)
+
+        # fps from index.json config (fallback to 24)
+        self.fps = float(self.config.get("fps", 24.0))
 
         cfg_nf = self.config.get("num_frames")
         if cfg_nf is not None and int(cfg_nf) != int(self.num_frames):
@@ -99,20 +101,13 @@ class Wan4DDataset(torch.utils.data.Dataset):
                 f"num_frames={self.num_frames} disagrees with index.json config.num_frames={cfg_nf}"
             )
 
-        t_half = (self.num_frames - 1) // 4 + 1
-        self._expect_latent_t_concat = 2 * t_half
+        self._f_latent = (self.num_frames - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
 
-    @staticmethod
-    def valid_patterns_for_clip(clip) -> List[TimePatternType]:
-        """Patterns with valid target latents: forward (source) plus encoded targets."""
-        tgt_hashes = clip.get("target_latent_hashes") or {}
-        valid: List[TimePatternType] = []
-        for p in Wan4DDataset.TIME_PATTERNS:
-            if p == "forward":
-                valid.append(cast(TimePatternType, "forward"))
-            elif p in tgt_hashes:
-                valid.append(cast(TimePatternType, p))
-        return valid
+        self._frame_process = v2.Compose([
+            v2.CenterCrop(size=(height, width)),
+            v2.ToTensor(),
+            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
 
     def worker_init_fn(self, worker_id):
         """Initialize worker seed for DataLoader with multiple workers."""
@@ -127,70 +122,21 @@ class Wan4DDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.steps_per_epoch
 
-    def _validate_sample_tensors(
-        self, latents: torch.Tensor, prompt_context: torch.Tensor, clip_path: str
-    ) -> None:
-        """Raise ValueError if tensors don't match Wan4D training expectations."""
-        if latents.dim() != 4:
-            raise ValueError(
-                f"clip={clip_path}: latents must be 4D [C,T,H,W], got shape {tuple(latents.shape)}"
+    def _load_sample(self, clip):
+        """Load one training sample with pixel-space frame remapping."""
+        video_path = self.videos_dir / clip["path"] / "video.mp4"
+        source_video = load_frames_using_imageio(
+            str(video_path),
+            num_frames=self.num_frames,
+            frame_process=self._frame_process,
+            target_h=self.height,
+            target_w=self.width,
+            permute_to_cthw=True,
+        )
+        if source_video is None:
+            raise RuntimeError(
+                f"clip={clip['path']}: video has fewer than {self.num_frames} frames"
             )
-        c, t, h, w = latents.shape
-        if c != WAN_LATENT_CHANNELS:
-            raise ValueError(
-                f"clip={clip_path}: latent C={c}, expected {WAN_LATENT_CHANNELS} (Wan VAE)"
-            )
-        if t != self._expect_latent_t_concat:
-            raise ValueError(
-                f"clip={clip_path}: latent T={t}, expected {self._expect_latent_t_concat} "
-                f"(2×((num_frames-1)//4+1) for num_frames={self.num_frames}). "
-                "Wrong T often causes GPU OOM (e.g. un-compressed time dim)."
-            )
-
-        if latents.dtype == torch.float32:
-            raise ValueError(
-                f"clip={clip_path}: latents are float32; use float16/bfloat16 latent exports "
-                "to avoid ~2× activation memory and OOM (see docs/dataset-structure.md)"
-            )
-        if latents.dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError(
-                f"clip={clip_path}: latents dtype {latents.dtype}; expected float16 or bfloat16"
-            )
-
-        if prompt_context.dim() != 2:
-            raise ValueError(
-                f"clip={clip_path}: prompt_context must be 2D [seq,dim], got {prompt_context.shape}"
-            )
-        le, d = prompt_context.shape
-        if le != UMT5_TEXT_SEQ_LEN or d != UMT5_TEXT_DIM:
-            raise ValueError(
-                f"clip={clip_path}: text_embeds shape ({le},{d}), expected "
-                f"({UMT5_TEXT_SEQ_LEN},{UMT5_TEXT_DIM}) for UMT5-XXL"
-            )
-
-    def _load_sample(self, clip, pattern: TimePatternType):
-        src_hash = clip["source_latent_hash"]
-        src_latent = torch.load(
-            self.latents_dir / f"{src_hash}.pt",
-            weights_only=True, map_location="cpu",
-        )["latents"].detach()
-
-        tgt_hashes = clip.get("target_latent_hashes") or {}
-        if pattern == "forward":
-            tgt_hash = tgt_hashes.get("forward", src_hash)
-        else:
-            tgt_hash = tgt_hashes[pattern]
-        tgt_latent = torch.load(
-            self.latents_dir / f"{tgt_hash}.pt",
-            weights_only=True, map_location="cpu",
-        )["latents"].detach()
-
-        if src_latent.shape != tgt_latent.shape:
-            raise ValueError(
-                f"latent shape mismatch src={src_latent.shape} tgt={tgt_latent.shape}"
-            )
-
-        latents = torch.cat([tgt_latent, src_latent], dim=1)
 
         cap_hash = clip["caption_hash"]
         text_data = torch.load(
@@ -199,49 +145,99 @@ class Wan4DDataset(torch.utils.data.Dataset):
         )
         prompt_context = text_data["text_embeds"].detach()
 
-        if self.validate_tensors:
-            self._validate_sample_tensors(latents, prompt_context, clip["path"])
+        result = sample_training_trajectory(num_frames=self.num_frames, rng=self.rng, fps=self.fps)
 
-        meta_path = self.root / "videos" / clip["path"] / "meta.json"
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-        src_c2w = np.array(meta["camera"]["extrinsics_c2w"])
-        tgt_cam = get_target_camera_from_source(src_c2w, pattern, num_frames=self.num_frames)
+        target_video = torch.empty_like(source_video)
+        max_frame = self.num_frames - 1
+        for i, p in enumerate(result.temporal_coords):
+            # p is absolute time in seconds; p * fps gives the source pixel frame index.
+            # E.g. p=1.0s at fps=24 → src_idx=24 (i.e. the 25th frame).
+            src_idx = round(p * self.fps)
+            src_idx = max(0, min(src_idx, max_frame))
+            target_video[:, i] = source_video[:, src_idx]
 
-        src_time = torch.tensor(
-            get_time_pattern("forward", self.num_frames), dtype=torch.float32
-        )
-        tgt_time = torch.tensor(
-            get_time_pattern(cast(TimePatternType, pattern), self.num_frames),
-            dtype=torch.float32,
-        )
+        latent_coords = pixel_to_latent_temporal_coords(result.temporal_coords, self.num_frames)
+        temporal_coords = torch.tensor(latent_coords, dtype=torch.float32)
+
+        pad = MAX_CONDITION_FRAMES
+        pixel_indices = result.condition_frame_indices
+        latent_indices = result.condition_latent_indices
+
+        pixel_idx_t = torch.full((pad,), -1, dtype=torch.long)
+        for i, idx in enumerate(pixel_indices[:pad]):
+            pixel_idx_t[i] = idx
+
+        # latent_indices may be shorter than pixel_indices (multiple pixels → same latent)
+        latent_idx_t = torch.full((pad,), -1, dtype=torch.long)
+        for i, idx in enumerate(latent_indices[:pad]):
+            latent_idx_t[i] = idx
+
+        # --- Camera embedding: pixel-resolution Plücker time-folded for SimpleAdapter ---
+        clip_path_str = clip["path"]
+        meta_path = self.videos_dir / clip_path_str / "meta.json"
+        npy_path = self.root / "src_cam" / (Path(clip_path_str).stem + "_extrinsics.npy")
+        f_lat = self._f_latent
+
+        with open(str(meta_path), "r") as _f:
+            _meta = json.load(_f)
+        c2w_raw = np.array(_meta["camera"]["extrinsics_c2w"], dtype=np.float32)
+        # Read intrinsics (3x3 per frame, already adjusted for resize/crop)
+        K = np.array(_meta["camera"]["intrinsics"], dtype=np.float32)
+        fx = float(K[0, 0, 0]) / self.width
+        fy = float(K[0, 1, 1]) / self.height
+        cx = float(K[0, 0, 2]) / self.width
+        cy = float(K[0, 1, 2]) / self.height
+
+        # c2w is already relative to first frame (identity) from build_hoi4d.
+        # No scene-scale normalization — keep original translation magnitude
+        # (consistent with CameraCtrl).
+        c2w_rel = c2w_raw
+        # Trim/pad to num_frames
+        if len(c2w_rel) < self.num_frames:
+            last = c2w_rel[-1:]
+            c2w_rel = np.concatenate(
+                [c2w_rel, np.tile(last, (self.num_frames - len(c2w_rel), 1, 1))], axis=0
+            )
+        else:
+            c2w_rel = c2w_rel[:self.num_frames]
+
+        # Remap camera trajectory to match temporal trajectory (same as video frames)
+        c2w_remapped = np.empty((self.num_frames, 4, 4), dtype=np.float32)
+        c2w_max = len(c2w_rel) - 1
+        for i, p in enumerate(result.temporal_coords):
+            src_idx = round(p * self.fps)
+            src_idx = max(0, min(src_idx, c2w_max))
+            c2w_remapped[i] = c2w_rel[src_idx]
+
+        # Compute Plücker at pixel resolution, then time-fold
+        plucker_raw = compute_plucker_pixel_resolution(
+            c2w_remapped, self.height, self.width,
+            fx=fx, fy=fy, cx=cx, cy=cy, dtype=torch.float32,
+        )  # [F_pixel, H, W, 6]
+        plucker_embedding = timefold_plucker(
+            plucker_raw, f_lat, temporal_stride=WAN_LATENT_TEMPORAL_STRIDE
+        )  # [24, F_latent, H, W]
 
         return {
-            "latents": latents,
-            "prompt_context": prompt_context,
-            "cam_emb": {"tgt": tgt_cam},
-            "frame_time_embedding": {
-                "time_embedding_src": src_time,
-                "time_embedding_tgt": tgt_time,
-            },
-            "time_pattern": pattern,
+            "target_video": target_video,                       # [C, T, H, W]
+            "prompt_context": prompt_context,                   # text embedding
+            "temporal_coords": temporal_coords,                 # [F_latent] float (seconds)
+            "condition_pixel_indices": pixel_idx_t,             # [MAX_CONDITION_FRAMES] long, -1 padded
+            "condition_latent_indices": latent_idx_t,           # [MAX_CONDITION_FRAMES] long, -1 padded
+            "plucker_embedding": plucker_embedding,             # [24, F_latent, H, W] float
         }
 
     def __getitem__(self, index):
-        """Random clip + valid time pattern; retries on transient I/O errors.
+        """Random clip; retries on transient I/O errors.
 
         Data/validation errors (:class:`ValueError`, :class:`KeyError`) propagate
-        immediately so messages (e.g. shape/dtype checks) are not hidden.
+        immediately so messages are not hidden.
         """
         last_exc: Optional[BaseException] = None
         for _ in range(self._GETITEM_MAX_TRIES):
             clip = self.clips[self.rng.randrange(len(self.clips))]
-            valid = self.valid_patterns_for_clip(clip)
-            if not valid:
-                continue
-            pattern = self.rng.choice(valid)
             try:
-                return self._load_sample(clip, pattern)
+                return self._load_sample(clip)
             except (ValueError, KeyError):
                 raise
             except Exception as e:
@@ -250,9 +246,8 @@ class Wan4DDataset(torch.utils.data.Dataset):
         if last_exc is not None:
             raise RuntimeError(
                 f"failed to load sample after {self._GETITEM_MAX_TRIES} tries "
-                f"(check latents, caption_latents, meta.json). Last error:"
+                f"(check videos/, caption_latents/). Last error:"
             ) from last_exc
         raise RuntimeError(
-            f"failed to load sample after {self._GETITEM_MAX_TRIES} tries: "
-            "every sampled clip had no valid time pattern (empty target_latent_hashes?)"
+            f"failed to load sample after {self._GETITEM_MAX_TRIES} tries"
         )

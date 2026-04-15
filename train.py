@@ -4,38 +4,43 @@ import json
 import logging
 import os
 import random
+import re
 from datetime import datetime
 
 import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from lightning_fabric.utilities.rank_zero import rank_zero_only, rank_zero_warn
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 
 
 class Wan4DModelCheckpoint(ModelCheckpoint):
-    """ModelCheckpoint that also cleans up standalone dit model weights."""
-
     def _remove_checkpoint(self, trainer, filepath):
-        """Remove checkpoint and corresponding _model.ckpt file."""
-        # Call parent to remove the main checkpoint file
-        super()._remove_checkpoint(trainer, filepath)
+        log = logging.getLogger("wan4d_train")
+        try:
+            super()._remove_checkpoint(trainer, filepath)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("Could not remove Lightning checkpoint %s: %s", filepath, e)
 
-        # Also remove the corresponding _model.ckpt file
-        # Extract step number from filepath (e.g., "epoch=0-step=500.ckpt" -> 500)
-        import re
         match = re.search(r"step=(\d+)", filepath)
-        if match:
-            step = match.group(1)
-            model_ckpt_path = os.path.join(
-                os.path.dirname(filepath),
-                f"step{step}_model.ckpt"
-            )
-            if os.path.exists(model_ckpt_path):
-                os.remove(model_ckpt_path)
-                log = logging.getLogger("wan4d_train")
-                log.info(f"Model weights removed: {model_ckpt_path}")
+        if not match:
+            return
+        step = match.group(1)
+        model_ckpt_path = os.path.join(
+            os.path.dirname(filepath),
+            f"step{step}_model.ckpt",
+        )
+        try:
+            os.remove(model_ckpt_path)
+            log.info("Model weights removed: %s", model_ckpt_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("Could not remove model weights %s: %s", model_ckpt_path, e)
 
 from diffsynth.core import ModelConfig
 from diffsynth.pipelines.wan_video_4d import Wan4DPipeline
@@ -44,6 +49,7 @@ from utils.dataset import Wan4DDataset
 NUM_FRAMES = 81
 DEFAULT_SEED = 42
 TRAINING_OUTPUT_BASE = "training"
+WAN_LATENT_TEMPORAL_STRIDE = 4
 
 # Default training parameters (align with Wan2.1-T2V-1.3B full dit recipe)
 WAN21_T2V_13B_LR = 1e-5
@@ -53,12 +59,21 @@ WAN21_T2V_13B_LR_SCHEDULER = "constant"
 WAN21_T2V_13B_MAX_EPOCHS = 2
 WAN21_T2V_13B_GRAD_ACCUM = 1
 
-_TRAINABLE_SUBSTR = ("cam_encoder", "projector", "self_attn")
+_TRAINABLE_SUBSTR = (
+    "patch_embedding",
+    "control_adapter",
+    "temporal_coord_embedding",
+    "self_attn",
+)
 
 
 def _safe_run_segment(name):
     s = (name or "run").strip().replace(os.sep, "_").replace("/", "_")
     return s if s else "run"
+
+
+def _is_rank_zero() -> bool:
+    return int(getattr(rank_zero_only, "rank", 0)) == 0
 
 
 def run_root_from_names(output_base, project_name, experiment_name):
@@ -94,25 +109,7 @@ def save_run_meta(run_root, config):
         f.write(readme)
 
 
-def resolve_dit_path(wan_model_dir):
-    patterns = [
-        "diffusion_pytorch_model*.safetensors",
-        "wan_video_dit*.safetensors",
-        "model*.safetensors",
-        "dit*.safetensors",
-    ]
-    for pattern in patterns:
-        matched = sorted(glob.glob(os.path.join(wan_model_dir, pattern)))
-        if len(matched) == 1:
-            return matched[0]
-        if len(matched) > 1:
-            raise ValueError(f"multiple DiT for `{pattern}`: {matched}")
-    raise FileNotFoundError(f"no DiT under `{wan_model_dir}`")
-
-
 class Wan4DTrainModule(pl.LightningModule):
-    """Fine-tunes selected DiT blocks for Wan4D (noise prediction on first half of latent time)."""
-
     def __init__(
         self,
         wan_model_dir,
@@ -124,10 +121,15 @@ class Wan4DTrainModule(pl.LightningModule):
         train_steps=25000,
         use_gradient_checkpointing=False,
         use_gradient_checkpointing_offload=False,
-        resume_ckpt_path=None,
         seed=DEFAULT_SEED,
         compile_model=False,
         log_metrics_every=1,
+        num_frames=NUM_FRAMES,
+        height=480,
+        width=832,
+        vae_tiled=False,
+        vae_tile_size=(34, 34),
+        vae_tile_stride=(18, 16),
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -136,22 +138,19 @@ class Wan4DTrainModule(pl.LightningModule):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
 
-        dit_path = resolve_dit_path(wan_model_dir)
+        dit_path = os.path.join(wan_model_dir, "diffusion_pytorch_model.safetensors")
+        vae_path = os.path.join(wan_model_dir, "Wan2.1_VAE.pth")
+        model_configs = [ModelConfig(path=dit_path), ModelConfig(path=vae_path)]
         self.pipe = Wan4DPipeline.from_pretrained(
-            model_configs=[ModelConfig(path=dit_path)],
+            model_configs=model_configs,
             tokenizer_config=None,
             device="cuda",
             torch_dtype=torch.bfloat16,
         )
-        if self.pipe.dit is None:
-            raise ValueError("dit init failed")
         self.pipe.scheduler.set_timesteps(1000, training=True)
         self.dit = self.pipe.dit
-
-        if resume_ckpt_path is not None:
-            self.dit.load_state_dict(
-                torch.load(resume_ckpt_path, map_location="cpu"), strict=True
-            )
+        self.pipe.vae.eval()
+        self.pipe.vae.requires_grad_(False)
 
         self._apply_parameter_freeze()
 
@@ -169,50 +168,91 @@ class Wan4DTrainModule(pl.LightningModule):
 
     def _batch_to_model_device(self, batch):
         dt = self.pipe.torch_dtype
-        latents = batch["latents"].to(self.device, dtype=dt)
         context = batch["prompt_context"].to(self.device, dtype=dt)
         if context.ndim == 4 and context.shape[1] == 1:
             context = context.squeeze(1)
-        cam_emb = {
-            "tgt": batch["cam_emb"]["tgt"].to(self.device, dtype=dt),
-        }
-        fte = {
-            "time_embedding_src": batch["frame_time_embedding"]["time_embedding_src"].to(
-                self.device, dtype=dt
-            ),
-            "time_embedding_tgt": batch["frame_time_embedding"]["time_embedding_tgt"].to(
-                self.device, dtype=dt
-            ),
-        }
-        return latents, context, cam_emb, fte
 
-    def _diffusion_loss(self, latents, context, cam_emb, fte):
-        noise = torch.randn_like(latents)
+        temporal_coords = batch.get("temporal_coords")
+        if temporal_coords is not None:
+            temporal_coords = temporal_coords.to(self.device, dtype=dt)
+
+        plucker_embedding = batch.get("plucker_embedding")
+        if plucker_embedding is not None:
+            plucker_embedding = plucker_embedding.to(self.device, dtype=dt)
+
+        # Condition frame indices from dataset (padded with -1)
+        cond_pixel_indices = batch["condition_pixel_indices"]   # [B, MAX_COND_FRAMES] long
+        cond_latent_indices = batch["condition_latent_indices"]  # [B, MAX_COND_FRAMES] long
+
+        target_video = batch["target_video"].to(self.device, dtype=dt)  # [B, C, T, H, W]
+        vae_tiled = bool(self.hparams.vae_tiled)
+        vae_tile_size = tuple(self.hparams.vae_tile_size)
+        vae_tile_stride = tuple(self.hparams.vae_tile_stride)
+
+        B, C, T, H, W = target_video.shape
+        F_latent = (T - 1) // WAN_LATENT_TEMPORAL_STRIDE + 1
+        H_l, W_l = H // 8, W // 8
+
+        with torch.no_grad():
+            target_latent = self.pipe.vae.encode(
+                target_video,
+                device=self.device,
+                tiled=vae_tiled,
+                tile_size=vae_tile_size,
+                tile_stride=vae_tile_stride,
+            )
+
+            cond_video = torch.zeros_like(target_video)
+            pixel_mask = torch.zeros(B, T, H_l, W_l, dtype=dt, device=self.device)
+
+            for b in range(B):
+                for k in range(cond_pixel_indices.shape[1]):
+                    idx = cond_pixel_indices[b, k].item()
+                    if idx < 0:
+                        break
+                    cond_video[b, :, idx] = target_video[b, :, idx]
+                    pixel_mask[b, idx] = 1.0
+
+            condition_latent = self.pipe.vae.encode(
+                cond_video,
+                device=self.device,
+                tiled=vae_tiled,
+                tile_size=vae_tile_size,
+                tile_stride=vae_tile_stride,
+            )
+
+            mask_folded = torch.cat([
+                pixel_mask[:, 0:1].expand(-1, 4, -1, -1),
+                pixel_mask[:, 1:],
+            ], dim=1)
+            condition_mask = mask_folded.view(B, F_latent, 4, H_l, W_l).permute(0, 2, 1, 3, 4).contiguous()
+
+        return target_latent, condition_latent, condition_mask, context, temporal_coords, plucker_embedding
+
+    def _diffusion_loss(self, target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding):
+        noise = torch.randn_like(target_latents)
         timestep_id = torch.randint(
             0, self.pipe.scheduler.num_train_timesteps, (1,), device="cpu"
         )
         t_scalar = self.pipe.scheduler.timesteps[timestep_id].squeeze()
-        clean = latents
+        clean = target_latents
         noisy = self.pipe.scheduler.add_noise(clean, noise, t_scalar)
-        time_half = noisy.shape[2] // 2
-        noisy[:, :, time_half:, ...] = clean[:, :, time_half:, ...]
         target = self.pipe.scheduler.training_target(clean, noise, t_scalar)
         timestep = t_scalar.to(dtype=self.pipe.torch_dtype, device=self.device).expand(
-            latents.shape[0]
+            target_latents.shape[0]
         )
         pred = self.dit(
             noisy,
             timestep=timestep,
-            cam_emb=cam_emb,
             context=context,
-            frame_time_embedding=fte,
+            temporal_coords=temporal_coords,
+            plucker_embedding=plucker_embedding,
+            condition_latents=condition_latents,
+            condition_mask=condition_mask,
             use_gradient_checkpointing=self.hparams.use_gradient_checkpointing,
             use_gradient_checkpointing_offload=self.hparams.use_gradient_checkpointing_offload,
         )
-        loss = F.mse_loss(
-            pred[:, :, :time_half, ...].float(),
-            target[:, :, :time_half, ...].float(),
-        )
+        loss = F.mse_loss(pred.float(), target.float())
         w = self.pipe.scheduler.training_weight(
             t_scalar.to(self.pipe.scheduler.timesteps.device)
         )
@@ -223,8 +263,8 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss * w
 
     def training_step(self, batch, batch_idx):
-        latents, context, cam_emb, fte = self._batch_to_model_device(batch)
-        loss = self._diffusion_loss(latents, context, cam_emb, fte)
+        target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding = self._batch_to_model_device(batch)
+        loss = self._diffusion_loss(target_latents, condition_latents, condition_mask, context, temporal_coords, plucker_embedding)
 
         every = int(self.hparams.log_metrics_every)
         if self.global_step % every == 0:
@@ -245,31 +285,18 @@ class Wan4DTrainModule(pl.LightningModule):
         return loss
 
     def on_save_checkpoint(self, checkpoint):
-        """Save checkpoint with model weights for inference (DeepSpeed compatible).
-
-        Lightning default checkpoint contains:
-        - epoch, global_step
-        - state_dict (model weights)
-        - optimizer_states (for resuming training)
-        - lr_schedulers
-
-        We additionally save a pure state_dict file for inference.
-        In DeepSpeed ZeRO strategies, checkpoint['state_dict'] is already
-        the merged complete weights, so this is naturally DeepSpeed compatible.
-        """
+        """Also save a pure state_dict file for inference."""
         checkpoint_dir = self.trainer.checkpoint_callback.dirpath
         current_step = self.global_step
 
-        # Save pure state_dict file for inference
-        state_dict = checkpoint['state_dict']
-        model_ckpt_path = os.path.join(checkpoint_dir, f"step{current_step}_model.ckpt")
-        torch.save(state_dict, model_ckpt_path)
+        if self.global_rank == 0:
+            state_dict = checkpoint['state_dict']
+            model_ckpt_path = os.path.join(checkpoint_dir, f"step{current_step}_model.ckpt")
+            torch.save(state_dict, model_ckpt_path)
 
-        # Keep checkpoint default content for resuming training
-        # Do NOT call checkpoint.clear() - we need optimizer states
-        log = logging.getLogger("wan4d_train")
-        log.info(f"Checkpoint saved: step={current_step}, dir={checkpoint_dir}")
-        log.info(f"Model weights saved: {model_ckpt_path}")
+            log = logging.getLogger("wan4d_train")
+            log.info(f"Checkpoint saved: step={current_step}, dir={checkpoint_dir}")
+            log.info(f"Model weights saved: {model_ckpt_path}")
 
     def configure_optimizers(self):
         params = [p for p in self.dit.parameters() if p.requires_grad]
@@ -333,7 +360,7 @@ def parse_args():
         "--dataset_root",
         type=str,
         required=True,
-        help="Root directory containing videos/, latents/, caption_latents/",
+        help="Root directory containing videos/, caption_latents/",
     )
     p.add_argument(
         "--index",
@@ -347,11 +374,14 @@ def parse_args():
         default=None,
         help="If set, only clips with this split field (e.g. train)",
     )
-    p.add_argument(
-        "--no_dataset_validate",
-        action="store_true",
-        help="Disable Wan4DDataset checks for latent/text shapes and dtypes (not recommended)",
-    )
+    p.add_argument("--height", type=int, default=480, help="Video height for loading (default 480).")
+    p.add_argument("--width", type=int, default=832, help="Video width for loading (default 832).")
+    p.add_argument("--vae_tiled", default=False, action="store_true",
+                   help="Use tiled VAE encoding for memory efficiency.")
+    p.add_argument("--vae_tile_size", type=int, nargs=2, default=[34, 34],
+                   metavar=("H", "W"), help="Tile size for tiled VAE (default 34 34).")
+    p.add_argument("--vae_tile_stride", type=int, nargs=2, default=[18, 16],
+                   metavar=("H", "W"), help="Tile stride for tiled VAE (default 18 16).")
     p.add_argument("--wan_model_dir", type=str, required=True)
     p.add_argument(
         "--project_name",
@@ -360,16 +390,10 @@ def parse_args():
         help="SwanLab project + folder under training/",
     )
     p.add_argument(
-        "--resume_ckpt_path",
+        "--resume_ckpt",
         type=str,
         default=None,
-        help="raw DiT state_dict .pt/.safetensors before fit",
-    )
-    p.add_argument(
-        "--resume_lightning_ckpt",
-        type=str,
-        default=None,
-        help="full Lightning .ckpt path (no auto pick)",
+        help="Lightning checkpoint path to resume from (mirrors trainer ckpt_path).",
     )
     p.add_argument("--steps_per_epoch", type=int, default=500)
     p.add_argument("--num_frames", type=int, default=81)
@@ -425,8 +449,8 @@ def parse_args():
         ),
     )
     p.add_argument("--swanlab_mode", type=str, default=None)
-    p.add_argument(
-        "--experiment_name",
+
+    p.add_argument(        "--experiment_name",
         type=str,
         default="run",
         help="run folder + SwanLab experiment; use a new name per trial",
@@ -436,8 +460,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.resume_lightning_ckpt and args.resume_ckpt_path:
-        raise ValueError("use either --resume_lightning_ckpt or --resume_ckpt_path, not both")
+
     if args.num_frames != 81:
         raise ValueError("num_frames must be 81")
 
@@ -450,11 +473,15 @@ def main():
     out, ckpt_dir, tb_dir, sw_dir = prepare_output_dirs(out)
     log = logging.getLogger("wan4d_train")
     log.setLevel(logging.INFO)
-    fh = logging.FileHandler(os.path.join(out, "finetune.log"), encoding="utf-8")
-    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    log.addHandler(fh)
-    log.info("start run output=%s", out)
-    save_run_meta(out, vars(args).copy())
+    if _is_rank_zero():
+        fh = logging.FileHandler(os.path.join(out, "finetune.log"), encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(fh)
+        log.info("start run output=%s", out)
+        save_run_meta(out, vars(args).copy())
+    else:
+        log.addHandler(logging.NullHandler())
+        log.propagate = False
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -467,18 +494,20 @@ def main():
         index_path=index_path,
         steps_per_epoch=args.steps_per_epoch,
         num_frames=args.num_frames,
+        height=args.height,
+        width=args.width,
         seed=args.seed,
         split=args.split,
-        validate_tensors=not args.no_dataset_validate,
     )
-    log.info(
-        "dataset_root=%s index=%s clips=%d steps_per_epoch=%d split=%s",
-        dataset_root,
-        index_path,
-        len(ds.clips),
-        ds.steps_per_epoch,
-        args.split,
-    )
+    if _is_rank_zero():
+        log.info(
+            "dataset_root=%s index=%s clips=%d steps_per_epoch=%d split=%s",
+            dataset_root,
+            index_path,
+            len(ds.clips),
+            ds.steps_per_epoch,
+            args.split,
+        )
 
     dl = torch.utils.data.DataLoader(
         ds,
@@ -491,8 +520,7 @@ def main():
         prefetch_factor=2 if args.dataloader_num_workers else None,
     )
     train_steps = max(1, args.max_epochs * args.steps_per_epoch)
-    resume_pl = args.resume_lightning_ckpt
-    dit_weights = None if resume_pl else args.resume_ckpt_path
+    resume_pl = args.resume_ckpt
     model = Wan4DTrainModule(
         wan_model_dir=args.wan_model_dir,
         learning_rate=args.learning_rate,
@@ -503,19 +531,24 @@ def main():
         train_steps=train_steps,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
-        resume_ckpt_path=dit_weights,
         seed=args.seed,
         compile_model=args.compile_model,
         log_metrics_every=args.log_metrics_every,
+        num_frames=args.num_frames,
+        height=args.height,
+        width=args.width,
+        vae_tiled=args.vae_tiled,
+        vae_tile_size=tuple(args.vae_tile_size),
+        vae_tile_stride=tuple(args.vae_tile_stride),
     )
     loggers = []
     if args.use_tensorboard:
         loggers.append(
             TensorBoardLogger(save_dir=tb_dir, name="tb", version=args.experiment_name)
         )
-    if args.use_swanlab:
+    if args.use_swanlab and _is_rank_zero():
         try:
-            from swanlab.integration.pytorch_lightning import SwanLabLogger  # type: ignore[import-untyped]
+            from swanlab.integration.pytorch_lightning import SwanLabLogger
 
             loggers.append(
                 SwanLabLogger(
@@ -527,7 +560,7 @@ def main():
                 )
             )
         except ImportError:
-            log.warning("swanlab not installed, skip")
+            rank_zero_warn("swanlab not installed, skip")
     ckpt = Wan4DModelCheckpoint(
         dirpath=ckpt_dir,
         save_top_k=args.save_top_k,
@@ -552,9 +585,10 @@ def main():
         log_every_n_steps=args.log_every_n_steps,
         gradient_clip_val=None if args.max_grad_norm <= 0 else args.max_grad_norm,
         callbacks=cb,
-        logger=loggers or True,
+        logger=loggers if loggers else _is_rank_zero(),
     )
-    log.info("fit resume=%s", resume_pl)
+    if _is_rank_zero():
+        log.info("fit resume_ckpt=%s", resume_pl)
     trainer.fit(model, dl, ckpt_path=resume_pl)
 
 
